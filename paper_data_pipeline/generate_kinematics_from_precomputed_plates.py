@@ -3,6 +3,7 @@ import nimblephysics as nimble
 import numpy as np
 from typing import List, Tuple, Dict, Set
 import matplotlib.pyplot as plt
+import time
 
 mag_methods = {
     "Mag Free": "mag_free",
@@ -15,10 +16,10 @@ mag_methods = {
 def generate_kinematics_report(b3d_path: str, model_path: str, cached_history_path: str, output_path: str, output_csv: str):
     subject = nimble.biomechanics.SubjectOnDisk(os.path.abspath(b3d_path))
     osim = subject.readOpenSimFile(subject.getNumProcessingPasses() - 1,
-                                   geometryFolder=os.path.abspath('../../test_data/Geometry') + '/')
+                                   geometryFolder=os.path.abspath('../data/Geometry') + '/')
     better_joints_osim = nimble.biomechanics.OpenSimParser.parseOsim(os.path.abspath(model_path),
                                                                      geometryFolder=os.path.abspath(
-                                                                         '../../test_data/Geometry') + '/')
+                                                                         '../data/Geometry') + '/')
 
     print("Loading skeleton history from cache")
     data = np.load(cached_history_path, allow_pickle=True)
@@ -150,13 +151,13 @@ def generate_kinematics_report(b3d_path: str, model_path: str, cached_history_pa
                                                  parent_orientation, child_orientation))
 
     # Calculate the mean and standard deviation of the error for each method, for each joint
-    method_names = [method for method in skeleton_history.keys() if method != "Markers"]
+    method_names = [method for method in skeleton_history.keys()]
     output_positions = {
         method: np.zeros((better_joints_osim.skeleton.getNumDofs() + 1, len(skeleton_history["Markers"]))) for method in
         skeleton_history.keys()
     }
     report = {}
-    all_joint_angle_errors_by_method = {method: np.array([]) for method in method_names}
+    all_joint_angle_errors_by_method = {method: np.array([]) for method in method_names if 'Markers' not in method}
 
     for current_joint_name, skel_joint, parent_plate, child_plate, parent_orientation, child_orientation in found_joints:
         print(f"Processing joint: {current_joint_name}")
@@ -176,8 +177,7 @@ def generate_kinematics_report(b3d_path: str, model_path: str, cached_history_pa
 
         for method_name in method_names:
             print(f"\tProcessing method: {method_name}")
-            if 'Markers' in method_name:
-                continue
+
             method_joint_angles = [joint.getNearestPositionToDesiredRotation(
                 parent_orientation @ snapshot[current_joint_name] @ child_orientation.T) for snapshot in
                                    skeleton_history[method_name]]
@@ -187,44 +187,45 @@ def generate_kinematics_report(b3d_path: str, model_path: str, cached_history_pa
                     method_joint_angles[t] = nimble.math.roundEulerAnglesToNearest(method_joint_angles[t],
                                                                                    marker_joint_angles[t], axis_order)
 
-            joint_angle_errors = [np.abs(marker_joint_angle - method_joint_angle) for
-                                  marker_joint_angle, method_joint_angle in
-                                  zip(marker_joint_angles, method_joint_angles)]
-            flattened_errors = np.array(joint_angle_errors).flatten()
-            all_joint_angle_errors_by_method[method_name] = np.concatenate([all_joint_angle_errors_by_method[method_name], flattened_errors])
-            joint_angle_errors = joint_angle_errors[5000:48000]
-            joint_angle_error_means = np.mean(joint_angle_errors, axis=0)
-            joint_angle_error_medians = np.median(joint_angle_errors, axis=0)
-            joint_angle_error_stds = np.std(joint_angle_errors, axis=0)
-            joint_angle_error_min = np.min(joint_angle_errors, axis=0)
-            joint_angle_error_10th_percentile = np.percentile(joint_angle_errors, 10, axis=0)
-            joint_angle_error_30th_percentile = np.percentile(joint_angle_errors, 30, axis=0)
-            joint_angle_error_70th_percentile = np.percentile(joint_angle_errors, 70, axis=0)
-            joint_angle_error_90th_percentile = np.percentile(joint_angle_errors, 90, axis=0)
-            joint_angle_error_max = np.max(joint_angle_errors, axis=0)
-            joint_angle_errors_by_method[method_name] = joint_angle_errors
-
             for dof, dof_name in enumerate(dof_names):
                 dof_index = better_joints_osim.skeleton.getDof(dof_name).getIndexInSkeleton()
                 output_positions[method_name][dof_index, :] = np.array([angle[dof] for angle in method_joint_angles])
 
-            for dof, dof_name in enumerate(dof_names):
-                key_name = current_joint_name + '_' + dof_name
-                if key_name not in report:
-                    report[key_name] = {method_name: {} for method_name in method_names}
-                report[key_name][method_name]['mean_degrees'] = joint_angle_error_means[dof] * 180 / np.pi
-                report[key_name][method_name]['median_degrees'] = joint_angle_error_medians[dof] * 180 / np.pi
-                report[key_name][method_name]['std'] = joint_angle_error_stds[dof] * 180 / np.pi
-                report[key_name][method_name]['min_degrees'] = joint_angle_error_min[dof] * 180 / np.pi
-                report[key_name][method_name]['10th_percentile_degrees'] = joint_angle_error_10th_percentile[
-                                                                               dof] * 180 / np.pi
-                report[key_name][method_name]['30th_percentile_degrees'] = joint_angle_error_30th_percentile[
-                                                                               dof] * 180 / np.pi
-                report[key_name][method_name]['70th_percentile_degrees'] = joint_angle_error_70th_percentile[
-                                                                               dof] * 180 / np.pi
-                report[key_name][method_name]['90th_percentile_degrees'] = joint_angle_error_90th_percentile[
-                                                                               dof] * 180 / np.pi
-                report[key_name][method_name]['max_degrees'] = joint_angle_error_max[dof] * 180 / np.pi
+            if 'Markers' not in method_name:
+                joint_angle_errors = [np.abs(marker_joint_angle - method_joint_angle) for
+                                      marker_joint_angle, method_joint_angle in
+                                      zip(marker_joint_angles, method_joint_angles)]
+                flattened_errors = np.array(joint_angle_errors).flatten()
+                all_joint_angle_errors_by_method[method_name] = np.concatenate([all_joint_angle_errors_by_method[method_name], flattened_errors])
+                joint_angle_errors = joint_angle_errors[5000:48000]
+                joint_angle_error_means = np.mean(joint_angle_errors, axis=0)
+                joint_angle_error_medians = np.median(joint_angle_errors, axis=0)
+                joint_angle_error_stds = np.std(joint_angle_errors, axis=0)
+                joint_angle_error_min = np.min(joint_angle_errors, axis=0)
+                joint_angle_error_10th_percentile = np.percentile(joint_angle_errors, 10, axis=0)
+                joint_angle_error_30th_percentile = np.percentile(joint_angle_errors, 30, axis=0)
+                joint_angle_error_70th_percentile = np.percentile(joint_angle_errors, 70, axis=0)
+                joint_angle_error_90th_percentile = np.percentile(joint_angle_errors, 90, axis=0)
+                joint_angle_error_max = np.max(joint_angle_errors, axis=0)
+                joint_angle_errors_by_method[method_name] = joint_angle_errors
+
+                for dof, dof_name in enumerate(dof_names):
+                    key_name = current_joint_name + '_' + dof_name
+                    if key_name not in report:
+                        report[key_name] = {method_name: {} for method_name in method_names}
+                    report[key_name][method_name]['mean_degrees'] = joint_angle_error_means[dof] * 180 / np.pi
+                    report[key_name][method_name]['median_degrees'] = joint_angle_error_medians[dof] * 180 / np.pi
+                    report[key_name][method_name]['std'] = joint_angle_error_stds[dof] * 180 / np.pi
+                    report[key_name][method_name]['min_degrees'] = joint_angle_error_min[dof] * 180 / np.pi
+                    report[key_name][method_name]['10th_percentile_degrees'] = joint_angle_error_10th_percentile[
+                                                                                   dof] * 180 / np.pi
+                    report[key_name][method_name]['30th_percentile_degrees'] = joint_angle_error_30th_percentile[
+                                                                                   dof] * 180 / np.pi
+                    report[key_name][method_name]['70th_percentile_degrees'] = joint_angle_error_70th_percentile[
+                                                                                   dof] * 180 / np.pi
+                    report[key_name][method_name]['90th_percentile_degrees'] = joint_angle_error_90th_percentile[
+                                                                                   dof] * 180 / np.pi
+                    report[key_name][method_name]['max_degrees'] = joint_angle_error_max[dof] * 180 / np.pi
 
         if current_joint_name == 'Hip' and False:
             # Plot the errors:
@@ -261,7 +262,7 @@ def generate_kinematics_report(b3d_path: str, model_path: str, cached_history_pa
     with open(output_csv, 'w') as f:
         f.write(
             "Joint_DOF,Method,Mean Error (degrees),Median Error (degrees),Std Error (degrees),Min Error (degrees),10th Percentile Error (degrees),30th Percentile Error (degrees),70th Percentile Error (degrees),90th Percentile Error (degrees),Max Error (degrees)\n")
-        for method_name in method_names:
+        for method_name in all_joint_angle_errors_by_method.keys():
             for key_name in report:
                 f.write(
                     f"{key_name},{method_name},{report[key_name][method_name]['mean_degrees']},{report[key_name][method_name]['median_degrees']},{report[key_name][method_name]['std']},{report[key_name][method_name]['min_degrees']},{report[key_name][method_name]['10th_percentile_degrees']},{report[key_name][method_name]['30th_percentile_degrees']},{report[key_name][method_name]['70th_percentile_degrees']},{report[key_name][method_name]['90th_percentile_degrees']},{report[key_name][method_name]['max_degrees']}\n")
@@ -288,9 +289,11 @@ def generate_kinematics_report(b3d_path: str, model_path: str, cached_history_pa
     #
     #     time.sleep(0.005)
 
+    return output_positions
+
 
 if __name__ == "__main__":
-    subject_number = 3
+    subject_number = 2
     generate_kinematics_report(
         b3d_path=f"../data/S{subject_number}_IMU_Data/S{subject_number}.b3d",
         model_path=f"../data/S{subject_number}_IMU_Data/SimplifiedIMUModel.osim",
