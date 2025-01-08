@@ -32,7 +32,8 @@ for subject_number in range(1, 4):
 
     kinematics.append(kinematic)
 
-dof_labels = []
+skeleton = nimble.biomechanics.OpenSimParser.parseOsim(os.path.abspath(f"../data/S{subject_number}_IMU_Data/SimplifiedIMUModel.osim")).skeleton
+dof_labels = [skeleton.getDofByIndex(i).getName() for i in range(skeleton.getNumDofs())]
 def split_median_by_activity():
     activity_order = ['Walking', 'Running', 'Stairs and Side Stepping', 'Standing and Sitting',
                       'Stairs and Side Stepping']
@@ -73,6 +74,34 @@ def split_median_by_activity():
 
     print("data split")
     return walking_splits, running_splits, stairs_splits, standing_splits
+
+def plot_histograms():
+    data = {method: [] for method in kinematics[0].keys()}
+
+    for subj_num in range(len(kinematics)):
+        for method, subj_kinem in kinematics[subj_num].items():
+            for joint_angles in subj_kinem:
+                if joint_angles[0] == 0. and joint_angles[100] == 0.:
+                    print('Skipping unfilled joint')
+                    continue
+                data[method].extend(joint_angles)
+
+    for method, values in data.items():
+        plt.hist(values, bins=100, alpha=0.5, label=method)
+    plt.legend()
+    plt.title('Histogram of All Joint angles')
+    plt.show()
+
+    for method, values in data.items():
+        if method == "Markers":
+            continue
+        values = np.array(values)
+        ground_truth = np.array(data["Markers"])
+        error = np.abs(values - ground_truth)
+        plt.hist(error, bins=100, alpha=0.5, label=method)
+    plt.legend()
+    plt.title('Histogram of All Joint angle Errors')
+    plt.show()
 
 def plot_median_by_activity():
     activity_splits = split_median_by_activity()
@@ -127,116 +156,6 @@ def plot_median_by_activity():
         current_pos += width + spacing  # Move to the next group position
 
     plot_boxes(boxplot_data, positions, labels, width, spacing, title)
-
-def plot_median_by_joint_axis():
-    joint_splits = [{method: [] for method in kinematics[0].keys()} for _ in range(3)]
-    for subj_num in range(len(kinematics)):
-        for method, subj_kinem in kinematics[subj_num].items():
-            for dof_num, joint_angles in enumerate(subj_kinem):
-                joint_splits[dof_num % 3][method].extend(joint_angles)
-
-    # Prepare the data for plotting
-    boxplot_data = []
-    positions = []
-    labels = []
-    current_pos = 1  # Starting position for the first boxplot
-    width = 0.8  # Total width allocated for each group of boxplots (per joint)
-    spacing = 0.5  # Spacing between groups
-    title = 'Median Joint Angle Error by Joint Axis per Method'
-
-    for i, joint_split in enumerate(joint_splits):
-        method_data_list = []
-
-        # Get the methods present for this joint
-        methods_in_joint = list(joint_split.keys())
-        num_methods_in_joint = len(methods_in_joint)
-        # Calculate offsets for methods within the joint group
-        offsets = np.linspace(-width / 2, width / 2, num=num_methods_in_joint + 2)[1:-1]
-
-        for offset, method in zip(offsets, methods_in_joint):
-            if 'Markers' in method:
-                continue
-            marker_data = np.array(joint_split['Markers']) * 180 / np.pi
-            method_data = np.array(joint_split[method]) * 180 / np.pi
-
-            # Extract statistics required for the boxplot
-            stats = {
-                'med': np.median(np.abs(marker_data - method_data)),
-                'q1': np.percentile(np.abs(marker_data - method_data), 30),
-                'q3': np.percentile(np.abs(marker_data - method_data), 70),
-                'whislo': np.percentile(np.abs(marker_data - method_data), 10),
-                'whishi': np.percentile(np.abs(marker_data - method_data), 90),
-                'mean': np.mean(np.abs(marker_data - method_data)),
-                'fliers': [],  # Empty list since we're not displaying outliers
-                'label': method
-            }
-            boxplot_data.append(stats)
-            # Calculate position for this boxplot
-            pos = current_pos + offset
-            positions.append(pos)
-            method_data_list.append(stats)
-
-
-        current_pos += width + spacing  # Move to the next group position
-    labels = ['Flexion', 'Adduction', 'Rotation']
-    plot_boxes(boxplot_data, positions, labels, width, spacing, title)
-
-# def plot_all_dofs():
-#     joint_splits = split_median_by_joint()
-#
-#     # Prepare the data for plotting
-#     boxplot_data = []
-#     positions = []
-#     labels = []
-#     current_pos = 1  # Starting position for the first boxplot
-#     width = 0.8  # Total width allocated for each group of boxplots (per joint)
-#     spacing = 0.5  # Spacing between groups
-#
-#     for i, joint_split in enumerate(joint_splits):
-#         # Get the name of this joint
-#         if i < skeleton.getNumDofs():
-#             dof_name = skeleton.getDofByIndex(i).getName()
-#         else:
-#             dof_name = 'All Joints'
-#
-#         method_data_list = []
-#
-#         # Get the methods present for this joint
-#         methods_in_joint = list(joint_split.keys())
-#         num_methods_in_joint = len(methods_in_joint)
-#
-#         # Calculate offsets for methods within the joint group
-#         offsets = np.linspace(-width / 2, width / 2, num=num_methods_in_joint + 2)[1:-1]
-#
-#         for offset, method in zip(offsets, methods_in_joint):
-#             if 'Markers' in method:
-#                 continue
-#             marker_data = np.array(joint_split['Markers']) * 180 / np.pi
-#             method_data = np.array(joint_split[method]) * 180 / np.pi
-#
-#             # Extract statistics required for the boxplot
-#             stats = {
-#                 'med': np.median(np.abs(marker_data - method_data)),
-#                 'q1': np.percentile(np.abs(marker_data - method_data), 30),
-#                 'q3': np.percentile(np.abs(marker_data - method_data), 70),
-#                 'whislo': np.percentile(np.abs(marker_data - method_data), 10),
-#                 'whishi': np.percentile(np.abs(marker_data - method_data), 90),
-#                 'mean': np.mean(np.abs(marker_data - method_data)),
-#                 'fliers': [],  # Empty list since we're not displaying outliers
-#                 'label': method
-#             }
-#             boxplot_data.append(stats)
-#             # Calculate position for this boxplot
-#             pos = current_pos + offset
-#             positions.append(pos)
-#             method_data_list.append(stats)
-#
-#         labels.append(
-#             dof_name.replace('_', ' ').replace(' hip', '').replace(' knee', '').replace(' lumbar', '').replace(' arm',
-#                                                                                                                '').replace(
-#                 ' elbow', '').replace(' ankle', ''))
-#
-#         current_pos += width + spacing  # Move to the next group position
 
 def plot_boxes(boxplot_data, positions, labels, width, spacing, title):
 
@@ -298,11 +217,12 @@ def plot_boxes(boxplot_data, positions, labels, width, spacing, title):
     plt.show()
 
 
-plot_median_by_joint_axis()
+# plot_median_by_joint_axis()
 # plot_median_by_activity()
 # plot_all_dofs()
 # plot_ankle_elbow()
 
+plot_histograms()
 
 
 

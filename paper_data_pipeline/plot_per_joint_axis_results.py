@@ -21,6 +21,8 @@ joints = df['Joint_DOF'].unique()
 methods = df['Method'].unique()
 num_methods = len(methods)
 
+joints_to_plot = ['Shoulder', 'Elbow']
+
 method_display_names = [
     'Magnetometer Free',
     'MAJIC Zeroth Order',
@@ -45,45 +47,44 @@ method_avg_median = [0.0 for _ in methods]
 method_mean = [0.0 for _ in methods]
 
 for joint in joints:
-    if 'All' in joint:
-        continue
-    joint_data = df[df['Joint_DOF'] == joint]
-    method_data_list = []
-    method_positions = []
+    if any(joint_to_plot in joint for joint_to_plot in joints_to_plot):
+        joint_data = df[df['Joint_DOF'] == joint]
+        method_data_list = []
+        method_positions = []
 
-    # Get the methods present for this joint
-    methods_in_joint = joint_data['Method'].unique()
-    num_methods_in_joint = len(methods_in_joint)
-    # Calculate offsets for methods within the joint group
-    offsets = np.linspace(-width / 2, width / 2, num=num_methods_in_joint + 2)[1:-1]
+        # Get the methods present for this joint
+        methods_in_joint = joint_data['Method'].unique()
+        num_methods_in_joint = len(methods_in_joint)
+        # Calculate offsets for methods within the joint group
+        offsets = np.linspace(-width / 2, width / 2, num=num_methods_in_joint + 2)[1:-1]
 
-    for offset, method in zip(offsets, methods_in_joint):
-        method_data = joint_data[joint_data['Method'] == method]
-        if method_data.empty:
-            continue  # Skip if there's no data for this method and joint
+        for offset, method in zip(offsets, methods_in_joint):
+            method_data = joint_data[joint_data['Method'] == method]
+            if method_data.empty:
+                continue  # Skip if there's no data for this method and joint
 
-        median = method_data['Median Error (degrees)'].values[0]
-        method_index = np.where(methods == method)[0][0]
-        method_avg_median[method_index] += median
-        # Extract statistics required for the boxplot
-        stats = {
-            'med': method_data['Median Error (degrees)'].values[0],
-            'q1': method_data['30th Percentile Error (degrees)'].values[0],
-            'q3': method_data['70th Percentile Error (degrees)'].values[0],
-            'whislo': method_data['10th Percentile Error (degrees)'].values[0],
-            'whishi': method_data['90th Percentile Error (degrees)'].values[0],
-            'mean': method_data['Mean Error (degrees)'].values[0],
-            'fliers': [],  # Empty list since we're not displaying outliers
-            'label': method
-        }
-        boxplot_data.append(stats)
-        # Calculate position for this boxplot
-        pos = current_pos + offset
-        positions.append(pos)
-        method_data_list.append(stats)
+            median = method_data['Median Error (degrees)'].values[0]
+            method_index = np.where(methods == method)[0][0]
+            method_avg_median[method_index] += median
+            # Extract statistics required for the boxplot
+            stats = {
+                'med': method_data['Median Error (degrees)'].values[0],
+                'q1': method_data['30th Percentile Error (degrees)'].values[0],
+                'q3': method_data['70th Percentile Error (degrees)'].values[0],
+                'whislo': method_data['10th Percentile Error (degrees)'].values[0],
+                'whishi': method_data['90th Percentile Error (degrees)'].values[0],
+                'mean': method_data['Mean Error (degrees)'].values[0],
+                'fliers': [],  # Empty list since we're not displaying outliers
+                'label': method
+            }
+            boxplot_data.append(stats)
+            # Calculate position for this boxplot
+            pos = current_pos + offset
+            positions.append(pos)
+            method_data_list.append(stats)
 
-    labels.append(joint.replace('_', ' ').replace(' hip', '').replace(' knee', '').replace(' lumbar', '').replace(' arm', '').replace(' elbow', '').replace(' ankle', ''))
-    current_pos += width + spacing  # Move to the next group position
+        labels.append(joint.replace('_', ' ').replace(' hip', '').replace(' knee', '').replace(' lumbar', '').replace(' arm', '').replace(' elbow', '').replace(' ankle', ''))
+        current_pos += width + spacing  # Move to the next group position
 
 # Create the figure and axis
 fig, ax = plt.subplots(figsize=(15, 8))

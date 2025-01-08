@@ -4,6 +4,8 @@ import numpy as np
 from typing import List, Tuple, Dict, Set
 import matplotlib.pyplot as plt
 import time
+from scipy.stats import kstest, probplot, wilcoxon
+import numpy as np
 
 mag_methods = {
     "Mag Free": "mag_free",
@@ -158,7 +160,7 @@ def generate_kinematics_report(b3d_path: str, model_path: str, cached_history_pa
     }
     report = {}
     all_joint_angle_errors_by_method = {method: np.array([]) for method in method_names if 'Markers' not in method}
-
+    joint_angle_error_dict = {}
     for current_joint_name, skel_joint, parent_plate, child_plate, parent_orientation, child_orientation in found_joints:
         print(f"Processing joint: {current_joint_name}")
         joint = better_joints_osim.skeleton.getJoint(skel_joint)
@@ -174,13 +176,14 @@ def generate_kinematics_report(b3d_path: str, model_path: str, cached_history_pa
             output_positions['Markers'][dof_index, :] = np.array([angle[dof] for angle in marker_joint_angles])
 
         joint_angle_errors_by_method = {}
-
+        unsigned_joint_angle_errors_by_method = {}
         for method_name in method_names:
             print(f"\tProcessing method: {method_name}")
 
             method_joint_angles = [joint.getNearestPositionToDesiredRotation(
                 parent_orientation @ snapshot[current_joint_name] @ child_orientation.T) for snapshot in
                                    skeleton_history[method_name]]
+
             if joint.getType() == nimble.dynamics.EulerJoint.getStaticType():
                 axis_order = joint.getAxisOrder()
                 for t in range(len(method_joint_angles)):
@@ -197,6 +200,9 @@ def generate_kinematics_report(b3d_path: str, model_path: str, cached_history_pa
                                       zip(marker_joint_angles, method_joint_angles)]
                 flattened_errors = np.array(joint_angle_errors).flatten()
                 all_joint_angle_errors_by_method[method_name] = np.concatenate([all_joint_angle_errors_by_method[method_name], flattened_errors])
+                unsigned_joint_angle_errors_by_method[method_name] = [marker_joint_angle - method_joint_angle for
+                                                                      marker_joint_angle, method_joint_angle in
+                                                                      zip(marker_joint_angles, method_joint_angles)]
                 joint_angle_errors = joint_angle_errors[5000:48000]
                 joint_angle_error_means = np.mean(joint_angle_errors, axis=0)
                 joint_angle_error_medians = np.median(joint_angle_errors, axis=0)
@@ -227,9 +233,44 @@ def generate_kinematics_report(b3d_path: str, model_path: str, cached_history_pa
                                                                                    dof] * 180 / np.pi
                     report[key_name][method_name]['max_degrees'] = joint_angle_error_max[dof] * 180 / np.pi
 
+        joint_angle_error_dict[current_joint_name] = unsigned_joint_angle_errors_by_method
+
         if current_joint_name == 'Hip' and False:
             # Plot the errors:
             timestamps = [time * 0.005 for time in range(len(np.array(joint_angle_errors_by_method['Mag Free'])[:, 0]))]
+            activity_order = ['Walking', 'Running', 'Stairs and Side Stepping', 'Standing and Sitting',
+                              'Stairs and Side Stepping']
+            activity_timestamps = [
+                [0, 2300, 3400, 5000, 8100, 10100, 11900, 13000, 14400, 18000, 20200, 22400, 23600, 25000, 28800, 30700,
+                 32800, 34000, 35200, 38500, 41000, 43500, 44900, 46300, 48000],
+                [0, 2400, 3500, 4600, 7000, 9300, 10800, 11800, 14000, 15300, 17000, 18700, 19800, 21500, 22400, 24100,
+                 25500, 27600, 30200, 32100, 33800, 36000, 37600, 38900, 40800, 42900, 44800, 46000, 47400, 48000],
+                [0, 2400, 4000, 5700, 8800, 12400, 13800, 15000, 16300, 18800, 21000, 22700, 23700, 25500, 30000, 32000,
+                 33700, 35100, 36500, 40700, 43600, 45800, 46900, 48000]]
+            activity_timestamps = activity_timestamps[1]
+            for index in range(len(activity_timestamps) - 1):
+                start = activity_timestamps[index]
+                end = activity_timestamps[index + 1]
+                activity = activity_order[index%5]
+                if activity == 'Walking':
+                    color = 'black'
+                    alpha = 0.1
+                elif activity == 'Running':
+                    color = 'red'
+                    alpha = 0.1
+                elif activity == 'Stairs and Side Stepping':
+                    color = 'blue'
+                    alpha = 0.1
+                elif activity == 'Standing and Sitting':
+                    color = 'green'
+                    alpha = 0.1
+
+                if end <= 5000:
+                    continue
+                if start < 5000:
+                    start = 5000
+                plt.axvspan((start - 5000) * 0.005, (end - 5000) * 0.005, color=color, alpha=alpha)
+
             for method in joint_angle_errors_by_method:
                 for dof, dof_name in enumerate(dof_names):
                     # plt.plot(np.array(marker_joint_angles)[:, dof], label=f"Marker {dof_name}")
@@ -289,7 +330,7 @@ def generate_kinematics_report(b3d_path: str, model_path: str, cached_history_pa
     #
     #     time.sleep(0.005)
 
-    return output_positions
+    return joint_angle_error_dict
 
 
 if __name__ == "__main__":
