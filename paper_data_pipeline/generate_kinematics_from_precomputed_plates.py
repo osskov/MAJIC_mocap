@@ -235,59 +235,6 @@ def generate_kinematics_report(b3d_path: str, model_path: str, cached_history_pa
 
         joint_angle_error_dict[current_joint_name] = unsigned_joint_angle_errors_by_method
 
-        if current_joint_name == 'Hip' and False:
-            # Plot the errors:
-            timestamps = [time * 0.005 for time in range(len(np.array(joint_angle_errors_by_method['Mag Free'])[:, 0]))]
-            activity_order = ['Walking', 'Running', 'Stairs and Side Stepping', 'Standing and Sitting',
-                              'Stairs and Side Stepping']
-            activity_timestamps = [
-                [0, 2300, 3400, 5000, 8100, 10100, 11900, 13000, 14400, 18000, 20200, 22400, 23600, 25000, 28800, 30700,
-                 32800, 34000, 35200, 38500, 41000, 43500, 44900, 46300, 48000],
-                [0, 2400, 3500, 4600, 7000, 9300, 10800, 11800, 14000, 15300, 17000, 18700, 19800, 21500, 22400, 24100,
-                 25500, 27600, 30200, 32100, 33800, 36000, 37600, 38900, 40800, 42900, 44800, 46000, 47400, 48000],
-                [0, 2400, 4000, 5700, 8800, 12400, 13800, 15000, 16300, 18800, 21000, 22700, 23700, 25500, 30000, 32000,
-                 33700, 35100, 36500, 40700, 43600, 45800, 46900, 48000]]
-            activity_timestamps = activity_timestamps[1]
-            for index in range(len(activity_timestamps) - 1):
-                start = activity_timestamps[index]
-                end = activity_timestamps[index + 1]
-                activity = activity_order[index%5]
-                if activity == 'Walking':
-                    color = 'black'
-                    alpha = 0.1
-                elif activity == 'Running':
-                    color = 'red'
-                    alpha = 0.1
-                elif activity == 'Stairs and Side Stepping':
-                    color = 'blue'
-                    alpha = 0.1
-                elif activity == 'Standing and Sitting':
-                    color = 'green'
-                    alpha = 0.1
-
-                if end <= 5000:
-                    continue
-                if start < 5000:
-                    start = 5000
-                plt.axvspan((start - 5000) * 0.005, (end - 5000) * 0.005, color=color, alpha=alpha)
-
-            for method in joint_angle_errors_by_method:
-                for dof, dof_name in enumerate(dof_names):
-                    # plt.plot(np.array(marker_joint_angles)[:, dof], label=f"Marker {dof_name}")
-                    # plt.plot(np.array(method_joint_angles)[:, dof], label=f"{method_name} {dof_name}")
-                    if dof_name == 'hip_adduction_r':
-                        if method == 'Mag Free':
-                            plt.plot(timestamps, np.array(joint_angle_errors_by_method[method])[:, dof] * 180.0 / np.pi,
-                                     label=f"Magnetometer Free")
-                        if method == 'Never Project':
-                            plt.plot(timestamps, np.array(joint_angle_errors_by_method[method])[:, dof] * 180.0 / np.pi,
-                                     label=f"MAJIC Zeroth Order")
-            plt.title(f"Hip Adduction: Ambiguity During Stillness for Magnetometer Free")
-            plt.xlabel("Time (seconds)")
-            plt.ylabel("Angle Error (degrees)")
-            plt.legend()
-            plt.show()
-
     report["All Joints"] = {method_name: {} for method_name in method_names}
     for method_name, errors in all_joint_angle_errors_by_method.items():
         report["All Joints"][method_name]['mean_degrees'] = np.mean(errors) * 180 / np.pi
