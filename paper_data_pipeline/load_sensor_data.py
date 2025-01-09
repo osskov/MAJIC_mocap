@@ -169,6 +169,9 @@ if load_sensor_stats:
         plt.figure(figsize=(10, 6))
         axis_shape = ['o', 's', '^']
 
+        correlation_child_acc_std = []
+        correlation_method_errors = {method: [] for method in method_display_names.keys()}
+
         for subject_number, subject_error in enumerate(subjects_errors):  # Iterate over the subjects
             for joint_name in subject_error:
                 # First, isolate the parent acc stds from the df
@@ -183,14 +186,14 @@ if load_sensor_stats:
                 min_acc_std = child_acc_std #np.min(parent_acc_std.values[0], child_acc_std.values[0])
 
                 # Next, isolate the joint median errors from the subject error for each method
-                method_errors = {method: np.median(np.abs(np.array(method_data)), axis=0) for method, method_data in
+                method_errors = {method: np.mean(np.median(np.abs(np.array(method_data)) * 180 / np.pi, axis=0)) for method, method_data in
                                  subject_error[joint_name].items()}
 
                 # Add data to scatter plot
                 for method, errors in method_errors.items():
-                    for i, error in enumerate(errors):
-                        plt.scatter(min_acc_std, error, color=method_colors[method], label=method_display_names[method],
-                                    alpha=0.5, marker=axis_shape[i])
+                    # for i, error in enumerate(errors):
+                    plt.scatter(min_acc_std, errors, color=method_colors[method], label=method_display_names[method],
+                                alpha=0.5, marker=axis_shape[subject_number])
 
         plt.xlabel("Minimum Accelerometer Standard Deviation")
         plt.ylabel("Median Joint Error")

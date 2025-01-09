@@ -15,9 +15,9 @@ plt.rcParams.update({
     'font.family': 'sans-serif',  # Use a sans-serif font family
     'font.sans-serif': ['Arial'],  # Set Arial as the default sans-serif font
     'axes.titlesize': 22,  # Larger title font size
-    'axes.labelsize': 18,  # Larger axis label font size
-    'xtick.labelsize': 18,  # Larger x-axis tick font size
-    'ytick.labelsize': 18,  # Larger y-axis tick font size
+    'axes.labelsize': 22,  # Larger axis label font size
+    'xtick.labelsize': 22,  # Larger x-axis tick font size
+    'ytick.labelsize': 22,  # Larger y-axis tick font size
     'legend.fontsize': 16,  # Larger legend font size
     'axes.labelweight': 'bold',  # Make axis labels bold
     'axes.titleweight': 'bold',  # Make titles bold
@@ -270,7 +270,7 @@ def generate_per_axis_box_plot():
     boxplot_data = []
     positions = []
     width = 1  # Total width allocated for each group of boxplots (per joint)
-    spacing = 0  # Spacing between groups
+    spacing = -0.5  # Spacing between groups
     title = 'Joint Angle Error Distribution per Axis'
     y_lim_max = 0
     for i, axis_error_dict in enumerate(axis_errors):
@@ -280,8 +280,7 @@ def generate_per_axis_box_plot():
         num_axis_in_method = 3
         # Calculate offsets for methods within the joint group
         offsets = np.linspace(-width / 2, width / 2, num=num_axis_in_method + 2)[1:-1]
-        offset = offsets[i]
-        for method in ['Mag Free', 'Never Project', 'Always Project', 'Cascade']:
+        for offset, method in zip(offsets, ['Mag Free', 'Never Project',  'Cascade']):
             plot_quantity = np.abs(np.array(axis_error_dict[method])) * 180 / np.pi  # Convert to degrees
 
             # Remove outliers based on 1.5 * IQR rule
@@ -604,10 +603,10 @@ if True:
     print('Generating Figure 1')
     generate_abs_val_all_joints_box_plot()
 
-    # # FIGURE 2
-    # print('Generating Figure 2')
-    # generate_per_axis_box_plot()
-    #
+    # FIGURE 2
+    print('Generating Figure 2')
+    generate_per_axis_box_plot()
+
     # # FIGURE 3
     # print('Generating Figure 3')
     # generate_ankle_lumbar_box_plot()
