@@ -47,7 +47,7 @@ def plot_boxes(boxplot_data, positions, labels, width, spacing, title, y_lim=[0,
     for idx, stats in enumerate(boxplot_data):
         bxp_stats = [stats]
         method = stats['label']
-        ax.bxp(bxp_stats, positions=[positions[idx]], widths=width / len(methods) * 0.5,
+        ax.bxp(bxp_stats, positions=[positions[idx]], widths=width / len(methods) * 0.6,
                showfliers=False,
                boxprops=dict(facecolor=method_colors[method], color=method_colors[method]),
                medianprops=medianprops,
@@ -59,19 +59,19 @@ def plot_boxes(boxplot_data, positions, labels, width, spacing, title, y_lim=[0,
 
     # Set x-ticks and labels
     group_positions = []
-    current_pos = 1
+    current_pos = 0.2
     for _ in labels:
         group_positions.append(current_pos)
         current_pos += width + spacing
 
     ax.set_xticks(group_positions)
-    ax.set_xticklabels(labels, rotation=45, ha='right')
+    ax.set_xticklabels(labels)
 
     if keep_legend:
         # Create a legend for the methods
         handles = [plt.Line2D([0], [0], color=method_colors[method], lw=10) for method in methods]
         ax.legend(handles, [method_display_names[method] for method in methods], title='Filter',
-                  bbox_to_anchor=(1.05, 1), loc='upper left')
+                   loc='upper left')
 
     ax.set_title(title)
     ax.set_ylabel('Error (degrees)')
@@ -252,8 +252,8 @@ def generate_per_axis_box_plot():
     # First we need to split our data by axis (flexion, abduction, and rotation)
     axis_errors = [{method: [] for method in ['Mag Free', 'Never Project', 'Always Project', 'Cascade']} for _ in
                    range(3)]
-    axis_display_names = ['Flexion', 'Abduction', 'Rotation']
-    method_positions = {'Mag Free': 1, 'Never Project': 2, 'Always Project': 3, 'Cascade': 4}
+    axis_display_names = ['Flexion', 'Adduction', 'Rotation']
+    # method_positions = {'Mag Free': 1, 'Never Project': 2, 'Always Project': 3, 'Cascade': 4}
 
     for subject_kinematics in subjects_errors:
         for joint_name, methods_data in subject_kinematics.items():
@@ -270,9 +270,10 @@ def generate_per_axis_box_plot():
     boxplot_data = []
     positions = []
     width = 1  # Total width allocated for each group of boxplots (per joint)
-    spacing = -0.5  # Spacing between groups
+    spacing = -0.1  # Spacing between groups
     title = 'Joint Angle Error Distribution per Axis'
     y_lim_max = 0
+    current_pos = 0.2  # Starting position for the first boxplot
     for i, axis_error_dict in enumerate(axis_errors):
         method_data_list = []
 
@@ -311,22 +312,22 @@ def generate_per_axis_box_plot():
             }
             boxplot_data.append(stats)
             # Calculate position for this boxplot
-            pos = method_positions[method] + offset
+            pos = current_pos + offset
             positions.append(pos)
             method_data_list.append(stats)
 
             print(f'Errors calculated for {axis_display_names[i]} {method}.')
             print(f'Median: {stats["med"]}, Q1: {stats["q1"]}, Q3: {stats["q3"]}')
             print(f'RMSE: {np.sqrt(np.mean(plot_quantity ** 2))}')
-
-    labels = ['Flexion\nAdduction\nRotation'] * 4
-    plot_boxes(boxplot_data, positions, labels, width, spacing, title, y_lim=[0, y_lim_max])
+        current_pos += width + spacing  # Move to the next group position
+    # labels = ['Mag Free', 'Never Project',  'Cascade']
+    plot_boxes(boxplot_data, positions, axis_display_names, width, spacing, title, y_lim=[0, y_lim_max])
 
 
 def generate_per_dof_box_plot(title, joint_filter=None, axis_filter=None, method_filter=None):
     # First we need to split our data by dof
     dof_errors = {}
-    axis_display_names = ['Flexion', 'Abduction', 'Rotation']
+    axis_display_names = ['Flexion', 'Adduction', 'Rotation']
 
     for subject_kinematics in subjects_errors:
         for joint_name, methods_data in subject_kinematics.items():
@@ -599,9 +600,9 @@ def generate_joint_error_vs_time_plot_activity_split_plot():
 
 
 if True:
-    # FIGURE 1
-    print('Generating Figure 1')
-    generate_abs_val_all_joints_box_plot()
+    # # FIGURE 1
+    # print('Generating Figure 1')
+    # generate_abs_val_all_joints_box_plot()
 
     # FIGURE 2
     print('Generating Figure 2')

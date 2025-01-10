@@ -2,15 +2,16 @@ import os.path
 from typing import List, Dict
 
 import numpy as np
-from scipy.stats import wilcoxon
+from scipy.stats import wilcoxon, stats
 from src.IMUSkeleton import IMUSkeleton, RawReading
 from src.toolchest.PlateTrial import PlateTrial
 from paper_data_pipeline.generate_kinematics_from_precomputed_plates import generate_kinematics_report
-import nimblephysics as nimble
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import pandas as pd
 import re
+from scipy.stats import linregress
+from scipy.stats import pearsonr
 
 plt.rcParams.update({
     'font.size': 20,  # Increase font size for all text
@@ -160,44 +161,252 @@ if load_sensor_stats:
     # Convert the list of data into a DataFrame
     df = pd.DataFrame(data, columns=['Subject', 'Joint', 'Sensor', 'Mean', 'Std'])
 
-    # Display the DataFrame
-    print(df)
+    def generate_acc_std_vs_error_scatter_plot_and_correlation_regress():
+        subject_shape = ['o', 's', '^']
+        correlations = {}  # To store correlations for each method
 
-
-    def generate_acc_std_vs_error_scatter_plot():
-        # Assuming method error is the 'Mean' column, if not, adjust accordingly
         plt.figure(figsize=(10, 6))
-        axis_shape = ['o', 's', '^']
-
-        correlation_child_acc_std = []
-        correlation_method_errors = {method: [] for method in method_display_names.keys()}
 
         for subject_number, subject_error in enumerate(subjects_errors):  # Iterate over the subjects
             for joint_name in subject_error:
-                # First, isolate the parent acc stds from the df
-                parent_acc_std = \
-                    df[(df['Subject'] == str(subject_number + 1)) & (df['Joint'] == joint_name) & (
-                                df['Sensor'] == 'Parent Acc')][
-                        'Std']
-                child_acc_std = \
-                    df[(df['Subject'] == str(subject_number + 1)) & (df['Joint'] == joint_name) & (
-                                df['Sensor'] == 'Child Acc')][
-                        'Std']
-                min_acc_std = child_acc_std #np.min(parent_acc_std.values[0], child_acc_std.values[0])
+                # Extract Acc Std
+                parent_acc_std = df[
+                    (df['Subject'] == str(subject_number + 1)) &
+                    (df['Joint'] == joint_name) &
+                    (df['Sensor'] == 'Parent Acc')
+                    ]['Std']
 
-                # Next, isolate the joint median errors from the subject error for each method
-                method_errors = {method: np.mean(np.median(np.abs(np.array(method_data)) * 180 / np.pi, axis=0)) for method, method_data in
-                                 subject_error[joint_name].items()}
+                child_acc_std = df[
+                    (df['Subject'] == str(subject_number + 1)) &
+                    (df['Joint'] == joint_name) &
+                    (df['Sensor'] == 'Child Acc')
+                    ]['Std']
 
-                # Add data to scatter plot
+                if parent_acc_std.empty or child_acc_std.empty:  # Skip if no data
+                    continue
+
+                acc_std_value = np.sqrt(parent_acc_std.values[0] ** 2 + child_acc_std.values[0] ** 2)
+
+                # Isolate the joint median errors for each method
+                method_errors = {
+                    method: np.mean(np.median(np.abs(np.array(method_data)) * 180 / np.pi, axis=0))
+                    for method, method_data in subject_error[joint_name].items()
+                }
+
+                # Initialize data structure for correlation calculation
                 for method, errors in method_errors.items():
-                    # for i, error in enumerate(errors):
-                    plt.scatter(min_acc_std, errors, color=method_colors[method], label=method_display_names[method],
-                                alpha=0.5, marker=axis_shape[subject_number])
+                    # if 'Project' in method:
+                    #     continue
+                    if method not in correlations:
+                        correlations[method] = {'stds': [], 'errors': []}
 
-        plt.xlabel("Minimum Accelerometer Standard Deviation")
+                    correlations[method]['stds'].append(acc_std_value)
+                    correlations[method]['errors'].append(errors)
+
+                    # Add data to scatter plot
+                    plt.scatter(
+                        acc_std_value, errors,
+                        color=method_colors[method],
+                        label=method_display_names[method],
+                        alpha=0.5,
+                        marker=subject_shape[subject_number]
+                    )
+
+        # Add best-fit lines for each method
+        for method, data in correlations.items():
+            if 'Mag Free' not in method:
+                continue
+            if len(data['stds']) > 1 and len(data['errors']) > 1:  # Ensure enough data points
+                # Remove outliers using the IQR method
+                stds, errors = np.array(data['stds']), np.array(data['errors'])
+                q1, q3 = np.percentile(errors, [25, 75])
+                iqr = q3 - q1
+                lower_bound, upper_bound = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+
+                mask = (errors >= lower_bound) & (errors <= upper_bound)
+                filtered_stds, filtered_errors = stds[mask], errors[mask]
+
+                if len(filtered_stds) <= 1 or len(filtered_errors) <= 1:
+                    print(
+                        f"Not enough data to calculate correlation for {method_display_names[method]} after outlier removal.")
+                    continue
+
+                # Perform linear regression
+                slope, intercept, _, _, _ = linregress(filtered_stds, filtered_errors)
+                fit_line = [slope * x + intercept for x in filtered_stds]
+
+                # Plot best-fit line
+                plt.plot(
+                    filtered_stds, fit_line,
+                    color=method_colors[method],
+                    linestyle='--',
+                    label=f"{method_display_names[method]} Fit Line"
+                )
+
+                # Annotate slope on the figure
+                x_pos = np.mean(filtered_stds)
+                y_pos = np.mean(filtered_errors)
+                plt.text(
+                    x_pos, y_pos,
+                    f"Slope: {slope:.2f}",
+                    color=method_colors[method],
+                    fontsize=10,
+                    bbox=dict(boxstyle="round,pad=0.3", edgecolor=method_colors[method], facecolor="white", alpha=0.7)
+                )
+
+        plt.xlabel("Joint Center Acceleration Standard Deviation")
         plt.ylabel("Median Joint Error")
-        plt.legend(handles=[mpatches.Patch(color=color, label=label) for label, color in method_colors.items()])
+        plt.legend(
+            handles=[mpatches.Patch(color=color, label=method_display_names[label]) for label, color in
+                     method_colors.items() if 'Project' not in label]
+        )
         plt.show()
 
-    generate_acc_std_vs_error_scatter_plot()
+        # Calculate and display correlations
+        for method, data in correlations.items():
+            stds, errors = np.array(data['stds']), np.array(data['errors'])
+
+            # Remove outliers using the IQR method
+            q1, q3 = np.percentile(errors, [25, 75])
+            iqr = q3 - q1
+            lower_bound, upper_bound = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+
+            mask = (errors >= lower_bound) & (errors <= upper_bound)
+            filtered_stds, filtered_errors = stds[mask], errors[mask]
+
+            if len(filtered_stds) > 1 and len(filtered_errors) > 1:
+                corr, p_value = pearsonr(filtered_stds, filtered_errors)
+                print(f"Correlation for {method_display_names[method]}: {corr:.3f}, p-value: {p_value:.3f}")
+            else:
+                print(
+                    f"Not enough data to calculate correlation for {method_display_names[method]} after outlier removal.")
+
+
+    def generate_msg_std_vs_error_scatter_plot_and_correlation_regress():
+        subject_shape = ['o', 's', '^']
+        correlations = {}  # To store correlations for each method
+
+        plt.figure(figsize=(10, 6))
+
+        for subject_number, subject_error in enumerate(subjects_errors):  # Iterate over the subjects
+            for joint_name in subject_error:
+                # Extract Magnetic Field Std
+                parent_mag_std = df[
+                    (df['Subject'] == str(subject_number + 1)) &
+                    (df['Joint'] == joint_name) &
+                    (df['Sensor'] == 'Parent Mag')
+                    ]['Std']
+
+                child_mag_std = df[
+                    (df['Subject'] == str(subject_number + 1)) &
+                    (df['Joint'] == joint_name) &
+                    (df['Sensor'] == 'Child Mag')
+                    ]['Std']
+
+                if parent_mag_std.empty or child_mag_std.empty:  # Skip if no data
+                    continue
+
+                mag_std_value = np.sqrt(parent_mag_std.values[0] ** 2 + child_mag_std.values[0] ** 2)
+
+                # Isolate the joint median errors for each method
+                method_errors = {
+                    method: np.mean(np.median(np.abs(np.array(method_data)) * 180 / np.pi, axis=0))
+                    for method, method_data in subject_error[joint_name].items()
+                }
+
+                # Initialize data structure for correlation calculation
+                for method, errors in method_errors.items():
+                    if 'Mag Free' in method:
+                        continue
+                    if method not in correlations:
+                        correlations[method] = {'stds': [], 'errors': []}
+
+                    correlations[method]['stds'].append(mag_std_value)
+                    correlations[method]['errors'].append(errors)
+
+                    # Add data to scatter plot
+                    plt.scatter(
+                        mag_std_value, errors,
+                        color=method_colors[method],
+                        label=method_display_names[method],
+                        alpha=0.5,
+                        marker=subject_shape[subject_number]
+                    )
+
+        # Add best-fit lines for each method
+        for method, data in correlations.items():
+            if 'Never Project' not in method:
+                continue
+            if len(data['stds']) > 1 and len(data['errors']) > 1:  # Ensure enough data points
+                # Remove outliers using IQR
+                stds = np.array(data['stds'])
+                errors = np.array(data['errors'])
+                q1, q3 = np.percentile(errors, [25, 75])
+                iqr = q3 - q1
+                lower_bound = q1 - 1.5 * iqr
+                upper_bound = q3 + 1.5 * iqr
+
+                filtered_indices = (errors >= lower_bound) & (errors <= upper_bound)
+                filtered_stds = stds[filtered_indices]
+                filtered_errors = errors[filtered_indices]
+
+                if len(filtered_stds) <= 1 or len(filtered_errors) <= 1:
+                    continue
+
+                # Perform linear regression
+                slope, intercept, _, _, _ = linregress(filtered_stds, filtered_errors)
+                fit_line = [slope * x + intercept for x in filtered_stds]
+
+                # Plot best-fit line
+                plt.plot(
+                    filtered_stds, fit_line,
+                    color=method_colors[method],
+                    linestyle='--',
+                    label=f"{method_display_names[method]} Fit Line"
+                )
+
+                # Annotate slope on the figure
+                x_pos = np.mean(filtered_stds)  # Place annotation at the mean of stds
+                y_pos = np.mean(filtered_errors)  # Place annotation at the mean of errors
+                plt.text(
+                    x_pos, y_pos,
+                    f"Slope: {slope:.2f}",
+                    color=method_colors[method],
+                    fontsize=10,
+                    bbox=dict(boxstyle="round,pad=0.3", edgecolor=method_colors[method], facecolor="white", alpha=0.7)
+                )
+
+        plt.xlabel("Magnetic Field Standard Deviation")
+        plt.ylabel("Median Joint Error")
+        plt.legend(
+            handles=[mpatches.Patch(color=color, label=method_display_names[label]) for label, color in
+                     method_colors.items() if 'Mag Free' not in label]
+        )
+        plt.show()
+
+        # Calculate and display correlations
+        for method, data in correlations.items():
+            if len(data['stds']) > 1 and len(data['errors']) > 1:  # Ensure enough data points
+                # Remove outliers using IQR for correlation calculation
+                stds = np.array(data['stds'])
+                errors = np.array(data['errors'])
+                q1, q3 = np.percentile(errors, [25, 75])
+                iqr = q3 - q1
+                lower_bound = q1 - 1.5 * iqr
+                upper_bound = q3 + 1.5 * iqr
+
+                filtered_indices = (errors >= lower_bound) & (errors <= upper_bound)
+                filtered_stds = stds[filtered_indices]
+                filtered_errors = errors[filtered_indices]
+
+                if len(filtered_stds) <= 1 or len(filtered_errors) <= 1:
+                    print(f"Not enough data to calculate correlation for {method_display_names[method]}")
+                    continue
+
+                corr, p_value = pearsonr(filtered_stds, filtered_errors)
+                print(f"Correlation for {method_display_names[method]}: {corr:.3f}, p-value: {p_value:.3f}")
+            else:
+                print(f"Not enough data to calculate correlation for {method_display_names[method]}")
+
+    generate_acc_std_vs_error_scatter_plot_and_correlation_regress()
+    generate_msg_std_vs_error_scatter_plot_and_correlation_regress()
