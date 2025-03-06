@@ -24,8 +24,8 @@ plt.rcParams.update({
 })
 method_display_names = {
     'Mag Free': 'Magnetometer Free',
-    'Never Project': 'MAJIC Zeroth Order',
-    'Always Project': 'MAJIC First Order',
+    'Never Project': 'MAJIC 0th Order',
+    'Always Project': 'MAJIC 1st Order',
     'Cascade': 'MAJIC Adaptive'
 }
 method_colors = {
@@ -35,7 +35,7 @@ method_colors = {
 
 def plot_boxes(boxplot_data, positions, labels, width, spacing, title, y_lim=[0, 40], keep_legend=True):
     # Create the figure and axis
-    fig, ax = plt.subplots(figsize=(15, 8))
+    fig, ax = plt.subplots(figsize=(4, 8))
 
     # Plot the boxplots
     medianprops = dict(linestyle='-', linewidth=2.5, color='black')
@@ -47,7 +47,7 @@ def plot_boxes(boxplot_data, positions, labels, width, spacing, title, y_lim=[0,
     for idx, stats in enumerate(boxplot_data):
         bxp_stats = [stats]
         method = stats['label']
-        ax.bxp(bxp_stats, positions=[positions[idx]], widths=width / len(methods) * 0.6,
+        ax.bxp(bxp_stats, positions=[positions[idx]], widths=width,
                showfliers=False,
                boxprops=dict(facecolor=method_colors[method], color=method_colors[method]),
                medianprops=medianprops,
@@ -59,21 +59,21 @@ def plot_boxes(boxplot_data, positions, labels, width, spacing, title, y_lim=[0,
 
     # Set x-ticks and labels
     group_positions = []
-    current_pos = 0.2
+    current_pos = positions[0]
     for _ in labels:
         group_positions.append(current_pos)
         current_pos += width + spacing
 
-    ax.set_xticks(group_positions)
-    ax.set_xticklabels(labels)
+    # ax.set_xticks(group_positions)
+    # ax.set_xticklabels(labels, rotation=45, ha='right')
 
     if keep_legend:
         # Create a legend for the methods
         handles = [plt.Line2D([0], [0], color=method_colors[method], lw=10) for method in methods]
         ax.legend(handles, [method_display_names[method] for method in methods], title='Filter',
-                   loc='upper left')
+                   loc='upper right')
 
-    ax.set_title(title)
+    ax.set_title(title, pad=20)
     ax.set_ylabel('Error (degrees)')
     ax.set_ylim(y_lim)
     plt.gca().spines['top'].set_visible(False)
@@ -96,7 +96,8 @@ for subject_number in range(1, 4):
         output_csv=f"../data/Walking_Results/S{subject_number}_Walking_joint_angles.csv"
     )
     subject_error = {joint_name: {method: method_data[5000:48000] for method, method_data in joint_data.items()} for
-                     joint_name, joint_data in subject_error.items()}
+                     joint_name, joint_data in subject_error.items() if '_2' not in joint_name}
+
     subjects_errors.append(subject_error)
 
 def generate_all_joints_box_plot():
@@ -171,16 +172,17 @@ def generate_all_joints_box_plot():
 
     plot_boxes(boxplot_data, positions, labels, width, spacing, title, y_lim=[-20, 20], keep_legend=False)
 
-
 def generate_abs_val_all_joints_box_plot():
     # From just this data, we can create our first figure: a boxplot of the errors for each method
     # First we need to group the errors by method
-    method_errors = {method: np.array([]) for method in ['Mag Free', 'Never Project', 'Always Project', 'Cascade']}
+    method_errors = {method: np.array([]) for method in ['Mag Free', 'Never Project', 'Always Project']}
     for subject_kinematics in subjects_errors:
         for joint_name, methods_data in subject_kinematics.items():
             if joint_name == 'All Joints':
                 continue
             for method, angle_errors in methods_data.items():
+                if method == 'Cascade':
+                    continue
                 angle_errors = np.array(np.abs(angle_errors)).flatten()
                 method_errors[method] = np.concatenate([method_errors[method], angle_errors])
 
@@ -190,10 +192,10 @@ def generate_abs_val_all_joints_box_plot():
     boxplot_data = []
     positions = []
     labels = []
-    current_pos = 1  # Starting position for the first boxplot
-    width = 1  # Total width allocated for each group of boxplots
-    spacing = 0  # Spacing between groups
-    title = 'Distribution of All Joint Angle Error Magnitudes for Each Sensor Fusion Filter'
+    current_pos = 0.5  # Starting position for the first boxplot
+    width = 0.8  # Total width allocated for each group of boxplots
+    spacing = 0.4  # Spacing between groups
+    title = 'Angle Error Distribution \nPer Sensor Fusion Filter'
     for method_name, method_error in method_errors.items():
         method_error = method_error * 180 / np.pi  # Convert to degrees
 
@@ -228,8 +230,8 @@ def generate_abs_val_all_joints_box_plot():
         positions.append(pos)
 
         labels.append(
-            method_display_names[method_name] + '\n(Median Error: {:.2f} degrees)'.format(np.median(method_error)))
-        current_pos += 1  # Move to the next group position
+            method_display_names[method_name]) #+ '\n(Median Error: {:.2f} degrees)'.format(np.median(method_error)))
+        current_pos += width + spacing  # Move to the next group position
 
         print(f'Errors calculated for {method_name}.')
         print(f'Median: {stats["med"]}, Q1: {stats["q1"]}, Q3: {stats["q3"]}')
@@ -245,7 +247,7 @@ def generate_abs_val_all_joints_box_plot():
         else:
             print(f'{method_name} is not significantly different from Mag Free.')
 
-    plot_boxes(boxplot_data, positions, labels, width, spacing, title, y_lim=[0, 30], keep_legend=False)
+    plot_boxes(boxplot_data, positions, labels, width, spacing, title, y_lim=[0, 22], keep_legend=True)
 
 
 def generate_per_axis_box_plot():
@@ -427,9 +429,9 @@ def generate_ankle_lumbar_box_plot():
                               ['Ankle', 'Lumbar_1', 'Lumbar_2'], method_filter=['Mag Free', 'Cascade'])
 
 
-def generate_ankle_elbow_box_plot():
-    generate_per_dof_box_plot('Ankle and Elbow Joint Angle Error Distribution per Degree of Freedom',
-                              ['Ankle', 'Elbow'], method_filter=['Never Project', 'Always Project', 'Cascade'])
+def generate_ankle_shoulder_box_plot():
+    generate_per_dof_box_plot('Ankle and Shoulder Joint Angle Error Distribution per Degree of Freedom',
+                              ['Ankle', 'Shoulder_1', 'Shoulder_2'], method_filter=['Never Project', 'Always Project', 'Cascade'])
 
 
 def generate_lower_body_box_plot():
@@ -600,21 +602,21 @@ def generate_joint_error_vs_time_plot_activity_split_plot():
 
 
 if True:
-    # # FIGURE 1
-    # print('Generating Figure 1')
-    # generate_abs_val_all_joints_box_plot()
+    # FIGURE 1
+    print('Generating Figure 1')
+    generate_abs_val_all_joints_box_plot()
 
-    # FIGURE 2
-    print('Generating Figure 2')
-    generate_per_axis_box_plot()
-
+    # # FIGURE 2
+    # print('Generating Figure 2')
+    # generate_per_axis_box_plot()
+    #
     # # FIGURE 3
     # print('Generating Figure 3')
     # generate_ankle_lumbar_box_plot()
     #
     # # FIGURE 4
     # print('Generating Figure 4')
-    # generate_ankle_elbow_box_plot()
+    # generate_ankle_shoulder_box_plot()
     #
     # # FIGURE 5
     # print('Generating Figure 5')
