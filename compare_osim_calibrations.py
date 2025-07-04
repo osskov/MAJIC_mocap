@@ -127,12 +127,12 @@ def compare_brick_rotations(file_paths):
 
 # Example usage
 file_paths = [
-    # "/Users/six/projects/work/vmu-suit/ml_and_simulation/test_data/oday_data/Subject03/walking/IMU/xsens/model_Rajagopal2015_calibrated.osim",
-    "/Users/six/projects/work/vmu-suit/ml_and_simulation/test_data/oday_data/Subject03/walking/IMU/xsens/model_Rajagopal2015_calibrated_new.osim",
-    # "/Users/six/projects/work/vmu-suit/ml_and_simulation/test_data/oday_data/Subject03/walking/IMU/mahony/model_Rajagopal2015_calibrated.osim",
-    "/Users/six/projects/work/vmu-suit/ml_and_simulation/test_data/oday_data/Subject03/walking/IMU/mahony/model_Rajagopal2015_calibrated_new.osim",
-    # "/Users/six/projects/work/vmu-suit/ml_and_simulation/test_data/oday_data/Subject03/walking/IMU/madgwick/model_Rajagopal2015_calibrated.osim",
-    "/Users/six/projects/work/vmu-suit/ml_and_simulation/test_data/oday_data/Subject03/walking/IMU/madgwick/model_Rajagopal2015_calibrated_new.osim",
+    "data/ODay_Data/Subject03/walking/IMU/xsens/model_Rajagopal2015_calibrated_new.osim",
+    # "data/ODay_Data/Subject03/walking/IMU/xsens/model_Rajagopal2015_calibrated.osim",
+    "data/ODay_Data/Subject03/walking/IMU/mahony/model_Rajagopal2015_calibrated_new.osim",
+    # "data/ODay_Data/Subject03/walking/IMU/mahony/model_Rajagopal2015_calibrated.osim",
+    "data/ODay_Data/Subject03/walking/IMU/madgwick/model_Rajagopal2015_calibrated_new.osim",
+    # "data/ODay_Data/Subject03/walking/IMU/madgwick/model_Rajagopal2015_calibrated.osim",
 ]
 
 def print_orientation_differences(all_data, brick_names):
@@ -165,8 +165,8 @@ def print_orientation_differences(all_data, brick_names):
         print(f"  Method: mahony to madgwick, Difference: {np.round(nimble.math.matrixToEulerXYZ(nimble.math.eulerXYZToMatrix(mahony).T @ nimble.math.eulerXYZToMatrix(madgwick)), 8)}")
 
 all_data, brick_names = compare_brick_rotations(file_paths)
-print_orientation_differences(all_data, brick_names)
-import matplotlib.pyplot as plt
+# print_orientation_differences(all_data, brick_names)
+# import matplotlib.pyplot as plt
 
 def plot_brick_rotations(brick_name, all_data):
     # Extract rotation values for the given brick across all files

@@ -172,6 +172,29 @@ class WorldTrace:
             imu_y_loc = data[:, imu_y_idx: imu_y_idx + 3]
             imu_d_loc = data[:, imu_d_idx: imu_d_idx + 3]
 
+            if "Foot" in imu_o_name:
+                imu_o_copy = imu_o_loc.copy()
+                imu_o_loc = imu_d_loc
+                imu_d_loc = imu_o_copy
+
+                if "R" in imu_o_name:
+                    imu_x_copy = imu_x_loc.copy()
+                    imu_x_loc = imu_d_loc
+                    imu_d_loc = imu_x_copy
+
+                    imu_y_copy = imu_y_loc.copy()
+                    imu_y_loc = imu_o_loc
+                    imu_o_loc = imu_y_copy
+
+            if "L" in imu_o_name:
+                imu_y_copy = imu_y_loc.copy()
+                imu_y_loc = imu_d_loc
+                imu_d_loc = imu_y_copy
+
+                imu_x_copy = imu_x_loc.copy()
+                imu_x_loc = imu_o_loc
+                imu_o_loc = imu_x_copy
+
             # Attempt to auto-detect units
             if np.max(np.abs(imu_o_loc)) > 1000:
                 print("Detected units in mm, converting to m")
@@ -200,10 +223,10 @@ class WorldTrace:
         assert not np.isnan(marker_y).any(), "NaN in marker_y"
 
         # Constructing axis and orientation components
-        x_axis_1 = marker_d - marker_x
+        x_axis_1 = marker_x - marker_d
         x_axis_1 = x_axis_1 / np.linalg.norm(x_axis_1, axis=1)[:, None]
         assert not np.isnan(x_axis_1).any(), "NaN in x_axis_1"
-        x_axis_2 = marker_y - marker_o
+        x_axis_2 = marker_o - marker_y
         x_axis_2 = x_axis_2 / np.linalg.norm(x_axis_2, axis=1)[:, None]
         if np.isnan(x_axis_2).any():
             x_axis = x_axis_1

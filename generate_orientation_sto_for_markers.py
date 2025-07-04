@@ -62,7 +62,7 @@ def _generate_orientation_sto_file_(output_directory: str,
     #         segment_orientations[child_trial.name] = [R_wp @ R_pc for R_wp, R_pc in
     #                                                   zip(segment_orientations[parent_trial.name], joint_orientations)]
 
-    output_path = os.path.join(output_directory, f'mocap_orientations.sto')
+    output_path = os.path.join(output_directory, f'walking_orientations.sto')
     _export_to_sto_(output_path, timestamps, segment_orientations)
     return timestamps[-1], list(segment_orientations.keys())
 
@@ -116,8 +116,8 @@ def _export_to_sto_(filename,
         for row in data:
             file.write("\t".join(row) + "\n")
 
-plate_trials = PlateTrial.load_trial_from_folder("test_data/oday_data/Subject03/walking")
+plate_trials = PlateTrial.load_trial_from_folder("data/ODay_Data/Subject03/walking", align_plate_trials=True)
 
-output_directory = "test_data/oday_data/Subject03/walking/Mocap"
+output_directory = "data/ODay_Data/Subject04/walking/Mocap"
 
 final_time, segment_names = _generate_orientation_sto_file_(output_directory, plate_trials)

@@ -217,15 +217,15 @@ if __name__ == "__main__":
     # The user provided this line for loading data:
 
 
-    all_plate_trials: List[PlateTrial] = PlateTrial.load_trial_from_folder("test_data/oday_data/Subject03/walking")
-
+    all_plate_trials: List[PlateTrial] = PlateTrial.load_trial_from_folder("data/ODay_Data/Subject03/walking", False)
+    all_plate_trials = [trial[:100] for trial in all_plate_trials]  # Limit to first 100 timesteps for faster visualization
     # for i in range(11):
     #     subject = f"Subject{i+1:02d}"
     #     # The user provided this line for loading data:
     #     all_plate_trials: List[PlateTrial] = PlateTrial.load_trial_from_folder(f"test_data/oday_data/{subject}/walking")
     print("done")
-    # if all_plate_trials:
-    #     visualize_plates_with_slider(all_plate_trials)
+    if all_plate_trials:
+        visualize_plates_with_slider(all_plate_trials)
     # else:
     #     print("No plate trials loaded. Please ensure your data loading logic is correct.")
 

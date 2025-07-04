@@ -83,15 +83,16 @@ class PlateTrial:
         return len(self.imu_trace)
 
     def __getitem__(self, key):
-        return PlateTrial(self.name, self.imu_trace[key], self.world_trace[key], self.second_imu_trace[key])
+        return PlateTrial(self.name, self.imu_trace[key], self.world_trace[key], self.second_imu_trace[key] if self.second_imu_trace is not None else None)
 
-    def align_imu_trace_to_world_trace(self) -> 'PlateTrial':
+    def align_world_trace_to_imu_trace(self) -> 'PlateTrial':
         # Generate synthetic world trace
         synthetic_imu_trace = self.world_trace.calculate_imu_trace()
         # Call imu_trace.calculate_rotation_offset_from_gyros(synthetic_world_trace)
         R_wt_it = synthetic_imu_trace.calculate_rotation_offset_from_gyros(self.imu_trace)
+        print(f"{self.name} rotation offset from gyros: {R_wt_it}")
         error = synthetic_imu_trace.calculate_gyro_angle_error(self.imu_trace)
-        print(self.name + ': ' + str(error))
+        # print(self.name + ': ' + str(error))
         # Call imu_trace.rotate_rot
         new_plate = PlateTrial(self.name, self.imu_trace.right_rotate(R_wt_it.T), self.world_trace,
                                self.second_imu_trace.right_rotate(
@@ -619,7 +620,7 @@ class PlateTrial:
             synced_imu_trace, synced_world_trace = PlateTrial._sync_imu_trace_to_world_trace(imu_trace, world_trace)
             new_plate_trial = PlateTrial(imu_name, synced_imu_trace, synced_world_trace)
             if align_plate_trials:
-                new_plate_trial = new_plate_trial.align_imu_trace_to_world_trace()
+                new_plate_trial = new_plate_trial.align_world_trace_to_imu_trace()
             new_plate_trial.subject = subject
             new_plate_trial.task = task
             if len(plate_trials) > 0:
@@ -816,7 +817,7 @@ class PlateTrial:
 
             new_plate_trial = PlateTrial(imu_name, synced_imu_trace_1, synced_world_trace, synced_imu_trace_2)
             if align_plate_trials:
-                new_plate_trial = new_plate_trial.align_imu_trace_to_world_trace()
+                new_plate_trial = new_plate_trial.align_world_trace_to_imu_trace()
             new_plate_trial.subject = 'cheeseburger'
             new_plate_trial.task = 'cheeseburger'
             if len(plate_trials) > 0:
