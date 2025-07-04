@@ -1,7 +1,5 @@
 import inspect
-
 import numpy as np
-from typing import List, Dict, Tuple
 
 
 def finite_difference(signal: np.ndarray, timesteps: np.ndarray, method: str = 'central', **kwargs) -> np.ndarray:
@@ -44,10 +42,12 @@ def finite_difference(signal: np.ndarray, timesteps: np.ndarray, method: str = '
     provided_keys = set(kwargs.keys())
     if not provided_keys <= valid_params:
         invalid_keys = provided_keys - valid_params
-        raise ValueError(f"Invalid arguments for method '{method}': {invalid_keys}. Valid arguments are {valid_params}.")
+        raise ValueError(
+            f"Invalid arguments for method '{method}': {invalid_keys}. Valid arguments are {valid_params}.")
 
     # Call the specific function with validated kwargs
     return selected_func(signal, timesteps, **kwargs)
+
 
 def central_difference(signal: np.ndarray, timesteps: np.ndarray, edges='extend') -> np.ndarray:
     """
@@ -85,12 +85,14 @@ def forward_difference(signal: np.ndarray, timesteps: np.ndarray, edges='extend'
     return gradient
 
 
-def polynomial_fit_derivative(signal: np.ndarray, timesteps: np.ndarray, order: int = 3, window_size: int = 10, derivative_order: int = 1) -> np.ndarray:
+def polynomial_fit_derivative(signal: np.ndarray, timesteps: np.ndarray, order: int = 3, window_size: int = 10,
+                              derivative_order: int = 1) -> np.ndarray:
     """
     This function computes the sliding window polynomial fit derivative of a signal.
     """
     if len(signal) < window_size:
-        raise ValueError("window_size ("+str(window_size)+") must be less than the length of the signal ("+str(len(signal))+").")
+        raise ValueError("window_size (" + str(window_size) + ") must be less than the length of the signal (" + str(
+            len(signal)) + ").")
 
     gradient = np.zeros_like(signal, dtype=np.float64)
     gradient_counts = np.zeros_like(signal)

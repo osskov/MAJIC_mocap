@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 import nimblephysics as nimble
-from src.toolchest.RelativeFilter import RelativeFilter
+from src.RelativeFilter import RelativeFilter
 
 
 class TestRelativeFilter(unittest.TestCase):
@@ -11,7 +11,7 @@ class TestRelativeFilter(unittest.TestCase):
         self.mag_std = 0.3
 
         # Create instance of RelativeFilter
-        self.filter = RelativeFilter(self.acc_std, self.gyro_std, self.mag_std)
+        self.filter = RelativeFilter([self.acc_std]*3, [self.gyro_std]*3, [self.mag_std]*3)
 
     def test_initial_state(self):
         self.assertTrue(np.allclose(self.filter.q_wp.to_rotation_matrix(), np.eye(3)), "Initial q_wp is not identity.")

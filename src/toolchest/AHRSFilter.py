@@ -1,4 +1,4 @@
-from typing import List, Dict, Callable, Any, Optional
+from typing import List, Optional
 import ahrs.filters as filt
 import numpy as np
 from .IMUTrace import IMUTrace
@@ -10,21 +10,8 @@ import nimblephysics as nimble
 # NOTE: The relationship between gravity and the expected accelerometer reading is not always the same.
 # Filters commented out did not pass unit tests.
 ALL_FILTERS = {"Angular Rate": [filt.AngularRate, True, False, False, [0, 0, 0], [0, 0, 0]],
-               # "AQUA": [filt.AQUA, False, True, True, [0, 0, 1], [1, 0, 1], # Empty initialization error
-               # "Complementary": [filt.Complementary, True, True, None, [0, 0, 1], [0, -1, 1]], Need to identify the reference frame
-               # "Davenport": [filt.Davenport, False, True, True, [0, 0, 1], [1, 1, 1]],
                "EKF": [filt.EKF, True, True, True, [0, 0, 0], [0, 0, 0]],  # Reference is set at initialization
-               # "FAMC": [filt.FAMC, False, True, True],  # Empty initialization error
-               # "FLAE": [filt.FLAE, False, True, True, [0, 0, 0], [0, 0, 0]],
-               # "Fourati": [filt.Fourati, True, True, True, [0, 0, 0], [0, 0, 0]],
-               # "FQA": [filt.FQA, False, True, None], # Empty initialization error
-               # "Madgwick": [filt.Madgwick, True, True, None, [0, 0, 1], [1, 0, 1]],
                "Mahony": [filt.Mahony, True, True, None, [0, 0, 1], [-1, 0, 1]],
-               #  "OLEQ": [filt.OLEQ, False, True, True, [0, 0, 0], [0, 0, 0]], # Different grav and mag definitions
-               # "QUEST": [filt.QUEST, False, True, True, [0, 0, 0], [0, 0, 0]],  # Failing randominitialization test
-               # "ROLEQ": [filt.ROLEQ, True, True, True, [0, 0, 0], [0, 0, 0]],
-               # "SAAM": [filt.SAAM, False, True, True], # Needs NaN handling implementation
-               # "Tilt": [filt.Tilt, False, True, None, [0, 0, 1], [1, 0, 1]]
                }
 
 
@@ -41,7 +28,8 @@ class AHRSFilter:
     R_wa: np.array = np.eye(3)
     q_world_to_ahrs: np.array = np.array([1., 0., 0., 0.])
 
-    def __init__(self, select_filter: str, world_reference_mag: np.ndarray, world_reference_acc: np.ndarray = np.array([0, 1, 0])):
+    def __init__(self, select_filter: str, world_reference_mag: np.ndarray,
+                 world_reference_acc: np.ndarray = np.array([0, 1, 0])):
         """ This function currently assumes that gravity is in y for the world frame and in z for the AHRS frame."""
         if select_filter in ALL_FILTERS.keys():
             self.filter_type = select_filter
@@ -73,7 +61,6 @@ class AHRSFilter:
             m_ahrs = m_ahrs * np.sin(world_angle) + g_ahrs * np.cos(world_angle)
             ahrs_angle = np.arccos(np.dot(g_ahrs, m_ahrs))
 
-
             W = np.outer(g_world, g_ahrs) + np.outer(m_world, m_ahrs)
             # Perform Singular Value Decomposition (SVD) on the cross-covariance matrix
             U, S, VT = np.linalg.svd(W)
@@ -93,7 +80,8 @@ class AHRSFilter:
         np.testing.assert_allclose(initial_R, np.eye(3), atol=1e-5, rtol=1e-5)
 
     @staticmethod
-    def convert_to_world_orientations(imu_trace: IMUTrace, select_filter: str, expected_mag: np.ndarray, expected_acc: Optional[np.ndarray] = None) -> WorldTrace:
+    def convert_to_world_orientations(imu_trace: IMUTrace, select_filter: str, expected_mag: np.ndarray,
+                                      expected_acc: Optional[np.ndarray] = None) -> WorldTrace:
         """ This function takes an IMUTrace object and a filter type and returns a WorldTrace object with the
         orientations of the IMUTrace object converted to the world frame. The expected gravity is the gravity vector,
         NOT the expected gravity reading."""

@@ -47,7 +47,7 @@ def plot_boxes(boxplot_data, positions, labels, width, spacing, title, y_lim=[0,
     for idx, stats in enumerate(boxplot_data):
         bxp_stats = [stats]
         method = stats['label']
-        ax.bxp(bxp_stats, positions=[positions[idx]], widths=width,
+        ax.bxp(bxp_stats, positions=[positions[idx]], widths=width / len(methods) * 0.6,
                showfliers=False,
                boxprops=dict(facecolor=method_colors[method], color=method_colors[method]),
                medianprops=medianprops,
@@ -59,19 +59,19 @@ def plot_boxes(boxplot_data, positions, labels, width, spacing, title, y_lim=[0,
 
     # Set x-ticks and labels
     group_positions = []
-    current_pos = positions[0]
+    current_pos = positions[0] + width / 4
     for _ in labels:
         group_positions.append(current_pos)
         current_pos += width + spacing
 
-    # ax.set_xticks(group_positions)
-    # ax.set_xticklabels(labels, rotation=45, ha='right')
+    ax.set_xticks(group_positions)
+    ax.set_xticklabels(labels, rotation=0)
 
     if keep_legend:
         # Create a legend for the methods
         handles = [plt.Line2D([0], [0], color=method_colors[method], lw=10) for method in methods]
         ax.legend(handles, [method_display_names[method] for method in methods], title='Filter',
-                   loc='upper right')
+                   loc='upper left')
 
     ax.set_title(title, pad=20)
     ax.set_ylabel('Error (degrees)')
@@ -196,6 +196,11 @@ def generate_abs_val_all_joints_box_plot():
     width = 0.8  # Total width allocated for each group of boxplots
     spacing = 0.4  # Spacing between groups
     title = 'Angle Error Distribution \nPer Sensor Fusion Filter'
+
+    # plt.hist([error*180/np.pi for error in method_errors.values()], stacked=True, histtype='step')
+    # plt.show()
+    # plt.plot((method_errors['Mag Free']- method_errors['Never Project'])*180/np.pi , label='Mag Free')
+    # plt.show()
     for method_name, method_error in method_errors.items():
         method_error = method_error * 180 / np.pi  # Convert to degrees
 
@@ -272,7 +277,7 @@ def generate_per_axis_box_plot():
     boxplot_data = []
     positions = []
     width = 1  # Total width allocated for each group of boxplots (per joint)
-    spacing = -0.1  # Spacing between groups
+    spacing = 0.1  # Spacing between groups
     title = 'Joint Angle Error Distribution per Axis'
     y_lim_max = 0
     current_pos = 0.2  # Starting position for the first boxplot
@@ -283,7 +288,7 @@ def generate_per_axis_box_plot():
         num_axis_in_method = 3
         # Calculate offsets for methods within the joint group
         offsets = np.linspace(-width / 2, width / 2, num=num_axis_in_method + 2)[1:-1]
-        for offset, method in zip(offsets, ['Mag Free', 'Never Project',  'Cascade']):
+        for offset, method in zip(offsets, ['Mag Free', 'Never Project']):
             plot_quantity = np.abs(np.array(axis_error_dict[method])) * 180 / np.pi  # Convert to degrees
 
             # Remove outliers based on 1.5 * IQR rule
@@ -419,6 +424,96 @@ def generate_per_dof_box_plot(title, joint_filter=None, axis_filter=None, method
         last_dof_name = dof_name
     plot_boxes(boxplot_data, positions, labels, width, spacing, title, y_lim=[0, y_lim_max])
 
+def generate_per_joint_box_plot(title, joint_filter=None, method_filter=['Mag Free', 'Never Project', 'Always Project', 'Cascade']):
+    # First we need to split our data by joint
+    joint_errors = {}
+
+    for subject_kinematics in subjects_errors:
+        for joint_name, methods_data in subject_kinematics.items():
+            if joint_filter and joint_name not in joint_filter:
+                continue
+            for method, angle_errors in methods_data.items():
+                if method_filter and method not in method_filter:
+                    continue
+                for axis_idx in range(3):
+                    if joint_name not in joint_errors.keys():
+                        joint_errors[joint_name] = {method: [] for method in method_filter}
+                    axis_error = [error[axis_idx] for error in angle_errors]
+                    joint_errors[joint_name][method].extend(axis_error)
+
+    print('Errors collected by joint.')
+
+    # Prepare the data for plotting
+    boxplot_data = []
+    positions = []
+    labels = []
+    current_pos = 1  # Starting position for the first boxplot
+    width = 1  # Total width allocated for each group of boxplots (per joint)
+    spacing = 0  # Spacing between groups
+    y_lim_max = 0
+    last_dof_name = ''
+    for dof_name in joint_filter:
+        dof_error_dict = joint_errors[dof_name]
+        method_data_list = []
+
+        if last_dof_name and (last_dof_name.split(' ')[0] != dof_name.split(' ')[0] or
+                              ('Lumbar' in dof_name and last_dof_name.split(' ')[1] != dof_name.split(' ')[1]) or
+                              ('Shoulder' in dof_name and last_dof_name.split(' ')[1] != dof_name.split(' ')[1])):
+            current_pos += 1
+            labels.append('')  # Add a blank label to separate the groups
+
+        # Get the methods present for this joint
+        num_methods_in_dof = len(method_filter) if method_filter else 4
+
+        # Calculate offsets for methods within the joint group
+        offsets = np.linspace(-width / 2, width / 2, num=num_methods_in_dof + 2)[1:-1]
+
+        for offset, method in zip(offsets,
+                                  method_filter if method_filter else ['Mag Free', 'Never Project',
+                                                                       'Always Project',
+                                                                       'Cascade']):
+            plot_quantity = np.abs(np.array(dof_error_dict[method])) * 180 / np.pi  # Convert to degrees
+
+            # Remove outliers based on 1.5 * IQR rule
+            q1 = np.percentile(plot_quantity, 25)
+            q3 = np.percentile(plot_quantity, 75)
+            iqr = q3 - q1
+            lower_bound = q1 - 1.5 * iqr if q1 - 1.5 * iqr > 0 else min(plot_quantity)
+            upper_bound = q3 + 1.5 * iqr
+            if upper_bound > y_lim_max:
+                y_lim_max = upper_bound + 5
+            plot_quantity = plot_quantity[(plot_quantity >= lower_bound) & (plot_quantity <= upper_bound)]
+            outliers = plot_quantity[(plot_quantity < lower_bound) | (plot_quantity > upper_bound)]
+
+            # Print number of data points considered outliers
+            print(
+                f'Number of outliers for {method} in {dof_name}: {len(dof_error_dict[method]) - len(plot_quantity)}')
+
+            # Extract statistics required for the boxplot
+            stats = {
+                'med': np.median(plot_quantity),
+                'q1': q1,
+                'q3': q3,
+                'whislo': np.min([lower_bound, np.min(plot_quantity)]),
+                'whishi': np.max([upper_bound, np.max(plot_quantity)]),
+                'mean': np.mean(plot_quantity),
+                'fliers': outliers,
+                'label': method
+            }
+            boxplot_data.append(stats)
+            # Calculate position for this boxplot
+            pos = current_pos + offset
+            positions.append(pos)
+            method_data_list.append(stats)
+
+            print(f'Errors calculated for {method}.')
+            print(f'Median: {stats["med"]}, Q1: {stats["q1"]}, Q3: {stats["q3"]}')
+            print(f'RMSE: {np.sqrt(np.mean(plot_quantity ** 2))}')
+        labels.append(dof_name)
+        current_pos += width + spacing  # Move to the next group position
+        last_dof_name = dof_name
+    plot_boxes(boxplot_data, positions, labels, width, spacing, title, y_lim=[0, y_lim_max])
+
 
 def generate_all_dof_box_plot():
     generate_per_dof_box_plot('Joint Angle Error Distribution per Degree of Freedom')
@@ -431,8 +526,11 @@ def generate_ankle_lumbar_box_plot():
 
 def generate_ankle_shoulder_box_plot():
     generate_per_dof_box_plot('Ankle and Shoulder Joint Angle Error Distribution per Degree of Freedom',
-                              ['Ankle', 'Shoulder_1', 'Shoulder_2'], method_filter=['Never Project', 'Always Project', 'Cascade'])
+                              ['Ankle', 'Shoulder_1'], method_filter=['Never Project', 'Always Project', 'Mag Free'])
 
+def generate_ankle_elbow_box_plot():
+    generate_per_dof_box_plot('Ankle and Elbow Joint Angle Error Distribution per Degree of Freedom',
+                              ['Ankle', 'Elbow'], method_filter=['Mag Free', 'Never Project', 'Always Project'])
 
 def generate_lower_body_box_plot():
     generate_per_dof_box_plot('Lower Body Joint Angle Error Distribution per Degree of Freedom',
@@ -460,16 +558,27 @@ def generate_per_activity_box_plot():
         [0, 2400, 4000, 5700, 8800, 12400, 13800, 15000, 16300, 18800, 21000, 22700, 23700, 25500, 30000, 32000, 33700,
          35100, 36500, 40700, 43600, 45800, 46900, 48000]]
 
-    walking_splits = {method: [] for method in subjects_errors[0]['Hip'].keys()}
-    running_splits = {method: [] for method in subjects_errors[0]['Hip'].keys()}
-    stairs_splits = {method: [] for method in subjects_errors[0]['Hip'].keys()}
-    standing_splits = {method: [] for method in subjects_errors[0]['Hip'].keys()}
+    walking_splits = {method: [] for method in subjects_errors[0]['Hip'].keys() if 'Free' in method or 'Never' in method}
+    running_splits = {method: [] for method in subjects_errors[0]['Hip'].keys() if 'Free' in method or 'Never' in method}
+    stairs_splits = {method: [] for method in subjects_errors[0]['Hip'].keys() if 'Free' in method or 'Never' in method}
+    standing_splits = {method: [] for method in subjects_errors[0]['Hip'].keys() if 'Free' in method or 'Never' in method}
+
+    # Prepare the data for plotting
+    boxplot_data = []
+    positions = []
+    labels = []
+    current_pos = 1  # Starting position for the first boxplot
+    width = 0.8  # Total width allocated for each group of boxplots (per joint)
+    spacing = 0.5  # Spacing between groups
+    title = 'Median Joint Angle Error by Activity per Method'
 
     for subj_num, subject_errors in enumerate(subjects_errors):
         for joint_name, methods_errors in subject_error.items():
             for method, joint_angles in methods_errors.items():
-                joint_angles = np.array(joint_angles)[:, 2]
-                joint_angles = np.array(joint_angles).flatten() * 180 / np.pi  # Convert to degrees
+                if method not in walking_splits.keys():
+                    continue
+                joint_angles = np.array(joint_angles)
+                joint_angles = np.abs(np.array(joint_angles).flatten() * 180 / np.pi)  # Convert to degrees
                 if joint_angles[0] == 0. and joint_angles[100] == 0.:
                     print('Skipping unfilled joint')
                     continue
@@ -493,52 +602,41 @@ def generate_per_activity_box_plot():
                     elif activity == 'Standing and Sitting':
                         standing_splits[method].extend(joint_angles[activity_start:activity_end])
 
-        activity_splits = [standing_splits, stairs_splits, walking_splits, running_splits]
-        activities_display_names = ['Standing and Sitting', 'Stairs and Side Stepping', 'Walking', 'Running']
+    activity_splits = [standing_splits, stairs_splits, walking_splits, running_splits]
+    activities_display_names = ['Standing and Sitting', 'Stairs and Side Stepping', 'Walking', 'Running']
 
-        # Prepare the data for plotting
-        boxplot_data = []
-        positions = []
-        labels = []
-        current_pos = 1  # Starting position for the first boxplot
-        width = 0.8  # Total width allocated for each group of boxplots (per joint)
-        spacing = 0.5  # Spacing between groups
-        title = 'Median Joint Angle Error by Activity per Method'
-        for i, activity_split in enumerate(activity_splits):
-            method_data_list = []
+    for i, activity_split in enumerate(activity_splits):
+        method_data_list = []
 
-            # Get the methods present for this joint
-            methods_in_activity = list(activity_split.keys())
-            num_methods_in_activity = len(methods_in_activity)
-            # Calculate offsets for methods within the joint group
-            offsets = np.linspace(-width / 2, width / 2, num=num_methods_in_activity + 2)[1:-1]
+        # Get the methods present for this joint
+        methods_in_activity = list(activity_split.keys())
+        num_methods_in_activity = len(methods_in_activity)
+        # Calculate offsets for methods within the joint group
+        offsets = np.linspace(-width / 2, width / 2, num=num_methods_in_activity + 2)[1:-1]
 
-            for offset, method in zip(offsets, methods_in_activity):
-                if 'Markers' in method:
-                    continue
+        for offset, method in zip(offsets, methods_in_activity):
+            plot_quantity = activity_split[method]
+            # Extract statistics required for the boxplot
+            stats = {
+                'med': np.median(plot_quantity),
+                'q1': np.percentile(plot_quantity, 30),
+                'q3': np.percentile(plot_quantity, 70),
+                'whislo': np.percentile(plot_quantity, 10),
+                'whishi': np.percentile(plot_quantity, 90),
+                'mean': np.mean(plot_quantity),
+                'fliers': [],  # Empty list since we're not displaying outliers
+                'label': method
+            }
+            boxplot_data.append(stats)
+            # Calculate position for this boxplot
+            pos = current_pos + offset
+            positions.append(pos)
+            method_data_list.append(stats)
 
-                plot_quantity = activity_split[method]
-                # Extract statistics required for the boxplot
-                stats = {
-                    'med': np.median(plot_quantity),
-                    'q1': np.percentile(plot_quantity, 30),
-                    'q3': np.percentile(plot_quantity, 70),
-                    'whislo': np.percentile(plot_quantity, 10),
-                    'whishi': np.percentile(plot_quantity, 90),
-                    'mean': np.mean(plot_quantity),
-                    'fliers': [],  # Empty list since we're not displaying outliers
-                    'label': method
-                }
-                boxplot_data.append(stats)
-                # Calculate position for this boxplot
-                pos = current_pos + offset
-                positions.append(pos)
-                method_data_list.append(stats)
+        labels.append(activities_display_names[i])
+        current_pos += width + spacing  # Move to the next group positione
 
-            labels.append(activities_display_names[i])
-            current_pos += width + spacing  # Move to the next group position
-
-        plot_boxes(boxplot_data, positions, labels, width, spacing, title)
+    plot_boxes(boxplot_data, positions, labels, width, spacing, title)
 
 
 def generate_joint_error_vs_time_plot_activity_split_plot():
@@ -602,10 +700,10 @@ def generate_joint_error_vs_time_plot_activity_split_plot():
 
 
 if True:
-    # FIGURE 1
-    print('Generating Figure 1')
-    generate_abs_val_all_joints_box_plot()
-
+    # # FIGURE 1
+    # print('Generating Figure 1')
+    # generate_abs_val_all_joints_box_plot()
+    #
     # # FIGURE 2
     # print('Generating Figure 2')
     # generate_per_axis_box_plot()
@@ -614,9 +712,11 @@ if True:
     # print('Generating Figure 3')
     # generate_ankle_lumbar_box_plot()
     #
-    # # FIGURE 4
-    # print('Generating Figure 4')
+    # FIGURE 4
+    print('Generating Figure 4')
     # generate_ankle_shoulder_box_plot()
+    # generate_ankle_elbow_box_plot()
+    generate_per_joint_box_plot('Joint Angle Error Distribution per Joint', joint_filter=['Ankle', 'Knee', 'Hip', 'Lumbar_1', 'Shoulder_1', 'Elbow'], method_filter=['Mag Free', 'Never Project'])
     #
     # # FIGURE 5
     # print('Generating Figure 5')
@@ -631,4 +731,5 @@ if True:
     # generate_lumbar_box_plot()
     # generate_lower_body_box_plot()
 
+    # generate_per_activity_box_plot()
 print('Done')

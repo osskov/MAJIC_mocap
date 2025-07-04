@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from src.cascade_filter.Board import RawReading, ProjectedReading, Board
+from src.Board import RawReading, ProjectedReading, Board
 
 class TestBoard(unittest.TestCase):
     def setUp(self):

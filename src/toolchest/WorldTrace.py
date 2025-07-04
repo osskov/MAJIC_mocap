@@ -1,17 +1,11 @@
 import os
-
-from matplotlib import pyplot as plt
-from scipy.interpolate import interp1d
-
 from .IMUTrace import IMUTrace
-from typing import List, Dict, Any, Union, Tuple
+from typing import List, Tuple
 import numpy as np
 import nimblephysics as nimble
-from .finite_difference_utils import polynomial_fit_derivative, central_difference
+from .finite_difference_utils import central_difference
 from .gyro_utils import finite_difference_rotations
 from scipy.signal import butter, filtfilt
-from toolchest.MagneticFieldModel import MagneticFieldModel
-
 
 class WorldTrace:
     """
@@ -108,7 +102,7 @@ class WorldTrace:
 
     def calculate_imu_trace(self,
                             acc_from_gravity: np.ndarray = np.zeros(3),
-                            magnetic_field: Union[np.ndarray, MagneticFieldModel] = np.zeros(3),
+                            magnetic_field: np.ndarray = np.zeros(3),
                             skip_lin_acc=False) -> IMUTrace:
         """
         This function computes the IMU trace from the world trace by finite differencing the positions and rotations.
@@ -118,12 +112,8 @@ class WorldTrace:
             local_acc = [rot.T @ acc for rot, acc in zip(self.rotations, world_acc)]
         else:
             local_acc = [rot.T @ acc_from_gravity for rot in self.rotations]
-
-        try:
-            local_mag = [rot.T @ magnetic_field.get_field(pos) for rot, pos in zip(self.rotations, self.positions)]
-        except:
-            assert isinstance(magnetic_field, np.ndarray)
-            local_mag = [rot.T @ magnetic_field for rot in self.rotations]
+        assert isinstance(magnetic_field, np.ndarray)
+        local_mag = [rot.T @ magnetic_field for rot in self.rotations]
         local_gyros = finite_difference_rotations(self.rotations, self.timestamps)
         return IMUTrace(self.timestamps, local_gyros, local_acc, local_mag)
 
@@ -215,8 +205,10 @@ class WorldTrace:
         assert not np.isnan(x_axis_1).any(), "NaN in x_axis_1"
         x_axis_2 = marker_y - marker_o
         x_axis_2 = x_axis_2 / np.linalg.norm(x_axis_2, axis=1)[:, None]
-        assert not np.isnan(x_axis_2).any(), "NaN in x_axis_2"
-        x_axis = (x_axis_1 + x_axis_2) / 2
+        if np.isnan(x_axis_2).any():
+            x_axis = x_axis_1
+        else:
+            x_axis = (x_axis_1 + x_axis_2) / 2
         x_axis = x_axis / np.linalg.norm(x_axis, axis=1)[:, None]
         assert not np.isnan(x_axis).any(), "NaN in x_axis"
 

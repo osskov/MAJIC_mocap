@@ -1,7 +1,7 @@
 import numpy as np
 
-from src.cascade_filter.JointCenterProjector import JointCenterProjector
-from src.cascade_filter.Board import Board, ProjectedReading
+from src.JointCenterProjector import JointCenterProjector
+from src.Board import Board, ProjectedReading
 import unittest
 
 class TestJointCenterProjector(unittest.TestCase):

@@ -1,5 +1,5 @@
 import numpy as np
-from typing import List, Union, Tuple
+from typing import List
 from scipy.linalg import logm, expm
 import nimblephysics as nimble
 
@@ -42,7 +42,8 @@ def finite_difference_rotations(rotation_matrices: List[np.ndarray], timestamps:
     return angular_velocities
 
 
-def integrate_rotations(angular_velocities: List[np.ndarray], timestamps: np.ndarray, initial_rotation: np.ndarray = np.eye(3)) -> List[np.ndarray]:
+def integrate_rotations(angular_velocities: List[np.ndarray], timestamps: np.ndarray,
+                        initial_rotation: np.ndarray = np.eye(3)) -> List[np.ndarray]:
     """
     Integrate a list of angular velocities to get a list of rotation matrices.
     :param angular_velocities: List of angular velocities.
@@ -62,7 +63,7 @@ def integrate_rotations(angular_velocities: List[np.ndarray], timestamps: np.nda
 def rotation_matrix_to_angular_velocity(R_rel: np.ndarray, dt: float) -> np.ndarray:
     """
     Converts a rotation matrix to an angular velocity vector using Rodrigues' rotation formula.
-    :param R_rel The rotation matrix.
+    :param R_rel: The rotation matrix.
     :param dt: The time step over which the rotation matrix was integrated.
     :return: The angular velocity vector.
 
@@ -71,10 +72,11 @@ def rotation_matrix_to_angular_velocity(R_rel: np.ndarray, dt: float) -> np.ndar
     """
     return nimble.math.logMap(R_rel) / dt
 
+
 def rotation_matrix_to_angular_velocity_python(R_rel: np.ndarray, dt: float) -> np.ndarray:
     """
     Converts a rotation matrix to an angular velocity vector using Rodrigues' rotation formula.
-    :param R_rel The rotation matrix.
+    :param R_rel: The rotation matrix.
     :param dt: The time step over which the rotation matrix was integrated.
     :return: The angular velocity vector.
 
@@ -108,6 +110,7 @@ def angular_velocity_to_rotation_matrix(omega: np.ndarray, dt: float) -> np.ndar
     matrix.
     """
     return nimble.math.expMapRot(omega * dt)
+
 
 def angular_velocity_to_rotation_matrix_python(omega: np.ndarray, dt: float) -> np.ndarray:
     """

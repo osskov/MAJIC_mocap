@@ -78,7 +78,7 @@ class RawMarkerTrace:
             other_points.append(other_trace.points[other_cursor])
             self_cursor += 1
             other_cursor += 1
-        # print(len(self_points), len(other_points))
+
         assert(len(self_points) == len(other_points))
         distances = []
         for i in range(len(self_points)):
@@ -218,7 +218,7 @@ class RawMarkerTrace:
 
     @staticmethod
     def clean_up_traces_using_plate(traces: List['RawMarkerTrace'], plate_trace: RawMarkerPlateTrace) -> List['RawMarkerTrace']:
-        # First we need to regenerate the points list from the traces. This is slightly different than in trace_to_plate
+        # First we need to regenerate the points list from the traces. This is slightly different from in trace_to_plate
         # because we keep all the timesteps of points, even if they have only 1 point observed
         points_by_timestep: Dict[float, List[np.ndarray]] = {}
         for trace in traces:

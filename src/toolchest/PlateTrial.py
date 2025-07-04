@@ -733,7 +733,7 @@ class PlateTrial:
             assert len(accs) == len(gyros), "Accelerometer data must be the same length as the IMU data"
             assert len(timestamps) == len(gyros), "Timestamps must be the same length as the IMU data"
 
-            imu_trace = IMUTrace(np.array(timestamps), gyros, accs, mags)
+            imu_trace = IMUTrace(timestamps=np.array(timestamps), gyro=gyros, acc=accs, mag=mags)
 
             # Assuming `key` is in the format "IMU_R_Foot_1"
             imu_name = '_'.join(key.split('_')[:-1])  # Extracts "R_Foot"
