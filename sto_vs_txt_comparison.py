@@ -7,8 +7,14 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
-
-
+JOINT_SEGMENT_DICT = {'R_Hip': ('pelvis_imu', 'femur_r_imu'),
+                      'R_Knee': ('femur_r_imu', 'tibia_r_imu'),
+                      'R_Ankle': ('tibia_r_imu', 'calcn_r_imu'),
+                      'L_Hip': ('pelvis_imu', 'femur_l_imu'),
+                      'L_Knee': ('femur_l_imu', 'tibia_l_imu'),
+                      'L_Ankle': ('tibia_l_imu', 'calcn_l_imu'),
+                      'Lumbar': ('pelvis_imu', 'torso_imu'),
+                      }
 def load_sensor_rotations_from_folder(imu_folder_path: str) -> Dict[str, 'IMUTrace']:
     imu_traces = {}
 
@@ -67,9 +73,12 @@ def load_sensor_rotations_from_folder(imu_folder_path: str) -> Dict[str, 'IMUTra
 def load_segment_orientations_from_folder(imu_folder_path: str):
     # find the subdirectories in the IMU folder
     subdirs = [d for d in os.listdir(imu_folder_path) if os.path.isdir(os.path.join(imu_folder_path, d))]
+    subdirs += ['markers']
     rotation_matrices = {}
     for subdir in subdirs:
         file_path = os.path.join(imu_folder_path, subdir, 'walking_orientations.sto')
+        if 'markers' in subdir:
+            file_path = "/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject03/walking/Mocap/walking_orientations.sto"
         # Read the file to find the endHeader index
         end_header_index = 0
         with open(file_path, 'r') as f:
@@ -130,9 +139,28 @@ def load_kinematics_mot(mot_file_path: str) -> pd.DataFrame:
     data = pd.read_csv(mot_file_path, delimiter='\t', skiprows=end_header_index)
     return data
 
-plates = PlateTrial.load_trial_from_folder('data/Subject03/walking')
-imu_folder_path = os.path.join('data', 'Subject03', 'walking', 'IMU')
-sensor_rotation_matrices = load_sensor_rotations_from_folder(imu_folder_path)
+def get_joint_orientations_from_segment_orientations(
+        segment_orientations: Dict[str, Dict[str, List[np.ndarray]]],
+        ) -> Dict[str, Dict[str, List[np.ndarray]]]:
+    """
+    Extract joint orientations from segment orientations for a given condition.
+    :param segment_orientations: Dictionary of segment orientations.
+    :param condition: Condition to filter the segment orientations.
+    :return: Dictionary of joint orientations.
+    """
+    joint_orientations = {}
+    for joint, (parent_segment, child_segment) in JOINT_SEGMENT_DICT.items():
+        joint_orientations[joint] = {}
+        if parent_segment not in segment_orientations or child_segment not in segment_orientations:
+            continue
+        for method, orientations in segment_orientations[parent_segment].items():
+            joint_orientations[joint][method] = [R_wp.T @ R_wc for R_wp, R_wc in zip(segment_orientations[parent_segment][method],
+                                                  segment_orientations[child_segment][method])]
+    return joint_orientations
+
+# plates = PlateTrial.load_trial_from_folder('data/Subject03/walking')
+imu_folder_path = os.path.join('data', 'ODay_Data', 'Subject03', 'walking', 'IMU')
+# sensor_rotation_matrices = load_sensor_rotations_from_folder(imu_folder_path)
 segment_rotation_matrices = load_segment_orientations_from_folder(imu_folder_path)
 
 # Also add the orientations for the majic filter
@@ -147,27 +175,27 @@ segment_rotation_matrices = load_segment_orientations_from_folder(imu_folder_pat
 # # plt.plot(flm0_sto, label='.sto index')
 # # plt.show()
 #
-slice1_list = []
-slice2_list = []
-for sensor_name in sensor_rotation_matrices:
-    if sensor_name not in segment_rotation_matrices:
-        continue
-    for method in sensor_rotation_matrices[sensor_name]:
-        for i in range(3):
-            for j in range(3):
-                array_1 = np.array([rot[i, j] for rot in sensor_rotation_matrices[sensor_name][method]])
-                array_2 = np.array([rot[i, j] for rot in segment_rotation_matrices[sensor_name][method]])
-                slice1, slice2 = _sync_arrays(array_1, array_2)
-                slice1_list.append(slice1)
-                slice2_list.append(slice2)
-
-# Treat None as 0 for sorting purposes
-sorted_slice1 = sorted(slice1_list, key=lambda s: s.start if s.start is not None else 0)
-slice1 = sorted_slice1[len(sorted_slice1) // 2]  # Take the middle slice
-sorted_slice2 = sorted(slice2_list, key=lambda s: s.start if s.start is not None else 0)
-slice2 = sorted_slice2[len(sorted_slice2) // 2]  # Take the middle slice
-
-rotation_difference = {}
+# slice1_list = []
+# slice2_list = []
+# for sensor_name in sensor_rotation_matrices:
+#     if sensor_name not in segment_rotation_matrices:
+#         continue
+#     for method in sensor_rotation_matrices[sensor_name]:
+#         for i in range(3):
+#             for j in range(3):
+#                 array_1 = np.array([rot[i, j] for rot in sensor_rotation_matrices[sensor_name][method]])
+#                 array_2 = np.array([rot[i, j] for rot in segment_rotation_matrices[sensor_name][method]])
+#                 slice1, slice2 = _sync_arrays(array_1, array_2)
+#                 slice1_list.append(slice1)
+#                 slice2_list.append(slice2)
+#
+# # Treat None as 0 for sorting purposes
+# sorted_slice1 = sorted(slice1_list, key=lambda s: s.start if s.start is not None else 0)
+# slice1 = sorted_slice1[len(sorted_slice1) // 2]  # Take the middle slice
+# sorted_slice2 = sorted(slice2_list, key=lambda s: s.start if s.start is not None else 0)
+# slice2 = sorted_slice2[len(sorted_slice2) // 2]  # Take the middle slice
+#
+# rotation_difference = {}
 # for sensor_name in sensor_rotation_matrices:
 #     if sensor_name not in segment_rotation_matrices:
 #         continue
@@ -185,36 +213,36 @@ rotation_difference = {}
 #                 mean_value = np.mean([rot[i] for rot in rotation_difference[sensor_name][method]])
 #                 std_value = np.std([rot[i] for rot in rotation_difference[sensor_name][method]])
 #                 print(f"Sensor: {sensor_name}, Method: {method}, Element ({i}): Mean = {mean_value}, Std = {std_value}")
-
-for sensor_name in sensor_rotation_matrices:
-    rotation_difference[sensor_name] = {}
-    if sensor_name not in segment_rotation_matrices:
-        continue
-    xsens_start = []
-    mahony_start = []
-    madgwick_start = []
-    for method in sensor_rotation_matrices[sensor_name]:
-        if method == 'xsens':
-            xsens_start = sensor_rotation_matrices[sensor_name][method][slice1][0]
-        elif method == 'mahony':
-            mahony_start = sensor_rotation_matrices[sensor_name][method][slice1][0]
-        elif method == 'madgwick':
-            madgwick_start = sensor_rotation_matrices[sensor_name][method][slice1][0]
-    rotation_difference[sensor_name]['xsens to madgwick'] = nimble.math.matrixToEulerXYZ(xsens_start.T @ madgwick_start)
-    rotation_difference[sensor_name]['xsens to mahony'] = nimble.math.matrixToEulerXYZ(xsens_start.T @ mahony_start)
-    rotation_difference[sensor_name]['mahony to madgwick'] = nimble.math.matrixToEulerXYZ(mahony_start.T @ madgwick_start)
-
-# Print the rotation differences for each sensor and method
-for sensor_name in rotation_difference:
-    if sensor_name not in segment_rotation_matrices:
-        continue
-    print(f"Sensor: {sensor_name}")
-    for method, diff in rotation_difference[sensor_name].items():
-        print(f"  Method: {method}, Difference: {diff}")
-
-
-
-
+#
+# for sensor_name in sensor_rotation_matrices:
+#     rotation_difference[sensor_name] = {}
+#     if sensor_name not in segment_rotation_matrices:
+#         continue
+#     xsens_start = []
+#     mahony_start = []
+#     madgwick_start = []
+#     for method in sensor_rotation_matrices[sensor_name]:
+#         if method == 'xsens':
+#             xsens_start = sensor_rotation_matrices[sensor_name][method][slice1][0]
+#         elif method == 'mahony':
+#             mahony_start = sensor_rotation_matrices[sensor_name][method][slice1][0]
+#         elif method == 'madgwick':
+#             madgwick_start = sensor_rotation_matrices[sensor_name][method][slice1][0]
+#     rotation_difference[sensor_name]['xsens to madgwick'] = nimble.math.matrixToEulerXYZ(xsens_start.T @ madgwick_start)
+#     rotation_difference[sensor_name]['xsens to mahony'] = nimble.math.matrixToEulerXYZ(xsens_start.T @ mahony_start)
+#     rotation_difference[sensor_name]['mahony to madgwick'] = nimble.math.matrixToEulerXYZ(mahony_start.T @ madgwick_start)
+#
+# # Print the rotation differences for each sensor and method
+# for sensor_name in rotation_difference:
+#     if sensor_name not in segment_rotation_matrices:
+#         continue
+#     print(f"Sensor: {sensor_name}")
+#     for method, diff in rotation_difference[sensor_name].items():
+#         print(f"  Method: {method}, Difference: {diff}")
+#
+#
+#
+joint_orientations = get_joint_orientations_from_segment_orientations(segment_rotation_matrices)
 
 #
 # for sensor_name in sensor_rotation_matrices:

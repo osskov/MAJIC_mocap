@@ -1,35 +1,36 @@
 %% Example Script to demonstrate the Marker and IMU tracking Workflow.
 % Master script and notes for Generic Subject Experiment
 clear all; close all;clc;
-% The top-level import is good for the script's base workspace,
-% but functions require their own import or fully qualified names.
-import org.opensim.modeling.*
 
-%% Define subject number, activity, and IMU method
+%% Define subject number and activity
 subjectNumRaw = 3; % Change this to the desired subject number (e.g., 1, 2, ..., 11)
 subjectNum = sprintf('%02d', subjectNumRaw); % Format as two digits (e.g., 1 becomes '01')
 activity = 'walking'; % Change this to 'walking' or 'complexTasks'
-imuMethods = {'madgwick', 'mahony', 'xsens'}; % Change this to 'xsens', 'mahony', or 'madgwick'
+endStamp = 60;
 
-for methodIndex = 1:3
+%% Section 1. Process Marker Based IK
+% Perform Marker based IK using the IKTool. Tracking is performed using
+% only the IMU plate based markers.
+% run_marker_ik(subjectNum, activity, -Inf, endStamp)
+   
+%% Section 2. Create Calibrated Model
+% calibrate_model(subjectNum, activity)
+
+%% Run IK for IMU Based Capture
+% run_imu_ik(subjectNum, activity, 'mocap', -Inf, endStamp);
+
+imuMethods = {'majic'};%'madgwick', 'mahony', 'xsens'}; 
+for methodIndex = 1:length(imuMethods)
     imuMethod = imuMethods{methodIndex};
-    %% Section 1. Process Marker Based IK
-    % Perform Marker based IK using the IKTool. Tracking is performed using
-    % only the IMU plate based markers.
-    % run_marker_ik(subjectNum, activity, -Inf, 2)
-    
-    %% Section 2. Align and Trim Marker and IMU Data
-    create_trimmed_datasets(subjectNum, activity, imuMethod)
-    
-    %% Section 3. Create Calibrated Model
-    calibrate_model(subjectNum, activity, imuMethod)
+    %% Section 3. Align and Trim Marker and IMU Data
+    % create_trimmed_datasets(subjectNum, activity, imuMethod)
     
     %% Section 4. IMU Kinematics
     % Use the posed model and rotated IMU data to perform IK.
-    run_imu_ik(subjectNum, activity, imuMethod, -Inf, 2)
+    run_imu_ik(subjectNum, activity, imuMethod, -Inf, endStamp)
 end
-%% Function Definitions
 
+%% Function Definitions
 function run_marker_ik(subjectNum, activity, startTime, endTime)
     % IMPORTANT: Import OpenSim modeling package within the function scope
     import org.opensim.modeling.*
@@ -80,6 +81,65 @@ function run_marker_ik(subjectNum, activity, startTime, endTime)
     % Write model to file. This is overwriting an input file, not a new generated one, so no prefix.
     STOFileAdapter().write(markerMotion, fullfile(mocapPath, 'ikResults', strrep(trcFile, '.trc', '_IK.mot')));
     fprintf("Updated IK motion file saved to %s\n", fullfile(mocapPath, 'ikResults', strrep(trcFile, '.trc', '_IK.mot'))); % Added newline
+end
+
+function calibrate_model(subjectNum, activity)
+    % IMPORTANT: Import OpenSim modeling package within the function scope
+    import org.opensim.modeling.*
+
+    fprintf("-----Calibrating IMU Model on %s %s %s.-----\n", subjectNum, activity); % Added newline
+    %% Generate a posed Model from the Marker Data.
+    % The model is posed using the estimated kinematics from the (now synced)
+    % marker based IK solution.
+    modelFile = sprintf('../Subject%s/model_Rajagopal2015_registered.osim', subjectNum);
+    modelFile_posed = sprintf('../Subject%s/model_Rajagopal2015_posed.osim', subjectNum);
+    model = Model(modelFile);
+    
+    motionPath = sprintf('../Subject%s/%s/Mocap/ikResults/%s_IK.mot', subjectNum, activity, activity);
+    markerMotion = TimeSeriesTable(motionPath);
+    
+    % Cycle through the model coordinates and update the default values.
+    cs = model.getCoordinateSet();
+    pelvis_rotation = 0;
+    for i = 0 : cs.getSize() - 1
+        % Get the Coordinate value from the the motion data.
+        % Ensure the column index matches the coordinate index
+        value = markerMotion.getRowAtIndex(0).getElt(0,i); % getElt(rowIndex, colIndex)
+
+        % Check if the coordinate is Rotational and convert to radians
+        if strcmp('Rotational', char(cs.get(i).getMotionType()))
+            % Assuming pelvis_rotation corresponds to a specific coordinate, e.g., index 2
+            if i == 2 % This index (2) needs to correspond to the pelvis rotation coordinate
+                pelvis_rotation = value;
+            end
+            value = deg2rad(value);
+        end
+        cs.get(i).set_default_value( value );
+    end
+    % Print model to file.
+    model.initSystem();
+    model.print(modelFile_posed);
+    
+    %% Calibrate Posed Model
+    baseIMUName = 'pelvis_imu'; visualizeCalibration = false;
+    % Use the posed model to generate a IMU calibrated model.
+    imu = IMUPlacer();
+    imu.set_model_file(modelFile_posed);
+   
+    % orientationsFileName = fullfile(imuPath, sprintf('%s_orientations.sto', activity));
+    orientationsFileName = sprintf('../Subject%s/%s/Mocap/%s_orientations.sto', subjectNum, activity, activity);
+    imu.set_orientation_file_for_calibration(orientationsFileName);
+    imu.set_base_heading_axis('z');
+    imu.set_base_imu_label(baseIMUName);
+    
+    % Run the ModelCalibrator()
+    imu.run(visualizeCalibration);
+    
+    % Write the Calibrated Model to file
+    calibratedModel = imu.getCalibratedModel();
+    modelFile_calibrated = sprintf('../Subject%s/model_Rajagopal2015_calibrated.osim', subjectNum);
+    calibratedModel.print(modelFile_calibrated);
+    disp("Model Calibration Complete.")
 end
 
 function create_trimmed_datasets(subjectNum, activity, imuMethod)
@@ -162,7 +222,7 @@ function create_trimmed_datasets(subjectNum, activity, imuMethod)
         quatTable.getIndependentColumn().set(i, i*(1/mRate));
     end
     
-    fprintf("Saving trimmed IMU data to %s...\n", orientationsFileName) % Added newline
+    fprintf("Saving trimmed IMU data to %s...\n", orientationsFileName)
     STOFileAdapterQuaternion.write(quatTable,  orientationsFileName);
 
     %% Marker Data Trimming
@@ -211,105 +271,21 @@ function create_trimmed_datasets(subjectNum, activity, imuMethod)
     disp('Trimming Complete.');
 end
 
-function calibrate_model(subjectNum, activity, imuMethod)
-    % IMPORTANT: Import OpenSim modeling package within the function scope
-    import org.opensim.modeling.*
-
-    fprintf("-----Calibrating IMU Model on %s %s %s.-----\n", subjectNum, activity, imuMethod); % Added newline
-    %% Generate a posed Model from the Marker Data.
-    % The model is posed using the estimated kinematics from the (now synced)
-    % marker based IK solution.
-    modelFile = sprintf('../Subject%s/model_Rajagopal2015_registered.osim', subjectNum);
-    imuPath = sprintf('../Subject%s/%s/IMU/%s', subjectNum, activity, imuMethod);
-    modelFile_posed = sprintf('../Subject%s/model_Rajagopal2015_posed.osim', subjectNum);
-    model = Model(modelFile);
-    
-    motionPath = sprintf('../Subject%s/%s/Mocap/ikResults/%s_IK.mot', subjectNum, activity, activity);
-    markerMotion = TimeSeriesTable(motionPath);
-    
-    % Cycle through the model coordinates and update the default values.
-    cs = model.getCoordinateSet();
-    pelvis_rotation = 0;
-    for i = 0 : cs.getSize() - 1
-        % Get the Coordinate value from the the motion data.
-        % Ensure the column index matches the coordinate index
-        value = markerMotion.getRowAtIndex(0).getElt(0,i); % getElt(rowIndex, colIndex)
-
-        % Check if the coordinate is Rotational and convert to radians
-        if strcmp('Rotational', char(cs.get(i).getMotionType()))
-            % Assuming pelvis_rotation corresponds to a specific coordinate, e.g., index 2
-            if i == 2 % This index (2) needs to correspond to the pelvis rotation coordinate
-                pelvis_rotation = value;
-            end
-            value = deg2rad(value);
-        end
-        cs.get(i).set_default_value( value );
-    end
-    % Print model to file.
-    model.initSystem();
-    model.print(modelFile_posed);
-    
-    %% Calibrate Posed Model
-    baseIMUName = 'pelvis_imu'; visualizeCalibration = false;
-    % Use the posed model to generate a IMU calibrated model.
-    imu = IMUPlacer();
-    imu.set_model_file(modelFile_posed);
-   
-    % orientationsFileName = fullfile(imuPath, sprintf('%s_orientations.sto', activity));
-    orientationsFileName = sprintf('../Subject%s/%s/Mocap/%s_orientations.sto', subjectNum, activity, activity);
-    imu.set_orientation_file_for_calibration(orientationsFileName);
-    imu.set_base_heading_axis('z');
-    imu.set_base_imu_label(baseIMUName);
-    
-    % Run the ModelCalibrator()
-    imu.run(visualizeCalibration);
-    
-    % Write the Calibrated Model to file
-    calibratedModel = imu.getCalibratedModel();
-    modelFile_calibrated = sprintf('../Subject%s/model_Rajagopal2015_calibrated.osim', subjectNum);
-    calibratedModel.print(modelFile_calibrated);
-    
-    %% Create Rotated Orientations File
-    % model = Model(modelFile_posed); % Reload the posed model
-    % s = model.initSystem();
-    % model.realizePosition(s);
-    % osense = OpenSenseUtilities();
-    % c = CoordinateDirection(CoordinateAxis(2),1); % Assuming axis 2 is Z
-    % oTableHC = TimeSeriesTableQuaternion(orientationsFileName);
-    % 
-    % R_HG = Rotation();
-    % R_HG.setRotationFromAngleAboutX(0); % Rotation about X by -pi/2
-    % osense.rotateOrientationTable(oTableHC, R_HG);
-    % 
-    % v = OpenSenseUtilities.computeHeadingCorrection(model, s, oTableHC, baseIMUName, c);
-    % computedAngularCorrection = v.get(1) * 180/pi; % get(1) for the second element (assuming it's the angle)
-
-    oTable = TimeSeriesTableQuaternion(orientationsFileName);
-    % % AngularCorrection value found in the console from the imu.run()
-    % angularCorrection = computedAngularCorrection - pelvis_rotation;
-    % 
-    % R_HG = Rotation();
-    % R_HG.setRotationFromAngleAboutZ(deg2rad( angularCorrection )); % Rotation about Z by angularCorrection
-    % 
-    % % Rotate the table data
-    % osense.rotateOrientationTable(oTable, R_HG);
-    rotatedOrientations = fullfile(imuPath, sprintf('%s_rotated_orientations.sto', activity));
-    STOFileAdapterQuaternion.write(oTable, rotatedOrientations); % Use generic STOFileAdapter
-    disp("Model Calibration Complete.")
-end
-
 function run_imu_ik(subjectNum, activity, imuMethod, startTime, endTime)
     % IMPORTANT: Import OpenSim modeling package within the function scope
     import org.opensim.modeling.*
 
     fprintf("-----Running IMU Inverse Kinematics on %s %s %s.-----\n", subjectNum, activity, imuMethod); % Added newline
     % Use the posed model and rotated IMU data to perform IK.
-    imuPath = sprintf('../Subject%s/%s/IMU/%s', subjectNum, activity, imuMethod);
+    if imuMethod == "mocap"
+        basePath = sprintf('../Subject%s/%s/Mocap/', subjectNum, activity);
+    else
+        basePath = sprintf('../Subject%s/%s/IMU/%s', subjectNum, activity, imuMethod);
+    end
+   
+    modelFile_calibrated = sprintf('../Subject%s/model_Rajagopal2015_calibrated.osim', subjectNum);
     
-    % IMPORTANT: Ensure this file name matches the one generated in calibrate_model
-    modelFile_calibrated = fullfile(imuPath, 'model_Rajagopal2015_calibrated_new.osim'); 
-    
-    resultsDirectory = fullfile(imuPath, 'IKResults', sprintf('IKWithErrorsUniformWeights'));
+    resultsDirectory = fullfile(basePath, 'IKResults', sprintf('IKWithErrorsUniformWeights'));
     if ~exist(resultsDirectory, 'dir')
         mkdir(resultsDirectory);
     end
@@ -327,9 +303,10 @@ function run_imu_ik(subjectNum, activity, imuMethod, startTime, endTime)
     ik.set_time_range(1, endTime);
     
     ik.set_model_file(modelFile_calibrated);
-    rotatedOrientations = fullfile(imuPath, sprintf('%s_rotated_orientations.sto', activity));
-    ik.set_orientations_file(rotatedOrientations);
+    orientationsFile = fullfile(basePath, sprintf('%s_orientations.sto', activity));
+    ik.set_orientations_file(orientationsFile);
     ik.set_results_directory(resultsDirectory);
+    ik.set_output_motion_file(fullfile(resultsDirectory, sprintf("%s_IK.mot", activity)))
     
     disp("Launching IMU IK tool...")
     % Run IK

@@ -10,7 +10,7 @@ class RelativeFilter:
     q_wc: nimble.math.Quaternion
 
     def __init__(self, acc_std: np.ndarray = np.ones(3) * 0.05,
-                 gyro_std: np.ndarray = np.ones(3) * 0.05,
+                 gyro_std: np.ndarray = np.ones(3) * 0.01,
                  mag_std: np.ndarray = np.ones(3) * 0.05):
         gyro_diag = np.concatenate([gyro_std, gyro_std])
         self.Q = np.diag(gyro_diag)

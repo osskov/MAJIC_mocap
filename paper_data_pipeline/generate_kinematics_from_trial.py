@@ -6,21 +6,17 @@ import nimblephysics as nimble
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as minidom
 from paper_data_pipeline.marker_gap_filler import generate_trc_from_c3d
-
-from toolchest.AHRSFilter import AHRSFilter
 from toolchest.PlateTrial import PlateTrial
 from RelativeFilter import RelativeFilter
 
-JOINT_SEGMENT_DICT = {
-    'Hip': ('Pelvis', 'Femur'),
-    'Knee': ('Femur', 'Shank'),
-    'Ankle': ('Shank', 'Foot'),
-    'Lumbar_1': ('Pelvis', 'Torso'),
-    'Lumbar_2': ('Pelvis', 'Sternum'),
-    'Shoulder_1': ('Torso', 'Upper_Arm'),
-    'Shoulder_2': ('Sternum', 'Upper_Arm'),
-    'Elbow': ('Upper_Arm', 'Lower_Arm')
-}
+JOINT_SEGMENT_DICT = {'R_Hip': ('pelvis_imu', 'femur_r_imu'),
+                      'R_Knee': ('femur_r_imu', 'tibia_r_imu'),
+                      'R_Ankle': ('tibia_r_imu', 'calcn_r_imu'),
+                      'L_Hip': ('pelvis_imu', 'femur_l_imu'),
+                      'L_Knee': ('femur_l_imu', 'tibia_l_imu'),
+                      'L_Ankle': ('tibia_l_imu', 'calcn_l_imu'),
+                      'Lumbar': ('pelvis_imu', 'torso_imu'),
+                      }
 
 OBSERVABILITY_THRESHOLD = 0.2
 
@@ -122,7 +118,7 @@ def load_kinematics_from_trial_folder(trial_directory: str,
 
 
 def _generate_orientation_sto_file_(output_directory: str,
-                                    trc_name: str,
+                                    plate_trials: List[PlateTrial],
                                     num_frames: int,
                                     joints_to_include: List[str],
                                     condition: str = 'Cascade') -> Tuple[float, List[str]]:
@@ -140,7 +136,7 @@ def _generate_orientation_sto_file_(output_directory: str,
         Tuple[float, List[str]]: Returns the final time and the list of segment names.
     """
     # Load the IMU data
-    plate_trials = PlateTrial.load_cheeseburger_trial_from_folder(output_directory, trc_name)
+    # plate_trials = PlateTrial.load_cheeseburger_trial_from_folder(output_directory, trc_name)
     num_frames = num_frames if num_frames > 0 else len(plate_trials[0])
     plate_trials = [plate[:num_frames] for plate in plate_trials]
     timestamps = plate_trials[0].imu_trace.timestamps
@@ -158,18 +154,6 @@ def _generate_orientation_sto_file_(output_directory: str,
             segment_orientations[parent_plate.name] = parent_plate.world_trace.rotations[:num_frames]
             segment_orientations[child_plate.name] = child_plate.world_trace.rotations[:num_frames]
 
-    elif condition == 'EKF':
-        gravity = np.array([0., -9.81, 0.])
-        magnetic_field = np.mean([plate.estimate_world_magnetic_field() for plate in plate_trials], axis=0)
-        for plate in plate_trials:
-            imu_trace = plate.imu_trace
-            ahrs_filter = AHRSFilter('EKF', world_reference_acc=-gravity, world_reference_mag=magnetic_field)
-            dt = imu_trace.timestamps[1] - imu_trace.timestamps[0]
-            segment_orientations[plate.name] = []
-            for t in range(len(timestamps)):
-                ahrs_filter.update(dt=dt, acc=imu_trace.acc[t], gyro=imu_trace.gyro[t], mag=imu_trace.mag[t])
-                segment_orientations[plate.name].append(ahrs_filter.get_last_R())
-
     else:
         # Estimate joint angles using RelativeFilter
         for joint_name, (parent_name, child_name) in JOINT_SEGMENT_DICT.items():
@@ -184,7 +168,7 @@ def _generate_orientation_sto_file_(output_directory: str,
 
             # Form the segment orientations
             if parent_trial.name not in segment_orientations:
-                segment_orientations[parent_trial.name] = [np.eye(3) for _ in range(len(timestamps))]
+                segment_orientations[parent_trial.name] = parent_trial.world_trace.rotations[:num_frames]
 
             segment_orientations[child_trial.name] = [R_wp @ R_pc for R_wp, R_pc in
                                                       zip(segment_orientations[parent_trial.name], joint_orientations)]
@@ -196,7 +180,7 @@ def _generate_orientation_sto_file_(output_directory: str,
 
 def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
                                                child_trial: PlateTrial,
-                                               condition: str = 'Cascade') -> List[np.ndarray]:
+                                               condition: str = 'Never Project') -> List[np.ndarray]:
     """
     Estimates joint orientations between parent and child trials using specified filter conditions.
 
@@ -251,8 +235,10 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
                                 parent_jc_imu_trace.mag[t], child_jc_imu_trace.mag[t], dt)
 
         else:
-            unproj_parent_mag = (parent_trial.imu_trace.mag[t] + parent_trial.second_imu_trace.mag[t]) / 2
-            unproj_child_mag = (child_trial.imu_trace.mag[t] + child_trial.second_imu_trace.mag[t]) / 2
+            unproj_parent_mag = (parent_trial.imu_trace.mag[t] + parent_trial.second_imu_trace.mag[t]) / 2 if \
+                parent_trial.second_imu_trace is not None else parent_trial.imu_trace.mag[t]
+            unproj_child_mag = (child_trial.imu_trace.mag[t] + child_trial.second_imu_trace.mag[t]) / 2 if \
+                child_trial.second_imu_trace is not None else child_trial.imu_trace.mag[t]
 
             mag_pairs = [
                 (unproj_parent_mag, unproj_child_mag),
@@ -455,3 +441,12 @@ def _generate_ik_setup_file_(xml_file_path,
     # Write the formatted XML to file
     with open(xml_file_path, "w") as file:
         file.write(pretty_xml_as_string)
+
+plate_trials = PlateTrial.load_trial_from_folder(
+    "/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject03/walking",
+    align_plate_trials=True
+)
+
+_generate_orientation_sto_file_("/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject03/walking/IMU/majic",
+                               plate_trials,
+                                6000, [], 'Mag Free')

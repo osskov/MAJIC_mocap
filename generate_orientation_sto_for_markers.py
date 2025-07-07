@@ -118,6 +118,6 @@ def _export_to_sto_(filename,
 
 plate_trials = PlateTrial.load_trial_from_folder("data/ODay_Data/Subject03/walking", align_plate_trials=True)
 
-output_directory = "data/ODay_Data/Subject04/walking/Mocap"
+output_directory = "data/ODay_Data/Subject03/walking/Mocap"
 
 final_time, segment_names = _generate_orientation_sto_file_(output_directory, plate_trials)
