@@ -834,7 +834,7 @@ class PlateTrial:
 
         imu_slice, world_slice = PlateTrial._sync_arrays(np.linalg.norm(imu_trace.gyro, axis=1),
                                                          np.linalg.norm(synthetic_imu_trace.gyro, axis=1))
-
+        print(f"Syncing IMU trace to World trace with IMU slice {imu_slice}/{len(imu_trace)}, and World slice {world_slice}/{len(world_trace)}")
         trimmed_imu_trace = imu_trace[imu_slice].re_zero_timestamps()
         trimmed_world_trace = world_trace[world_slice].re_zero_timestamps()
 

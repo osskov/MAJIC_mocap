@@ -7,7 +7,7 @@ import org.opensim.modeling.*
 %% Define subject number and activity
 subjectNumRaw = 3; % Change this to the desired subject number (e.g., 1, 2, ..., 11)
 subjectNum = sprintf('%02d', subjectNumRaw); % Format as two digits (e.g., 1 becomes '01')
-activity = 'complexTasks'; % Change this to 'walking' or 'complexTasks'
+activity = 'walking'; % Change this to 'walking' or 'complexTasks'
 endStamp = Inf; % Change this to the desired end time in seconds (e.g., 2, 5, etc.). Inf for no limit.
 
 %% Section 1. Process Marker Based IK and Model Calibration
@@ -22,10 +22,10 @@ calibrate_model(subjectNum, activity)
 %% Section 2. Run IK for IMU Based Capture
 % Perform IMU based IK, using the orientations of the marker plates as the cost
 % function.
-% run_imu_ik(subjectNum, activity, 'mocap', -Inf, endStamp);
+run_imu_ik(subjectNum, activity, 'mocap', -Inf, endStamp);
 
 %% Section 3. Perform IMU Based IK
-imuMethods = {'xsens', 'madgwick', 'Unprojected', 'Never Project', 'Mag Free'};
+imuMethods = { 'Unprojected', 'Never Project', 'Mag Free'};
 for methodIndex = 1:length(imuMethods)
     imuMethod = imuMethods{methodIndex};
     %% Section 3A. Align and Trim Marker and IMU Data
@@ -35,7 +35,7 @@ for methodIndex = 1:length(imuMethods)
     
     %% Section 3B. IMU Kinematics
     % Use the posed model and rotated IMU data to perform IK.
-    % run_imu_ik(subjectNum, activity, imuMethod, -Inf, endStamp)
+    run_imu_ik(subjectNum, activity, imuMethod, -Inf, endStamp)
 end
 
 %% Function Definitions
@@ -66,10 +66,10 @@ function run_marker_ik(subjectNum, activity, startTime, endTime)
     ik.set_time_range(0, startTime); 
     ik.set_time_range(1, endTime);
     
-    disp("Launching IK tool...")
+    disp("Launching IK tool...\n")
     % Run IK
     ik.run();
-    disp("IK Complete.")
+    disp("IK Complete.\n")
     
     model = Model(modelFile); 
     
@@ -87,20 +87,20 @@ function run_marker_ik(subjectNum, activity, startTime, endTime)
     end
     
     % Write model to file. This is overwriting an input file, not a new generated one, so no prefix.
-    STOFileAdapter().write(markerMotion, fullfile(mocapPath, 'ikResults', strrep(trcFile, '.trc', '_IK.mot')));
-    fprintf("Updated IK motion file saved to %s\n", fullfile(mocapPath, 'ikResults', strrep(trcFile, '.trc', '_IK.mot'))); % Added newline
+    STOFileAdapter().write(markerMotion, outputMotionFile);
+    fprintf("Updated IK motion file saved to %s\n", outputMotionFile); % Added newline
 end
 
 function calibrate_model(subjectNum, activity)
     % IMPORTANT: Import OpenSim modeling package within the function scope
     import org.opensim.modeling.*
 
-    fprintf("-----Calibrating IMU Model on %s %s %s.-----\n", subjectNum, activity); % Added newline
+    fprintf("-----Calibrating IMU Model on Subject%s %s.-----\n", subjectNum, activity); % Added newline
     %% Generate a posed Model from the Marker Data.
     % The model is posed using the estimated kinematics from the (now synced)
     % marker based IK solution.
     modelFile = sprintf('../Subject%s/model_Rajagopal2015_registered.osim', subjectNum);
-    modelFile_posed = sprintf('../Subject%s/model_Rajagopal2015_posed.osim', subjectNum);
+    modelFile_posed = sprintf('../Subject%s/model_Rajagopal2015_posed_%s.osim', subjectNum, activity);
     model = Model(modelFile);
     
     motionPath = sprintf('../Subject%s/%s/Mocap/ikResults/%s_IK.mot', subjectNum, activity, activity);
@@ -125,7 +125,7 @@ function calibrate_model(subjectNum, activity)
     model.print(modelFile_posed);
     
     %% Calibrate Posed Model
-    baseIMUName = 'pelvis_imu'; visualizeCalibration = false;
+    visualizeCalibration = false;
     % Use the posed model to generate a IMU calibrated model.
     imu = IMUPlacer();
     imu.set_model_file(modelFile_posed);
@@ -133,16 +133,15 @@ function calibrate_model(subjectNum, activity)
     % orientationsFileName = fullfile(imuPath, sprintf('%s_orientations.sto', activity));
     orientationsFileName = sprintf('../Subject%s/%s/Mocap/%s_orientations.sto', subjectNum, activity, activity);
     imu.set_orientation_file_for_calibration(orientationsFileName);
-    imu.set_base_imu_label(baseIMUName);
     
     % Run the ModelCalibrator()
     imu.run(visualizeCalibration);
     
     % Write the Calibrated Model to file
     calibratedModel = imu.getCalibratedModel();
-    modelFile_calibrated = sprintf('../Subject%s/model_Rajagopal2015_calibrated.osim', subjectNum);
+    modelFile_calibrated = sprintf('../Subject%s/model_Rajagopal2015_calibrated_%s.osim', subjectNum, activity);
     calibratedModel.print(modelFile_calibrated);
-    disp("Model Calibration Complete.")
+    fprintf("Model Calibration Complete. Model saved to %s.\n", modelFile_calibrated)
 end
 
 function create_trimmed_datasets(subjectNum, activity, imuMethod)
@@ -151,25 +150,42 @@ function create_trimmed_datasets(subjectNum, activity, imuMethod)
 
     fprintf("-----Aligning Marker and IMU Data on %s %s %s.-----\n", subjectNum, activity, imuMethod); % Added newline
     % TrimFromFrame/imuTrimFromFrame data for all subjects:
-    % Subject 1: 1/42896, Subject 2: 1/68233;, Subject 3: 1/83342,  Subject 4: 2/2616,
-    % Subject 5: 1/3350,  Subject 6: 1/457,    Subject 7: 605/1,    Subject 8: 1/1576,
-    % Subject 9: 313/1,  Subject 10: 254/1,   Subject 11:  293/1.
+    % Subject1
     TrimFromFrame = 1;
     imuTrimFromFrame = 1; % Default to 1, will be updated based on subject
     switch subjectNum
         case '01'
-            imuTrimFromFrame = 42896;
+            if activity == "walking"
+                imuTrimFromFrame = 42999;
+            else
+                imuTrimFromFrame = 45573;
+            end
         case '02'
-            imuTrimFromFrame = 68233;
+            if activity == "walking"
+                imuTrimFromFrame = 68436;
+            else
+                imuTrimFromFrame = 47010;
+            end
         case '03'
-            imuTrimFromFrame = 83440;
+            if activity == "walking"
+                imuTrimFromFrame = 83444;
+            else
+                imuTrimFromFrame = 69692;
+            end
         case '04'
-            TrimFromFrame = 2;
-            imuTrimFromFrame = 2616;
+            if activity == "walking"
+                imuTrimFromFrame = 2818;
+            else
+                imuTrimFromFrame = 14780;
+            end
         case '05'
             imuTrimFromFrame = 3350;
         case '06'
-            imuTrimFromFrame = 457;
+            if activity == "walking"
+                imuTrimFromFrame = 457;
+            else
+                imuTrimFromFrame = 26780;
+            end
         case '07'
             TrimFromFrame = 605;
         case '08'
@@ -263,15 +279,17 @@ function create_trimmed_datasets(subjectNum, activity, imuMethod)
         ikData.getIndependentColumn().set(i, i*(1/mRate));
         trcData.getIndependentColumn().set(i, i*(1/mRate));
     end
+
+    trimmedTRCFile =  fullfile(mocapPath, strrep(trcFile, '.trc', '_trimmed.trc'));
+    fprintf("Saving trimmed mocap data to %s...\n", trimmedTRCFile); % Added newline
+    TRCFileAdapter().write(trcData, trimmedTRCFile); % Corrected trcFile
     
-    fprintf("Saving trimmed mocap data to %s...\n", fullfile(mocapPath, strrep(trcFile, '.trc', '_trimmed.trc'))); % Added newline
-    TRCFileAdapter().write(trcData, fullfile(mocapPath, strrep(trcFile, '.trc', '_trimmed.trc'))); % Corrected trcFile
-    
-    fprintf("Saving trimmed mocap data to %s...\n", fullfile(mocapPath, 'ikResults', strrep(trcFile, '.trc', '_IK_trimmed.mot'))); % Added newline
-    STOFileAdapter().write(ikData, fullfile(mocapPath, 'ikResults', strrep(trcFile, '.trc', '_IK_trimmed.mot'))); % Corrected trcFile
+    trimmedIKFile = fullfile(mocapPath, 'ikResults', strrep(trcFile, '.trc', '_IK_trimmed.mot'));
+    fprintf("Saving trimmed mocap data to %s...\n", trimmedIKFile); % Added newline
+    STOFileAdapter().write(ikData, trimmedIKFile); % Corrected trcFile
     
     % Display output
-    disp('Trimming Complete.');
+    disp('Trimming Complete. %s files saved to %s. Mocap files saved to %s and %s', imuMethod, orientationsFileName, trimmedTRCFile, trimmedIKFile);
 end
 
 function run_imu_ik(subjectNum, activity, imuMethod, startTime, endTime)
@@ -286,7 +304,7 @@ function run_imu_ik(subjectNum, activity, imuMethod, startTime, endTime)
         basePath = sprintf('../Subject%s/%s/IMU/%s', subjectNum, activity, imuMethod);
     end
    
-    modelFile_calibrated = sprintf('../Subject%s/model_Rajagopal2015_calibrated.osim', subjectNum);
+    modelFile_calibrated = sprintf('../Subject%s/model_Rajagopal2015_calibrated_%s.osim', subjectNum, activity);
 
     resultsDirectory = fullfile(basePath, 'IKResults', sprintf('IKWithErrorsUniformWeights'));
     if ~exist(resultsDirectory, 'dir')
@@ -309,12 +327,13 @@ function run_imu_ik(subjectNum, activity, imuMethod, startTime, endTime)
     orientationsFile = fullfile(basePath, sprintf('%s_orientations.sto', activity));
     ik.set_orientations_file(orientationsFile);
     ik.set_results_directory(resultsDirectory);
-    ik.set_output_motion_file(fullfile(resultsDirectory, sprintf("%s_IK.mot", activity)))
+    outputMotionFile = fullfile(resultsDirectory, sprintf("%s_IK.mot", activity));
+    ik.set_output_motion_file(outputMotionFile);
     if imuMethod == "xsens" || imuMethod == "mahony" || imuMethod == "madgwick"
         ik.set_sensor_to_opensim_rotations(Vec3(-pi/2,0,0));
     end
     disp("Launching IMU IK tool...")
     % Run IK
     ik.run();
-    fprintf("IMU IK Complete. File saved to: %s\n", fullfile(resultsDirectory, sprintf("%s_IK.mot", activity))); % Added newline
+    fprintf("IMU IK Complete. File saved to: %s\n", outputMotionFile); % Added newline
 end

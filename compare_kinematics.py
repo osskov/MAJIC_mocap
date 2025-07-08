@@ -45,18 +45,12 @@ def _read_mot_file_(file_path) -> Tuple[Dict[str, Any], Dict[str, List[float]]]:
     return header_info, data_dict
 
 mot_files = {
+    "ground truth": "data/DO_NOT_MODIFY_AlBorno/Subject03/walking/Mocap/ikResults/walking_IK.mot",
+    "madgwick": "data/DO_NOT_MODIFY_AlBorno/Subject03/walking/IMU/madgwick/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
     "markers": "data/ODay_Data/Subject03/walking/Mocap/ikResults/IKWithErrorsUniformWeights/walking_IK.mot",
-    "ground truth": "data/ODay_Data/Subject03/walking/Mocap/ikResults/walking_IK.mot",
-    "original madgwick": "data/DO_NOT_MODIFY_AlBorno/Subject03/walking/IMU/madgwick/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
-    # "original xsens": "data/DO_NOT_MODIFY_AlBorno/Subject03/walking/IMU/xsens/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
-    # "original orien, original model": "data/ODay_Data/Subject03/walking/IMU/madgwick/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
-    # "original orien, modified model": "data/ODay_Data/Subject03/walking/IMU/madgwick/IKResults/IKWithErrorsUniformWeights/walking_IK_markermodel.mot",
-    # "madgwick": "data/ODay_Data/Subject03/walking/IMU/madgwick/IKResults/IKWithErrorsUniformWeights/walking_IK_customOrien.mot",
     "mag free": "data/ODay_Data/Subject03/walking/IMU/Mag Free/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
-    # "unprojected": "data/ODay_Data/Subject03/walking/IMU/Unprojected/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
+    "unprojected": "data/ODay_Data/Subject03/walking/IMU/Unprojected/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
     "never project": "data/ODay_Data/Subject03/walking/IMU/Never Project/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
-    # "new xsens": "data/ODay_Data/Subject03/walking/IMU/xsens/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
-    # "new mahony": "data/ODay_Data/Subject03/walking/IMU/mahony/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
 }
 
 # mot_files = {
@@ -89,7 +83,7 @@ def compare_kinematics(datasets: Dict[str, Dict[str, List[float]]]) -> None:
     ax_idx = 0
 
     ignore_keywords = ["time", "pelvis", "arm", "elbow", "pro", "beta"]
-
+    error_by_method = {method: [] for method in datasets if method != 'ground truth'}
     for segment in ground_truth:
         if any(key in segment for key in ignore_keywords):
             continue
@@ -106,6 +100,7 @@ def compare_kinematics(datasets: Dict[str, Dict[str, List[float]]]) -> None:
             num_samples = min(len(ground_truth_values), len(values))
             error = [abs(gt - val) for gt, val in zip(ground_truth_values[:num_samples], values[:num_samples])]
             errors[method][segment] = error
+            error_by_method[method].append(np.mean(np.array(error) ** 2))  # Accumulate error for each method
 
         # Plotting per-segment bar chart
         row, col = divmod(ax_idx, num_cols)
@@ -133,6 +128,10 @@ def compare_kinematics(datasets: Dict[str, Dict[str, List[float]]]) -> None:
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.show()
+
+    for method, total_error in error_by_method.items():
+        total_error = np.mean(total_error) ** 0.5
+        print(f"Error for all joints {method}: {total_error:.2f} deg")
 
 def plot_errors(error_files):
     error_by_segment = {}

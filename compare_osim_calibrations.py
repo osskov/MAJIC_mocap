@@ -129,8 +129,9 @@ def compare_brick_rotations(file_paths):
 file_paths = [
     # "data/ODay_Data/Subject03/walking/IMU/xsens/model_Rajagopal2015_calibrated.osim",
     # "data/ODay_Data/Subject03/walking/IMU/mahony/model_Rajagopal2015_calibrated.osim",
-    "data/ODay_Data/Subject03/walking/IMU/madgwick/model_Rajagopal2015_calibrated.osim",
-    "data/DO_NOT_MODIFY_AlBorno/Subject03/walking/IMU/madgwick/model_Rajagopal2015_calibrated.osim",
+    "data/ODay_Data/Subject03/model_Rajagopal2015_calibrated.osim",
+    "data/ODay_Data/Subject03/model_Rajagopal2015_calibrated_walking.osim",
+    # "data/DO_NOT_MODIFY_AlBorno/Subject03/walking/IMU/madgwick/model_Rajagopal2015_calibrated.osim",
     # "data/ODay_Data/Subject03/model_Rajagopal2015_calibrated.osim",
     # "data/ODay_Data/Subject03/walking/IMU/xsens/model_Rajagopal2015_calibrated.osim",
     # "data/ODay_Data/Subject03/walking/IMU/mahony/model_Rajagopal2015_calibrated_new.osim",

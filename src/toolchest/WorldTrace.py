@@ -255,6 +255,25 @@ class WorldTrace:
         error_y = np.linalg.norm(y_axis - y_axis_temp_1, axis=1)
         angle_error = np.arccos(np.clip(np.sum(y_axis * y_axis_temp_1, axis=1), -1, 1)) * 180 / np.pi
         if np.mean(error_y) > 0.015 or np.mean(angle_error) > 1.0:
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(1, 5)
+            ax[0].plot(angle_error)
+            ax[0].set_title("Angle Error (deg)")
+            ax[1].plot(np.linalg.norm(marker_o - marker_x, axis=1), label='o-x')
+            ax[1].plot(np.linalg.norm(marker_o - marker_y, axis=1), label='o-y')
+            ax[1].plot(np.linalg.norm(marker_o - marker_d, axis=1), label='o-d')
+            ax[2].plot(np.linalg.norm(marker_x - marker_y, axis=1), label='x-y')
+            ax[2].plot(np.linalg.norm(marker_x - marker_d, axis=1), label='x-d')
+            ax[3].plot(np.linalg.norm(marker_y - marker_d, axis=1), label='y-d')
+            ax[1].set_title("Marker Distances from O")
+            ax[1].legend()
+            ax[2].set_title("Marker Distances from X")
+            ax[2].legend()
+            ax[3].set_title("Marker Distances from Y")
+            ax[3].legend()
+            ax[4].plot(timestamps, error_y, label='y-y_temp')
+            plt.show()
+
             print(f"Mean angle error: {np.mean(angle_error)}")
             print(f"Mean norm of y-y_temp: {np.mean(error_y)}")
 

@@ -1,11 +1,7 @@
 import os
-import subprocess
 from typing import List, Tuple, Dict, Any
 import numpy as np
 import nimblephysics as nimble
-import xml.etree.ElementTree as ET
-import xml.dom.minidom as minidom
-from marker_gap_filler import generate_trc_from_c3d
 from toolchest.PlateTrial import PlateTrial
 from RelativeFilter import RelativeFilter
 
@@ -17,105 +13,6 @@ JOINT_SEGMENT_DICT = {'R_Hip': ('pelvis_imu', 'femur_r_imu'),
                       'L_Ankle': ('tibia_l_imu', 'calcn_l_imu'),
                       'Lumbar': ('pelvis_imu', 'torso_imu'),
                       }
-
-OBSERVABILITY_THRESHOLD = 0.2
-
-
-def load_kinematics_from_trial_folder(trial_directory: str,
-                                      filter_type: str,
-                                      regenerate: bool = False,
-                                      override_weights: dict = {},
-                                      num_frames: int = -1,
-                                      joints_to_include: List[str] = None) -> \
-        Tuple[nimble.dynamics.Skeleton, nimble.biomechanics.OpenSimMot, Any]:
-    """
-    Loads the kinematics from the trial folder, generates or uses pre-existing inverse kinematics (IK) results.
-
-    Args:
-        trial_directory (str): Path to the trial folder.
-        filter_type (str): Type of filter to use for IMU data.
-        regenerate (bool): Whether to regenerate IK results. Defaults to False.
-        override_weights (dict): Weights to override for specific segments.
-        num_frames (int): Number of frames to use. Defaults to -1 (use all frames).
-        joints_to_include (List[str]): List of joint names to include in the processing.
-
-    Returns:
-        Tuple[nimble.dynamics.Skeleton, Dict[str, List[float]]]: Returns the skeleton and kinematics.
-    """
-    if joints_to_include is None:
-        joints_to_include = JOINT_SEGMENT_DICT.keys()
-
-    trial_directory = os.path.abspath(trial_directory)
-
-    # Check if IK results are already in the directory, unless the user wants to override
-    ik_results = os.path.join(trial_directory, filter_type.lower() + '_ik.mot')
-    if os.path.exists(ik_results) and (not regenerate or 'OMC' in filter_type):
-        print(f"Found existing IK results at {ik_results}. Skipping IK generation.")
-
-    else:
-        # Check if the segment orientations are present, unless the user wants to override
-        segment_orientations_path = os.path.join(trial_directory, filter_type.lower() + '_segment_orientations.sto')
-
-        if os.path.exists(segment_orientations_path) and not regenerate:
-            print(f"Found existing segment orientations file at {segment_orientations_path}.")
-
-            # load the orientation file to get the final time
-            with open(segment_orientations_path, 'r') as f:
-                lines = f.readlines()
-                imu_names = lines[5].split()[1:]
-                final_time = float(lines[-1].split()[0])
-        else:
-            print(f"Generating {segment_orientations_path} now...")
-
-            trc_file = next((f for f in os.listdir(trial_directory) if f.endswith('.trc') and 'traces' not in f), None)
-            if not trc_file:
-                print(f"Could not find a TRC file in {trial_directory}. Generating now...")
-                c3d_file = next((f for f in os.listdir(trial_directory) if f.endswith('.c3d')), None)
-                subject_dir = os.path.abspath(os.path.join(trial_directory, os.pardir))
-                mapping_path = os.path.join(subject_dir, 'marker_mapping.json')
-                generate_trc_from_c3d(c3d_file, mapping_path, trc_file)
-            final_time, imu_names = _generate_orientation_sto_file_(trial_directory, trc_file, num_frames,
-                                                                    joints_to_include, filter_type)
-
-        # Get all the paths and generate the set-up file
-        weights = {imu_name: 1.0 for imu_name in imu_names}
-        for imu_name, weight in override_weights.items():
-            try:
-                weights[imu_name] = weight
-            except KeyError:
-                print(f"Could not find {imu_name} in the orientations file. Skipping...")
-
-        xml_file_path = os.path.join(trial_directory, filter_type + '_ik_setup.xml')
-        ik_output_path = os.path.join(trial_directory, filter_type + '_ik')
-        model_file_path = os.path.join(os.path.abspath(os.path.dirname(trial_directory)), 'scaled_with_imus.osim')
-
-        _generate_ik_setup_file_(xml_file_path, trial_directory, final_time, ik_output_path,
-                                 segment_orientations_path, model_file_path, weights)
-
-        # Command to run
-        command = ['opensense', '-IK', xml_file_path]
-
-        # Run the command
-        result = subprocess.run(command, capture_output=True, text=True)
-
-        # Output the result
-        print(result.stdout)
-        if result.stderr:
-            print(result.stderr)
-
-    model_file_path = os.path.join(os.path.abspath(os.path.dirname(trial_directory)), 'scaled_with_imus.osim')
-    if not os.path.exists(model_file_path):
-        raise FileNotFoundError(f"Could not find the model file at {model_file_path}")
-
-    skeleton = nimble.biomechanics.OpenSimParser.parseOsim(model_file_path).skeleton
-    kinematics = nimble.biomechanics.OpenSimParser.loadMot(skeleton, ik_results)
-    try:
-        errors = _read_mot_file_(os.path.join(trial_directory, filter_type.lower() + '_ik_orientationErrors.sto'))[1]
-    except FileNotFoundError:
-        print("Could not find the orientation errors file. Skipping...")
-        errors = None
-    return skeleton, kinematics, errors
-
 
 def _generate_orientation_sto_file_(output_directory: str,
                                     plate_trials: List[PlateTrial],
@@ -170,7 +67,8 @@ def _generate_orientation_sto_file_(output_directory: str,
             segment_orientations[child_trial.name] = [R_wp @ R_pc for R_wp, R_pc in
                                                       zip(segment_orientations[parent_trial.name], joint_orientations)]
 
-    output_path = os.path.join(output_directory, f'walking_orientations.sto' if 'walking' in output_directory else 'complexTasks_orientations.sto')
+    output_path = os.path.join(output_directory,
+                               f'walking_orientations.sto' if 'walking' in output_directory else 'complexTasks_orientations.sto')
     _export_to_sto_(output_path, timestamps, segment_orientations)
     return timestamps[-1], list(segment_orientations.keys())
 
@@ -327,7 +225,6 @@ def _export_to_sto_(filename,
         for row in data:
             file.write("\t".join(row) + "\n")
 
-
 def _read_mot_file_(file_path) -> Tuple[Dict[str, Any], Dict[str, List[float]]]:
     """
     Reads a .mot file and parses its header and data.
@@ -368,97 +265,21 @@ def _read_mot_file_(file_path) -> Tuple[Dict[str, Any], Dict[str, List[float]]]:
 
     return header_info, data_dict
 
-
-def _generate_ik_setup_file_(xml_file_path,
-                             results_directory,
-                             final_time,
-                             ik_output_path,
-                             orientation_input_file_path,
-                             model_file_path,
-                             weights: Dict[str, float]):
-    """
-    Generates an XML setup file for the OpenSim Inverse Kinematics (IK) tool.
-
-    Args:
-        xml_file_path (str): Path to save the XML file.
-        results_directory (str): Directory where results should be saved.
-        final_time (float): Final time of the trial.
-        ik_output_path (str): Path to save the IK output file.
-        orientation_input_file_path (str): Path to the segment orientations input file.
-        model_file_path (str): Path to the model file (.osim).
-        weights (Dict[str, float]): Weights for each body segment.
-    """
-    # Root element
-    root = ET.Element("OpenSimDocument", Version="40000")
-
-    # IMUInverseKinematicsTool element
-    ik_tool = ET.SubElement(root, "IMUInverseKinematicsTool")
-
-    # Add results_directory
-    results_dir = ET.SubElement(ik_tool, "results_directory")
-    results_dir.text = os.path.abspath(results_directory)
-
-    # Add model_file
-    model_file = ET.SubElement(ik_tool, "model_file")
-    model_file.text = os.path.abspath(model_file_path)
-
-    # Add time_range
-    time_range = ET.SubElement(ik_tool, "time_range")
-    time_range.text = "0 " + str(final_time)
-
-    # Add output_motion_file
-    output_motion = ET.SubElement(ik_tool, "output_motion_file")
-    output_motion.text = os.path.abspath(ik_output_path)
-
-    # Add report_errors
-    report_errors = ET.SubElement(ik_tool, "report_errors")
-    report_errors.text = "true"
-
-    # Add sensor_to_opensim_rotations
-    sensor_rotations = ET.SubElement(ik_tool, "sensor_to_opensim_rotations")
-    sensor_rotations.text = "0 0 0"
-
-    # Add orientations_file
-    orientations_file = ET.SubElement(ik_tool, "orientations_file")
-    orientations_file.text = orientation_input_file_path
-
-    # OrientationWeightSet element
-    orientation_weights = ET.SubElement(ik_tool, "OrientationWeightSet", name="orientation_weights")
-    objects = ET.SubElement(orientation_weights, "objects")
-
-    for segment_name, segment_weight in weights.items():
-        # Add OrientationWeight for segment
-        segment = ET.SubElement(objects, "OrientationWeight", name=segment_name)
-        weight = ET.SubElement(segment, "weight")
-        weight.text = str(segment_weight)
-
-    # Convert to string and format using minidom for pretty-printing
-    xml_string = ET.tostring(root, encoding="utf-8")
-    parsed = minidom.parseString(xml_string)
-    pretty_xml_as_string = parsed.toprettyxml(indent="  ")
-
-    # Write the formatted XML to file
-    with open(xml_file_path, "w") as file:
-        file.write(pretty_xml_as_string)
+# GENERATING STO FILES
+activity = 'walking'
+subject_num = '06'
 
 plate_trials = PlateTrial.load_trial_from_folder(
-    "/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject03/walking",
+    f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}",
     align_plate_trials=True
 )
 
-for condition in ['Marker']: #, 'Unprojected', 'Mag Free', 'Never Project']:
-    output_dir = "/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject03/complexTasks/IMU/" + condition
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    _generate_orientation_sto_file_(output_dir,
-                                   plate_trials,
-                                    -1, condition)
-
-    output_dir = "/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject03/walking/IMU/" + condition
+for condition in ['Marker', 'Unprojected', 'Mag Free', 'Never Project']:
+    output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/IMU/" + condition
+    if condition == 'Marker':
+        output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/Mocap/"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     _generate_orientation_sto_file_(output_dir,
                                     plate_trials,
-                                    -1, condition)
-
-
+                                    100, condition)
