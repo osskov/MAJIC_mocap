@@ -89,7 +89,7 @@ def compare_brick_rotations(file_paths):
     for path in file_paths:
         # Get a more descriptive name: e.g., 'xsens_model_Rajagopal2015_calibrated.osim'
         parent_dir = os.path.basename(os.path.dirname(path))
-        name = f"{parent_dir}" if "new" not in path else f"{parent_dir}_new"
+        name = path
         all_data[name] = parse_osim_file(path)
 
     # Collect all brick names
@@ -127,11 +127,15 @@ def compare_brick_rotations(file_paths):
 
 # Example usage
 file_paths = [
-    "data/ODay_Data/Subject03/walking/IMU/xsens/model_Rajagopal2015_calibrated_new.osim",
     # "data/ODay_Data/Subject03/walking/IMU/xsens/model_Rajagopal2015_calibrated.osim",
-    "data/ODay_Data/Subject03/walking/IMU/mahony/model_Rajagopal2015_calibrated_new.osim",
     # "data/ODay_Data/Subject03/walking/IMU/mahony/model_Rajagopal2015_calibrated.osim",
-    "data/ODay_Data/Subject03/walking/IMU/madgwick/model_Rajagopal2015_calibrated_new.osim",
+    "data/ODay_Data/Subject03/walking/IMU/madgwick/model_Rajagopal2015_calibrated.osim",
+    "data/DO_NOT_MODIFY_AlBorno/Subject03/walking/IMU/madgwick/model_Rajagopal2015_calibrated.osim",
+    # "data/ODay_Data/Subject03/model_Rajagopal2015_calibrated.osim",
+    # "data/ODay_Data/Subject03/walking/IMU/xsens/model_Rajagopal2015_calibrated.osim",
+    # "data/ODay_Data/Subject03/walking/IMU/mahony/model_Rajagopal2015_calibrated_new.osim",
+    # "data/ODay_Data/Subject03/walking/IMU/mahony/model_Rajagopal2015_calibrated.osim",
+    # "data/ODay_Data/Subject03/walking/IMU/madgwick/model_Rajagopal2015_calibrated_new.osim",
     # "data/ODay_Data/Subject03/walking/IMU/madgwick/model_Rajagopal2015_calibrated.osim",
 ]
 

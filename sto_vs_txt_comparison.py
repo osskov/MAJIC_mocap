@@ -160,7 +160,7 @@ def get_joint_orientations_from_segment_orientations(
 
 # plates = PlateTrial.load_trial_from_folder('data/Subject03/walking')
 imu_folder_path = os.path.join('data', 'ODay_Data', 'Subject03', 'walking', 'IMU')
-# sensor_rotation_matrices = load_sensor_rotations_from_folder(imu_folder_path)
+sensor_rotation_matrices = load_sensor_rotations_from_folder(imu_folder_path)
 segment_rotation_matrices = load_segment_orientations_from_folder(imu_folder_path)
 
 # Also add the orientations for the majic filter
@@ -175,45 +175,45 @@ segment_rotation_matrices = load_segment_orientations_from_folder(imu_folder_pat
 # # plt.plot(flm0_sto, label='.sto index')
 # # plt.show()
 #
-# slice1_list = []
-# slice2_list = []
-# for sensor_name in sensor_rotation_matrices:
-#     if sensor_name not in segment_rotation_matrices:
-#         continue
-#     for method in sensor_rotation_matrices[sensor_name]:
-#         for i in range(3):
-#             for j in range(3):
-#                 array_1 = np.array([rot[i, j] for rot in sensor_rotation_matrices[sensor_name][method]])
-#                 array_2 = np.array([rot[i, j] for rot in segment_rotation_matrices[sensor_name][method]])
-#                 slice1, slice2 = _sync_arrays(array_1, array_2)
-#                 slice1_list.append(slice1)
-#                 slice2_list.append(slice2)
-#
-# # Treat None as 0 for sorting purposes
-# sorted_slice1 = sorted(slice1_list, key=lambda s: s.start if s.start is not None else 0)
-# slice1 = sorted_slice1[len(sorted_slice1) // 2]  # Take the middle slice
-# sorted_slice2 = sorted(slice2_list, key=lambda s: s.start if s.start is not None else 0)
-# slice2 = sorted_slice2[len(sorted_slice2) // 2]  # Take the middle slice
-#
-# rotation_difference = {}
-# for sensor_name in sensor_rotation_matrices:
-#     if sensor_name not in segment_rotation_matrices:
-#         continue
-#     rotation_difference[sensor_name] = {}
-#     for method in sensor_rotation_matrices[sensor_name]:
-#         rotation_difference[sensor_name][method] = [rot1 @ rot2.T for rot1, rot2 in
-#                                                     zip(sensor_rotation_matrices[sensor_name][method][slice1],
-#                                                         segment_rotation_matrices[sensor_name][method][slice2])]
-#         # Calculate the mean and standard deviation for each element in the rotation matrices
-#         # Convert the rotation matrices to euler angles
-#         rotation_difference[sensor_name][method] = [nimble.math.matrixToEulerXYZ(rot) for rot in
-#                                                     rotation_difference[sensor_name][method]]
-#         for i in range(3):
-#             # for j in range(3):
-#                 mean_value = np.mean([rot[i] for rot in rotation_difference[sensor_name][method]])
-#                 std_value = np.std([rot[i] for rot in rotation_difference[sensor_name][method]])
-#                 print(f"Sensor: {sensor_name}, Method: {method}, Element ({i}): Mean = {mean_value}, Std = {std_value}")
-#
+slice1_list = []
+slice2_list = []
+for sensor_name in sensor_rotation_matrices:
+    if sensor_name not in segment_rotation_matrices:
+        continue
+    for method in sensor_rotation_matrices[sensor_name]:
+        for i in range(3):
+            for j in range(3):
+                array_1 = np.array([rot[i, j] for rot in sensor_rotation_matrices[sensor_name][method]])
+                array_2 = np.array([rot[i, j] for rot in segment_rotation_matrices[sensor_name][method]])
+                slice1, slice2 = _sync_arrays(array_1, array_2)
+                slice1_list.append(slice1)
+                slice2_list.append(slice2)
+
+# Treat None as 0 for sorting purposes
+sorted_slice1 = sorted(slice1_list, key=lambda s: s.start if s.start is not None else 0)
+slice1 = sorted_slice1[len(sorted_slice1) // 2]  # Take the middle slice
+sorted_slice2 = sorted(slice2_list, key=lambda s: s.start if s.start is not None else 0)
+slice2 = sorted_slice2[len(sorted_slice2) // 2]  # Take the middle slice
+
+rotation_difference = {}
+for sensor_name in sensor_rotation_matrices:
+    if sensor_name not in segment_rotation_matrices:
+        continue
+    rotation_difference[sensor_name] = {}
+    for method in sensor_rotation_matrices[sensor_name]:
+        rotation_difference[sensor_name][method] = [rot1 @ rot2.T for rot1, rot2 in
+                                                    zip(sensor_rotation_matrices[sensor_name][method][slice1],
+                                                        segment_rotation_matrices[sensor_name][method][slice2])]
+        # Calculate the mean and standard deviation for each element in the rotation matrices
+        # Convert the rotation matrices to euler angles
+        rotation_difference[sensor_name][method] = [nimble.math.matrixToEulerXYZ(rot) for rot in
+                                                    rotation_difference[sensor_name][method]]
+        for i in range(3):
+            # for j in range(3):
+                mean_value = np.mean([rot[i] for rot in rotation_difference[sensor_name][method]])
+                std_value = np.std([rot[i] for rot in rotation_difference[sensor_name][method]])
+                print(f"Sensor: {sensor_name}, Method: {method}, Element ({i}): Mean = {mean_value}, Std = {std_value}")
+
 # for sensor_name in sensor_rotation_matrices:
 #     rotation_difference[sensor_name] = {}
 #     if sensor_name not in segment_rotation_matrices:
@@ -242,7 +242,7 @@ segment_rotation_matrices = load_segment_orientations_from_folder(imu_folder_pat
 #
 #
 #
-joint_orientations = get_joint_orientations_from_segment_orientations(segment_rotation_matrices)
+# joint_orientations = get_joint_orientations_from_segment_orientations(segment_rotation_matrices)
 
 #
 # for sensor_name in sensor_rotation_matrices:

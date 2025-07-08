@@ -1,33 +1,41 @@
 %% Example Script to demonstrate the Marker and IMU tracking Workflow.
 % Master script and notes for Generic Subject Experiment
-clear all; close all;clc;
+clear all; close all; clc;
+import org.opensim.modeling.*
+ 
 
 %% Define subject number and activity
 subjectNumRaw = 3; % Change this to the desired subject number (e.g., 1, 2, ..., 11)
 subjectNum = sprintf('%02d', subjectNumRaw); % Format as two digits (e.g., 1 becomes '01')
-activity = 'walking'; % Change this to 'walking' or 'complexTasks'
-endStamp = 60;
+activity = 'complexTasks'; % Change this to 'walking' or 'complexTasks'
+endStamp = Inf; % Change this to the desired end time in seconds (e.g., 2, 5, etc.). Inf for no limit.
 
-%% Section 1. Process Marker Based IK
-% Perform Marker based IK using the IKTool. Tracking is performed using
-% only the IMU plate based markers.
+%% Section 1. Process Marker Based IK and Model Calibration
+% Perform traditional marker based IK, with marker distances as the cost function,
+% using the IKTool. 
 % run_marker_ik(subjectNum, activity, -Inf, endStamp)
-   
-%% Section 2. Create Calibrated Model
-% calibrate_model(subjectNum, activity)
 
-%% Run IK for IMU Based Capture
+% Use the posed model from the marker based IK solution to calibrate the placement
+% of the IMUs on the model.
+calibrate_model(subjectNum, activity)
+
+%% Section 2. Run IK for IMU Based Capture
+% Perform IMU based IK, using the orientations of the marker plates as the cost
+% function.
 % run_imu_ik(subjectNum, activity, 'mocap', -Inf, endStamp);
 
-imuMethods = {'majic'};%'madgwick', 'mahony', 'xsens'}; 
+%% Section 3. Perform IMU Based IK
+imuMethods = {'xsens', 'madgwick', 'Unprojected', 'Never Project', 'Mag Free'};
 for methodIndex = 1:length(imuMethods)
     imuMethod = imuMethods{methodIndex};
-    %% Section 3. Align and Trim Marker and IMU Data
-    % create_trimmed_datasets(subjectNum, activity, imuMethod)
+    %% Section 3A. Align and Trim Marker and IMU Data
+    if imuMethod == "xsens" || imuMethod == "mahony" || imuMethod == "madgwick"
+        % create_trimmed_datasets(subjectNum, activity, imuMethod)
+    end
     
-    %% Section 4. IMU Kinematics
+    %% Section 3B. IMU Kinematics
     % Use the posed model and rotated IMU data to perform IK.
-    run_imu_ik(subjectNum, activity, imuMethod, -Inf, endStamp)
+    % run_imu_ik(subjectNum, activity, imuMethod, -Inf, endStamp)
 end
 
 %% Function Definitions
@@ -36,7 +44,7 @@ function run_marker_ik(subjectNum, activity, startTime, endTime)
     import org.opensim.modeling.*
 
     fprintf("-----Running MoCap Inverse Kinematics on %s %s.-----\n", subjectNum, activity); % Added newline
-    ik = InverseKinematicsTool('Setup_IK_Walking.xml');
+    ik = InverseKinematicsTool('Setup_Marker_IK.xml');
     
     % This code uses the original registered model from the OpenSense paper
     modelFile = sprintf('../Subject%s/model_Rajagopal2015_registered.osim', subjectNum);
@@ -65,7 +73,7 @@ function run_marker_ik(subjectNum, activity, startTime, endTime)
     
     model = Model(modelFile); 
     
-    % Load the results of the IK run
+    % Set the translation coordinated to the default values.
     markerMotion = TimeSeriesTable(outputMotionFile);
     labels = markerMotion.getColumnLabels();
     for i = 0 : markerMotion.getNumColumns() - 1
@@ -100,7 +108,6 @@ function calibrate_model(subjectNum, activity)
     
     % Cycle through the model coordinates and update the default values.
     cs = model.getCoordinateSet();
-    pelvis_rotation = 0;
     for i = 0 : cs.getSize() - 1
         % Get the Coordinate value from the the motion data.
         % Ensure the column index matches the coordinate index
@@ -109,9 +116,6 @@ function calibrate_model(subjectNum, activity)
         % Check if the coordinate is Rotational and convert to radians
         if strcmp('Rotational', char(cs.get(i).getMotionType()))
             % Assuming pelvis_rotation corresponds to a specific coordinate, e.g., index 2
-            if i == 2 % This index (2) needs to correspond to the pelvis rotation coordinate
-                pelvis_rotation = value;
-            end
             value = deg2rad(value);
         end
         cs.get(i).set_default_value( value );
@@ -129,7 +133,6 @@ function calibrate_model(subjectNum, activity)
     % orientationsFileName = fullfile(imuPath, sprintf('%s_orientations.sto', activity));
     orientationsFileName = sprintf('../Subject%s/%s/Mocap/%s_orientations.sto', subjectNum, activity, activity);
     imu.set_orientation_file_for_calibration(orientationsFileName);
-    imu.set_base_heading_axis('z');
     imu.set_base_imu_label(baseIMUName);
     
     % Run the ModelCalibrator()
@@ -284,7 +287,7 @@ function run_imu_ik(subjectNum, activity, imuMethod, startTime, endTime)
     end
    
     modelFile_calibrated = sprintf('../Subject%s/model_Rajagopal2015_calibrated.osim', subjectNum);
-    
+
     resultsDirectory = fullfile(basePath, 'IKResults', sprintf('IKWithErrorsUniformWeights'));
     if ~exist(resultsDirectory, 'dir')
         mkdir(resultsDirectory);
@@ -292,7 +295,7 @@ function run_imu_ik(subjectNum, activity, imuMethod, startTime, endTime)
     
     % Determine the IK setup XML filename based on the activity
     % These are typically input files, not generated, so no prefix here.
-    ikSetupXML = 'Setup_IK_Walking_IMU_extremely_low_feet_weights.xml';
+    ikSetupXML = 'Setup_IMU_IK.xml';
     
     % Instantiate an InverseKinematicsStudy
     ik = IMUInverseKinematicsTool(ikSetupXML);
@@ -307,9 +310,11 @@ function run_imu_ik(subjectNum, activity, imuMethod, startTime, endTime)
     ik.set_orientations_file(orientationsFile);
     ik.set_results_directory(resultsDirectory);
     ik.set_output_motion_file(fullfile(resultsDirectory, sprintf("%s_IK.mot", activity)))
-    
+    if imuMethod == "xsens" || imuMethod == "mahony" || imuMethod == "madgwick"
+        ik.set_sensor_to_opensim_rotations(Vec3(-pi/2,0,0));
+    end
     disp("Launching IMU IK tool...")
     % Run IK
     ik.run();
-    disp("IMU IK Complete.")
+    fprintf("IMU IK Complete. File saved to: %s\n", fullfile(resultsDirectory, sprintf("%s_IK.mot", activity))); % Added newline
 end

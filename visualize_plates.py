@@ -4,6 +4,8 @@ from matplotlib.widgets import Slider, Button
 import matplotlib.animation as animation
 from typing import List, Optional, Tuple, Dict
 import os
+import pandas as pd
+import nimblephysics as nimble
 
 # --- Import your actual classes here ---
 # Ensure that PlateTrial.py, IMUTrace.py, and WorldTrace.py are in your Python path
@@ -218,7 +220,53 @@ if __name__ == "__main__":
 
 
     all_plate_trials: List[PlateTrial] = PlateTrial.load_trial_from_folder("data/ODay_Data/Subject03/walking", False)
+    copy_plate_trials = PlateTrial.load_trial_from_folder("data/ODay_Data/Subject03/walking", True)  # Create a copy of the trials
+    def load_segment_orientations_from_folder(imu_folder_path: str):
+        # find the subdirectories in the IMU folder
+        subdirs = [d for d in os.listdir(imu_folder_path) if os.path.isdir(os.path.join(imu_folder_path, d))]
+        subdirs += ['markers']
+        rotation_matrices = {}
+        for subdir in subdirs:
+            file_path = os.path.join(imu_folder_path, subdir, 'walking_orientations.sto')
+            if 'markers' in subdir:
+                file_path = "/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject03/walking/Mocap/walking_orientations.sto"
+            # Read the file to find the endHeader index
+            end_header_index = 0
+            with open(file_path, 'r') as f:
+                for i, line in enumerate(f):
+                    end_header_index = i + 1
+                    if line.startswith('endheader'):
+                        break
+            # Read the file into a DataFrame
+            df = pd.read_csv(file_path, delimiter='\t', skiprows=end_header_index)
+
+            # Apply the function to convert columns from strings, to arrays of 4 numbers
+            df = df.map(lambda x: np.array([float(i) for i in x.split(',')]) if isinstance(x, str) else x)
+            df = df.map(lambda x: nimble.math.expMapRot(
+                nimble.math.quatToExp(nimble.math.Quaternion(x[0], x[1], x[2], x[3]))) if isinstance(x,
+                                                                                                     np.ndarray) and len(
+                x) == 4 else x)
+
+            for col in df.columns:
+                if col != 'time':
+                    if col not in rotation_matrices:
+                        rotation_matrices[col] = {}
+                    # Convert the column to a list
+                    rotation_matrices[col][subdir] = df[col].tolist()
+        return rotation_matrices
+
+    rotation_matrices = load_segment_orientations_from_folder("data/ODay_Data/Subject03/walking/IMU")
+
+    # replace all the worldtrace rotations in the plate trials with a chosen set of rotations
+    for trial in all_plate_trials:
+        if trial.name in rotation_matrices:
+            rotation_difference = trial.world_trace.rotations[0].T @ rotation_matrices[trial.name]['mahony'][0]
+            print(f"Rotation difference for trial {trial.name}: {rotation_difference}")
+            trial.world_trace.rotations = rotation_matrices[trial.name]['madgwick']
+
+    all_plate_trials += copy_plate_trials  # Add the copied trials for comparison
     all_plate_trials = [trial[:100] for trial in all_plate_trials]  # Limit to first 100 timesteps for faster visualization
+
     # for i in range(11):
     #     subject = f"Subject{i+1:02d}"
     #     # The user provided this line for loading data:

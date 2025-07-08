@@ -5,7 +5,7 @@ import numpy as np
 import nimblephysics as nimble
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as minidom
-from paper_data_pipeline.marker_gap_filler import generate_trc_from_c3d
+from marker_gap_filler import generate_trc_from_c3d
 from toolchest.PlateTrial import PlateTrial
 from RelativeFilter import RelativeFilter
 
@@ -120,7 +120,6 @@ def load_kinematics_from_trial_folder(trial_directory: str,
 def _generate_orientation_sto_file_(output_directory: str,
                                     plate_trials: List[PlateTrial],
                                     num_frames: int,
-                                    joints_to_include: List[str],
                                     condition: str = 'Cascade') -> Tuple[float, List[str]]:
     """
     Generates a .sto file containing segment orientations from IMU data.
@@ -144,8 +143,6 @@ def _generate_orientation_sto_file_(output_directory: str,
 
     if condition == 'Marker':
         for joint, (parent, child) in JOINT_SEGMENT_DICT.items():
-            if joint not in joints_to_include:
-                continue
             parent_plate = next((p for p in plate_trials if p.name.__contains__(parent)), None)
             child_plate = next((p for p in plate_trials if p.name.__contains__(child)), None)
             if not parent_plate or not child_plate:
@@ -173,7 +170,7 @@ def _generate_orientation_sto_file_(output_directory: str,
             segment_orientations[child_trial.name] = [R_wp @ R_pc for R_wp, R_pc in
                                                       zip(segment_orientations[parent_trial.name], joint_orientations)]
 
-    output_path = os.path.join(output_directory, f'{condition.lower()}_segment_orientations.sto')
+    output_path = os.path.join(output_directory, f'walking_orientations.sto' if 'walking' in output_directory else 'complexTasks_orientations.sto')
     _export_to_sto_(output_path, timestamps, segment_orientations)
     return timestamps[-1], list(segment_orientations.keys())
 
@@ -194,6 +191,8 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
     """
     # Create the filter structure
     joint_filter = RelativeFilter()
+    joint_filter.set_qs(nimble.math.expToQuat(nimble.math.logMap(parent_trial.world_trace.rotations[0])),
+                        nimble.math.expToQuat(nimble.math.logMap(child_trial.world_trace.rotations[0])))
     dt = parent_trial.imu_trace.timestamps[1] - parent_trial.imu_trace.timestamps[0]
     R_pc = []
 
@@ -447,6 +446,19 @@ plate_trials = PlateTrial.load_trial_from_folder(
     align_plate_trials=True
 )
 
-_generate_orientation_sto_file_("/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject03/walking/IMU/majic",
-                               plate_trials,
-                                6000, [], 'Mag Free')
+for condition in ['Marker']: #, 'Unprojected', 'Mag Free', 'Never Project']:
+    output_dir = "/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject03/complexTasks/IMU/" + condition
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    _generate_orientation_sto_file_(output_dir,
+                                   plate_trials,
+                                    -1, condition)
+
+    output_dir = "/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject03/walking/IMU/" + condition
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    _generate_orientation_sto_file_(output_dir,
+                                    plate_trials,
+                                    -1, condition)
+
+

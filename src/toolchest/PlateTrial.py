@@ -86,19 +86,13 @@ class PlateTrial:
         return PlateTrial(self.name, self.imu_trace[key], self.world_trace[key], self.second_imu_trace[key] if self.second_imu_trace is not None else None)
 
     def align_world_trace_to_imu_trace(self) -> 'PlateTrial':
-        # Generate synthetic world trace
         synthetic_imu_trace = self.world_trace.calculate_imu_trace()
-        # Call imu_trace.calculate_rotation_offset_from_gyros(synthetic_world_trace)
         R_wt_it = synthetic_imu_trace.calculate_rotation_offset_from_gyros(self.imu_trace)
-        print(f"{self.name} rotation offset from gyros: {R_wt_it}")
-        error = synthetic_imu_trace.calculate_gyro_angle_error(self.imu_trace)
-        # print(self.name + ': ' + str(error))
-        # Call imu_trace.rotate_rot
-        new_plate = PlateTrial(self.name, self.imu_trace.right_rotate(R_wt_it.T), self.world_trace,
-                               self.second_imu_trace.right_rotate(
-                                   R_wt_it.T) if self.second_imu_trace is not None else None)
-        # new_plate.imu_offset = R_wt_it @ self.imu_offset
-        # new_plate.second_imu_offset = R_wt_it @ self.second_imu_offset
+        # print(f"{self.name} rotation offset from gyros: {R_wt_it}")
+        # error = synthetic_imu_trace.calculate_gyro_angle_error(self.imu_trace)
+        new_world_rotations = [R_wt_it.T @ rot for rot in self.world_trace.rotations]
+        new_world_trace = WorldTrace(self.world_trace.timestamps, self.world_trace.positions, new_world_rotations)
+        new_plate = PlateTrial(self.name, self.imu_trace, new_world_trace, self.second_imu_trace)
         return new_plate
 
     def rotate_to_world_frame(self) -> 'PlateTrial':

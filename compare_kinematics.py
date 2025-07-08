@@ -44,101 +44,125 @@ def _read_mot_file_(file_path) -> Tuple[Dict[str, Any], Dict[str, List[float]]]:
 
     return header_info, data_dict
 
-mot_files = ["data/ODay_Data/Subject03/walking/Mocap/ikResults/walking_IK.mot",
-             "data/ODay_Data/Subject03/walking/Mocap/ikResults/IKWithErrorsUniformWeights/walking_IK.mot",
-             "data/ODay_Data/Subject03/walking/IMU/xsens/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
-             "data/ODay_Data/Subject03/walking/IMU/mahony/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
-             "data/ODay_Data/Subject03/walking/IMU/madgwick/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
-             "data/ODay_Data/Subject03/walking/IMU/majic/IKResults/IKWithErrorsUniformWeights/walking_IK.mot"]
+mot_files = {
+    "markers": "data/ODay_Data/Subject03/walking/Mocap/ikResults/IKWithErrorsUniformWeights/walking_IK.mot",
+    "ground truth": "data/ODay_Data/Subject03/walking/Mocap/ikResults/walking_IK.mot",
+    "original madgwick": "data/DO_NOT_MODIFY_AlBorno/Subject03/walking/IMU/madgwick/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
+    # "original xsens": "data/DO_NOT_MODIFY_AlBorno/Subject03/walking/IMU/xsens/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
+    # "original orien, original model": "data/ODay_Data/Subject03/walking/IMU/madgwick/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
+    # "original orien, modified model": "data/ODay_Data/Subject03/walking/IMU/madgwick/IKResults/IKWithErrorsUniformWeights/walking_IK_markermodel.mot",
+    # "madgwick": "data/ODay_Data/Subject03/walking/IMU/madgwick/IKResults/IKWithErrorsUniformWeights/walking_IK_customOrien.mot",
+    "mag free": "data/ODay_Data/Subject03/walking/IMU/Mag Free/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
+    # "unprojected": "data/ODay_Data/Subject03/walking/IMU/Unprojected/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
+    "never project": "data/ODay_Data/Subject03/walking/IMU/Never Project/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
+    # "new xsens": "data/ODay_Data/Subject03/walking/IMU/xsens/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
+    # "new mahony": "data/ODay_Data/Subject03/walking/IMU/mahony/IKResults/IKWithErrorsUniformWeights/walking_IK.mot",
+}
+
+# mot_files = {
+#     "markers": "data/ODay_Data/Subject03/complexTasks/Mocap/ikResults/IKWithErrorsUniformWeights/complexTasks_IK.mot",
+#     "ground truth": "data/DO_NOT_MODIFY_AlBorno/Subject03/complexTasks/Mocap/ikResults/complexTasks_IK.mot",
+#     "madgwick": "data/ODay_Data/Subject03/complexTasks/IMU/madgwick/IKResults/IKWithErrorsUniformWeights/complexTasks_IK.mot",
+#     "xsens": "data/ODay_Data/Subject03/complexTasks/IMU/xsens/IKResults/IKWithErrorsUniformWeights/complexTasks_IK.mot",
+#     # "mag free": "data/ODay_Data/Subject03/complexTasks/IMU/Mag Free/IKResults/IKWithErrorsUniformWeights/complexTasks_IK.mot",
+#     "unprojected": "data/ODay_Data/Subject03/complexTasks/IMU/Unprojected/IKResults/IKWithErrorsUniformWeights/complexTasks_IK.mot",
+#     "never project": "data/ODay_Data/Subject03/complexTasks/IMU/Never Project/IKResults/IKWithErrorsUniformWeights/complexTasks_IK.mot",
+# }
 
 # Add "_orientationErrors.sto" to the end of each file name
-error_files = [mot_file.replace(".mot", ".mot_orientationErrors.sto") for mot_file in mot_files]
+error_files = {name: mot_file.replace(".mot", ".mot_orientationErrors.sto") for name, mot_file in mot_files.items()}
 
-datasets = []
-for mot_file in mot_files:
+datasets = {}
+for name, mot_file in mot_files.items():
     header, data = _read_mot_file_(mot_file)
-    datasets.append(data)
+    datasets[name] = data
 
-def compare_kinematics(datasets: List[Dict[str, List[float]]]) -> None:
-    ground_truth = datasets[1]
-    marker_ik = datasets[0]
-    xsens_ik = datasets[2]
-    mahony_ik = datasets[3]
-    madgwick_ik = datasets[4]
-    majic_ik = datasets[5]  # Assuming this is the Majic IK results
 
-    errors = {
-        "marker": {},
-        "xsens": {},
-        "mahony": {},
-        "madgwick": {},
-        "majic": {}
-    }
+def compare_kinematics(datasets: Dict[str, Dict[str, List[float]]]) -> None:
+    ground_truth = datasets['ground truth']
+    num_rows = 3
+    num_cols = 5
+    errors = {}
 
-    for key in ground_truth.keys():
-        if key == "time" or "pelvis" in key or "arm" in key or "elbow" in key or "pro" in key or "beta" in key:
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(16, 12), sharey=True)
+    fig.suptitle("Kinematic Error Comparison", fontsize=16)
+    ax_idx = 0
+
+    ignore_keywords = ["time", "pelvis", "arm", "elbow", "pro", "beta"]
+
+    for segment in ground_truth:
+        if any(key in segment for key in ignore_keywords):
             continue
-        print(f"Comparing {key}:")
-        gt_values = ground_truth[key]
-        marker_values = marker_ik[key]
-        xsens_values = xsens_ik[key]
-        mahony_values = mahony_ik[key]
-        madgwick_values = madgwick_ik[key]
-        majic_values = majic_ik[key]
-        marker_error = [abs(gt - mk) for gt, mk in zip(gt_values, marker_values)]
-        xsens_error = [abs(gt - xs) for gt, xs in zip(gt_values, xsens_values)]
-        mahony_error = [abs(gt - mh) for gt, mh in zip(gt_values, mahony_values)]
-        madgwick_error = [abs(gt - md) for gt, md in zip(gt_values, madgwick_values)]
-        majic_error = [abs(gt - mj) for gt, mj in zip(gt_values, majic_values)]
-        errors["majic"][key] = majic_error
-        errors["marker"][key] = marker_error
-        errors["xsens"][key] = xsens_error
-        errors["mahony"][key] = mahony_error
-        errors["madgwick"][key] = madgwick_error
 
-        plt.Figure()
-        plt.plot(ground_truth["time"], marker_error, label='Marker IK Error', color='blue')
-        plt.plot(ground_truth["time"], xsens_error, label='Xsens IK Error', color='orange')
-        plt.plot(ground_truth["time"], mahony_error, label='Mahony IK Error', color='green')
-        plt.plot(ground_truth["time"], madgwick_error, label='Madgwick IK Error', color='red')
-        plt.plot(ground_truth["time"][:-1], majic_error, label='Majic IK Error', color='purple')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Error (deg)')
-        plt.title(f'IK Error Comparison for {key}')
-        plt.legend()
-        plt.grid()
-        plt.show()
+        print(f"\nComparing {segment}:")
+        ground_truth_values = ground_truth[segment]
 
-        # Make bar chart too for mean and whiskers for std
-        plt.Figure()
-        plt.bar(['Marker', 'Xsens', 'Mahony', 'Madgwick', 'Majic'],
-                [sum(marker_error)/len(marker_error), sum(xsens_error)/len(xsens_error),
-                 sum(mahony_error)/len(mahony_error), sum(madgwick_error)/len(madgwick_error), sum(majic_error)/len(majic_error)],
-                yerr=[np.std(marker_error), np.std(xsens_error), np.std(mahony_error), np.std(madgwick_error), np.std(majic_error)],
-                capsize=5, color=['blue', 'orange', 'green', 'red', 'purple'])
-        plt.ylabel('Mean Error (deg)')
-        plt.title(f'Mean IK Error Comparison for {key}')
-        plt.grid()
-        plt.show()
+        for method in datasets:
+            if method == 'ground truth':
+                continue
+            if method not in errors:
+                errors[method] = {}
+            values = datasets[method].get(segment, [])
+            num_samples = min(len(ground_truth_values), len(values))
+            error = [abs(gt - val) for gt, val in zip(ground_truth_values[:num_samples], values[:num_samples])]
+            errors[method][segment] = error
+
+        # Plotting per-segment bar chart
+        row, col = divmod(ax_idx, num_cols)
+        ax = axes[row][col]
+        ax_idx += 1
+
+        for i, (method, seg_errors) in enumerate(errors.items()):
+            if segment not in seg_errors:
+                continue
+            err = np.array(seg_errors[segment])
+            mean = np.mean(err ** 2) ** 0.5  # RMS error
+            std = np.std(err)
+            print(f"{method}: Mean = {mean:.2f} deg, Std = {std:.2f} deg")
+            ax.bar(i, mean, yerr=std, capsize=5, label=method)
+
+        ax.set_title(segment)
+        ax.set_ylabel("Error (deg)")
+        ax.set_xticks(range(len(errors)))
+        ax.set_xticklabels([m for m in errors if segment in errors[m]], rotation=45, ha='right')
+
+    # Hide unused subplots
+    for i in range(ax_idx, num_rows * num_cols):
+        row, col = divmod(i, num_cols)
+        fig.delaxes(axes[row][col])
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.show()
 
 def plot_errors(error_files):
-    for error_file in error_files:
-        if "ik" in error_file:
+    error_by_segment = {}
+    for method, error_file in error_files.items():
+        if "ground truth" in method or "trad markers" in method:
             continue
         header, data = _read_mot_file_(error_file)
-        time = data['time']
-        errors = {key: data[key] for key in data.keys() if key != 'time'}
+        for segment, values in data.items():
+            if segment == 'time':
+                continue
+            if segment not in error_by_segment:
+                error_by_segment[segment] = {}
+            error_by_segment[segment][method] = values
 
-        plt.figure(figsize=(10, 6))
-        for key, values in errors.items():
-            values = np.array(values)
-            plt.plot(time, values * 180/np.pi, label=key)
-        plt.xlabel('Time (s)')
-        plt.ylabel('Error (deg)')
-        plt.title(f'Orientation Errors from {error_file}')
-        plt.legend()
-        plt.grid()
-        plt.show()
+
+    # Make a plot with axes for each segment
+    num_segments = len([key for key in error_by_segment.keys()])
+    counter = 0
+    fig, ax = plt.subplots(1, num_segments, sharey=True)
+    for key, errors_by_method in error_by_segment.items():
+        for method, values in errors_by_method.items():
+            error_mean = np.mean(values)
+            error_std = np.std(values)
+            ax[counter].bar(method, error_mean, yerr=error_std, label=method)
+        ax[counter].set_title(key)
+        ax[counter].set_xlabel('Method')
+        ax[counter].set_ylabel('Error (deg)')
+        counter += 1
+    plt.show()
+
 
 # plot_errors(error_files)
 compare_kinematics(datasets)
