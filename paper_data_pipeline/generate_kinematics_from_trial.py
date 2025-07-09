@@ -17,7 +17,7 @@ JOINT_SEGMENT_DICT = {'R_Hip': ('pelvis_imu', 'femur_r_imu'),
 def _generate_orientation_sto_file_(output_directory: str,
                                     plate_trials: List[PlateTrial],
                                     num_frames: int,
-                                    condition: str = 'Cascade') -> Tuple[float, List[str]]:
+                                    condition: str = 'Never Project') -> Tuple[float, List[str]]:
     """
     Generates a .sto file containing segment orientations from IMU data.
 
@@ -32,13 +32,12 @@ def _generate_orientation_sto_file_(output_directory: str,
         Tuple[float, List[str]]: Returns the final time and the list of segment names.
     """
     # Load the IMU data
-    # plate_trials = PlateTrial.load_cheeseburger_trial_from_folder(output_directory, trc_name)
     num_frames = num_frames if num_frames > 0 else len(plate_trials[0])
     plate_trials = [plate[:num_frames] for plate in plate_trials]
     timestamps = plate_trials[0].imu_trace.timestamps
     segment_orientations = {}
 
-    if condition == 'Marker':
+    if condition == 'marker':
         for joint, (parent, child) in JOINT_SEGMENT_DICT.items():
             parent_plate = next((p for p in plate_trials if p.name.__contains__(parent)), None)
             child_plate = next((p for p in plate_trials if p.name.__contains__(child)), None)
@@ -75,7 +74,7 @@ def _generate_orientation_sto_file_(output_directory: str,
 
 def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
                                                child_trial: PlateTrial,
-                                               condition: str = 'Never Project') -> List[np.ndarray]:
+                                               condition: str = 'never project') -> List[np.ndarray]:
     """
     Estimates joint orientations between parent and child trials using specified filter conditions.
 
@@ -95,80 +94,21 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
     R_pc = []
 
     # If we're going to need some projected information, we should generate it now.
-    if condition != 'Unprojected':
+    if condition != 'unprojected':
         parent_joint_center_offset, child_joint_center_offset, error = parent_trial.world_trace.get_joint_center(
             child_trial.world_trace)
 
-        parent_jc_imu_trace = parent_trial.project_imu_trace(parent_joint_center_offset)
-        child_jc_imu_trace = child_trial.project_imu_trace(child_joint_center_offset)
+        parent_trial.imu_trace = parent_trial.project_imu_trace(parent_joint_center_offset)
+        child_trial.imu_trace = child_trial.project_imu_trace(child_joint_center_offset)
 
-    # Also generate the observability metric in advance if we need it
-    if condition == 'Cascade':
-        da_parent = np.diff(parent_jc_imu_trace.acc, axis=0)
-        da_child = np.diff(child_jc_imu_trace.acc, axis=0)
-        o_parent = np.cross(parent_jc_imu_trace.acc[:-1], da_parent) / np.linalg.norm(parent_jc_imu_trace.acc[:-1],
-                                                                                      axis=1)[:, None]
-        o_child = np.cross(child_jc_imu_trace.acc[:-1], da_child) / np.linalg.norm(child_jc_imu_trace.acc[:-1], axis=1)[
-                                                                    :, None]
-
-        observability_metric = np.minimum(np.linalg.norm(o_parent, axis=1),
-                                          np.linalg.norm(o_child, axis=1))
-        observability_metric = np.concatenate(([observability_metric[0]], observability_metric))
+        if condition == 'mag free':
+            parent_trial.imu_trace.mag = [np.zeros(3)] * len(parent_trial)
+            child_trial.imu_trace.mag = [np.zeros(3)] * len(child_trial)
 
     for t in range(len(parent_trial)):
-        if condition == 'Unprojected':
-            joint_filter.update(parent_trial.imu_trace.gyro[t], child_trial.imu_trace.gyro[t],
-                                parent_trial.imu_trace.acc[t], child_trial.imu_trace.acc[t],
-                                parent_trial.imu_trace.mag[t], child_trial.imu_trace.mag[t], dt)
-
-        elif condition == 'Mag Free':
-            joint_filter.update(parent_jc_imu_trace.gyro[t], child_jc_imu_trace.gyro[t],
-                                parent_jc_imu_trace.acc[t], child_jc_imu_trace.acc[t],
-                                np.zeros(3), np.zeros(3), dt)
-
-        elif condition == 'Always Project':
-            joint_filter.update(parent_jc_imu_trace.gyro[t], child_jc_imu_trace.gyro[t],
-                                parent_jc_imu_trace.acc[t], child_jc_imu_trace.acc[t],
-                                parent_jc_imu_trace.mag[t], child_jc_imu_trace.mag[t], dt)
-
-        else:
-            unproj_parent_mag = (parent_trial.imu_trace.mag[t] + parent_trial.second_imu_trace.mag[t]) / 2 if \
-                parent_trial.second_imu_trace is not None else parent_trial.imu_trace.mag[t]
-            unproj_child_mag = (child_trial.imu_trace.mag[t] + child_trial.second_imu_trace.mag[t]) / 2 if \
-                child_trial.second_imu_trace is not None else child_trial.imu_trace.mag[t]
-
-            mag_pairs = [
-                (unproj_parent_mag, unproj_child_mag),
-                # (unproj_parent_mag, child_jc_imu_trace.mag[t]),
-                # (parent_jc_imu_trace.mag[t], unproj_child_mag),
-                (parent_jc_imu_trace.mag[t], child_jc_imu_trace.mag[t])
-            ]
-
-            # Find the pair with the smallest difference in norm
-            closest_parent_mag, closest_child_mag = min(
-                mag_pairs,
-                key=lambda pair: abs(np.linalg.norm(pair[0]) - np.linalg.norm(pair[1]))
-            )
-
-            if condition == 'Never Project':
-                joint_filter.update(parent_jc_imu_trace.gyro[t], child_jc_imu_trace.gyro[t],
-                                    parent_jc_imu_trace.acc[t], child_jc_imu_trace.acc[t],
-                                    unproj_parent_mag, unproj_child_mag, dt)
-
-            elif condition == 'Closest Mag Pair':
-                joint_filter.update(parent_jc_imu_trace.gyro[t], child_jc_imu_trace.gyro[t],
-                                    parent_jc_imu_trace.acc[t], child_jc_imu_trace.acc[t],
-                                    closest_parent_mag, closest_child_mag, dt)
-
-            elif condition == 'Cascade':
-                if observability_metric[t] > OBSERVABILITY_THRESHOLD:
-                    joint_filter.update(parent_jc_imu_trace.gyro[t], child_jc_imu_trace.gyro[t],
-                                        parent_jc_imu_trace.acc[t], child_jc_imu_trace.acc[t],
-                                        np.zeros(3), np.zeros(3), dt)
-                else:
-                    joint_filter.update(parent_jc_imu_trace.gyro[t], child_jc_imu_trace.gyro[t],
-                                        parent_jc_imu_trace.acc[t], child_jc_imu_trace.acc[t],
-                                        closest_parent_mag, closest_child_mag, dt)
+        joint_filter.update(parent_trial.imu_trace.gyro[t], child_trial.imu_trace.gyro[t],
+                            parent_trial.imu_trace.acc[t], child_trial.imu_trace.acc[t],
+                            parent_trial.imu_trace.mag[t], child_trial.imu_trace.mag[t], dt)
 
         # Store the joint orientation
         R_pc.append(joint_filter.get_R_pc())
@@ -225,61 +165,29 @@ def _export_to_sto_(filename,
         for row in data:
             file.write("\t".join(row) + "\n")
 
-def _read_mot_file_(file_path) -> Tuple[Dict[str, Any], Dict[str, List[float]]]:
-    """
-    Reads a .mot file and parses its header and data.
+if __name__ == "__main__":
+    # GENERATING STO FILES
+    num_frames = -1  # Use -1 to indicate all frames
 
-    Args:
-        file_path (str): Path to the .mot file.
+    for subject_num in ['02']: # ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11']:
+        for activity in ['walking']: #['complexTasks', 'walking']:
+            print(f"-------Processing Subject {subject_num}, Activity {activity}...--------")
+            # Load the plate trials for the current subject and activity
+            try:
+                plate_trials = PlateTrial.load_trial_from_folder(
+                    f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}",
+                    align_plate_trials=True
+                )
 
-    Returns:
-        Tuple[Dict[str, Any], Dict[str, List[float]]]: Returns the header information and data as a dictionary.
-    """
-    with open(file_path, 'r') as f:
-        lines = f.readlines()
-
-        # Parse header
-        header_info = {}
-        i = 0
-        while lines[i].strip() != "endheader":
-            if "=" in lines[i]:
-                key, value = lines[i].strip().split("=")
-                header_info[key] = value
-            i += 1
-
-        # Skip the "endheader" line
-        i += 1
-
-        # Parse column headers
-        headers = lines[i].strip().split()
-        i += 1
-
-        # Parse data rows
-        data = []
-        for line in lines[i:]:
-            values = list(map(float, line.strip().split()))
-            data.append(values)
-
-        # Create a dictionary where each header maps to its corresponding data column
-        data_dict = {headers[j]: [row[j] for row in data] for j in range(len(headers))}
-
-    return header_info, data_dict
-
-# GENERATING STO FILES
-activity = 'walking'
-subject_num = '06'
-
-plate_trials = PlateTrial.load_trial_from_folder(
-    f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}",
-    align_plate_trials=True
-)
-
-for condition in ['Marker', 'Unprojected', 'Mag Free', 'Never Project']:
-    output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/IMU/" + condition
-    if condition == 'Marker':
-        output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/Mocap/"
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    _generate_orientation_sto_file_(output_dir,
-                                    plate_trials,
-                                    100, condition)
+                for condition in ['marker', 'unprojected', 'mag free', 'never project']:
+                    output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/IMU/" + condition
+                    if condition == 'marker':
+                        output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/Mocap/"
+                    if not os.path.exists(output_dir):
+                        os.makedirs(output_dir)
+                    _generate_orientation_sto_file_(output_dir,
+                                                    plate_trials,
+                                                    num_frames, condition)
+            except Exception as e:
+                print(f"Failed to process Subject {subject_num}, Activity {activity}: {e}")
+                continue

@@ -2,41 +2,45 @@
 % Master script and notes for Generic Subject Experiment
 clear all; close all; clc;
 import org.opensim.modeling.*
- 
 
-%% Define subject number and activity
-subjectNumRaw = 3; % Change this to the desired subject number (e.g., 1, 2, ..., 11)
-subjectNum = sprintf('%02d', subjectNumRaw); % Format as two digits (e.g., 1 becomes '01')
-activity = 'walking'; % Change this to 'walking' or 'complexTasks'
+subjects = {"01","02","03","04","05","06","07","08","09","10","11"};
+activities = {'walking', 'complexTasks'};
+methods = {"mocap", "unprojected", "never project", "mag free"};
 endStamp = Inf; % Change this to the desired end time in seconds (e.g., 2, 5, etc.). Inf for no limit.
 
-%% Section 1. Process Marker Based IK and Model Calibration
+%% Section 0. Run Based IK if necessary
 % Perform traditional marker based IK, with marker distances as the cost function,
-% using the IKTool. 
-% run_marker_ik(subjectNum, activity, -Inf, endStamp)
+% using the IKTool. Some trials from the original Al Borno dataset had to be reprocessed.
+% The output of this function will then need to be trimmed using the
+% PlateTrial found in the python code.
+subjectNumNeedingIK = '01';
+activityNeedingIK = 'complexTasks';
+run_marker_ik(subjectNumNeedingIK, activityNeedingIK, -Inf, endStamp)
 
-% Use the posed model from the marker based IK solution to calibrate the placement
-% of the IMUs on the model.
-calibrate_model(subjectNum, activity)
-
-%% Section 2. Run IK for IMU Based Capture
-% Perform IMU based IK, using the orientations of the marker plates as the cost
-% function.
-run_imu_ik(subjectNum, activity, 'mocap', -Inf, endStamp);
-
-%% Section 3. Perform IMU Based IK
-imuMethods = { 'Unprojected', 'Never Project', 'Mag Free'};
-for methodIndex = 1:length(imuMethods)
-    imuMethod = imuMethods{methodIndex};
-    %% Section 3A. Align and Trim Marker and IMU Data
-    if imuMethod == "xsens" || imuMethod == "mahony" || imuMethod == "madgwick"
-        % create_trimmed_datasets(subjectNum, activity, imuMethod)
-    end
-    
-    %% Section 3B. IMU Kinematics
-    % Use the posed model and rotated IMU data to perform IK.
-    run_imu_ik(subjectNum, activity, imuMethod, -Inf, endStamp)
-end
+% for i = 1:length(subjects)
+%     subject = subjects{i};
+% 
+%     for j = 1:length(activities)
+%         activity = activities{j};
+%         fprintf("~~~~~Processing data for Subject%s %s.~~~~~", subject, activity)
+% 
+%         %% Section 1. Calibrate the Registered Model
+%         % Use the posed model from the marker based IK solution to calibrate the placement
+%         % of the IMUs on     the model.
+%         calibrate_model(subjectNum, activity)
+% 
+%         %% Section 2. Run IK for IMU Based Capture
+%         % Perform IMU based IK, using the orientations of the marker plates as the cost
+%         % function.
+%         run_imu_ik(subjectNum, activity, 'mocap', -Inf, endStamp);
+% 
+%         %% Section 3. Perform IMU Based IK
+%         for k = 1:length(methods)
+%             method = methods{k};
+%             run_imu_ik(subjectNum, activity, method, -Inf, endStamp)
+%         end
+%     end
+% end
 
 %% Function Definitions
 function run_marker_ik(subjectNum, activity, startTime, endTime)
@@ -103,7 +107,7 @@ function calibrate_model(subjectNum, activity)
     modelFile_posed = sprintf('../Subject%s/model_Rajagopal2015_posed_%s.osim', subjectNum, activity);
     model = Model(modelFile);
     
-    motionPath = sprintf('../Subject%s/%s/Mocap/ikResults/%s_IK.mot', subjectNum, activity, activity);
+    motionPath = sprintf('../Subject%s/%s/Mocap/ikResults/%s_IK_trimmed.mot', subjectNum, activity, activity);
     markerMotion = TimeSeriesTable(motionPath);
     
     % Cycle through the model coordinates and update the default values.
@@ -142,154 +146,6 @@ function calibrate_model(subjectNum, activity)
     modelFile_calibrated = sprintf('../Subject%s/model_Rajagopal2015_calibrated_%s.osim', subjectNum, activity);
     calibratedModel.print(modelFile_calibrated);
     fprintf("Model Calibration Complete. Model saved to %s.\n", modelFile_calibrated)
-end
-
-function create_trimmed_datasets(subjectNum, activity, imuMethod)
-    % IMPORTANT: Import OpenSim modeling package within the function scope
-    import org.opensim.modeling.*
-
-    fprintf("-----Aligning Marker and IMU Data on %s %s %s.-----\n", subjectNum, activity, imuMethod); % Added newline
-    % TrimFromFrame/imuTrimFromFrame data for all subjects:
-    % Subject1
-    TrimFromFrame = 1;
-    imuTrimFromFrame = 1; % Default to 1, will be updated based on subject
-    switch subjectNum
-        case '01'
-            if activity == "walking"
-                imuTrimFromFrame = 42999;
-            else
-                imuTrimFromFrame = 45573;
-            end
-        case '02'
-            if activity == "walking"
-                imuTrimFromFrame = 68436;
-            else
-                imuTrimFromFrame = 47010;
-            end
-        case '03'
-            if activity == "walking"
-                imuTrimFromFrame = 83444;
-            else
-                imuTrimFromFrame = 69692;
-            end
-        case '04'
-            if activity == "walking"
-                imuTrimFromFrame = 2818;
-            else
-                imuTrimFromFrame = 14780;
-            end
-        case '05'
-            imuTrimFromFrame = 3350;
-        case '06'
-            if activity == "walking"
-                imuTrimFromFrame = 457;
-            else
-                imuTrimFromFrame = 26780;
-            end
-        case '07'
-            TrimFromFrame = 605;
-        case '08'
-            imuTrimFromFrame = 1576;
-        case '09'
-            TrimFromFrame = 313;
-        case '10'
-            TrimFromFrame = 254;
-        case '11'
-            TrimFromFrame = 293;
-        otherwise
-            warning('No specific trimming defined for Subject %s. Using default (1/1).\n', subjectNum); % Added newline
-    end
-
-    %% IMU Data Trimming
-    % Generate a trimmed .sto file from the pregenerated IMU data .txt
-    % files.
-    % Define some folder and file paths
-    imuPath = sprintf('../Subject%s/%s/IMU/%s', subjectNum, activity, imuMethod);
-    orientationsFileName = fullfile(imuPath, sprintf('%s_orientations.sto', activity));
-    
-    % Instantiate an XsensDataReader
-    mappingsFile = fullfile(sprintf('../Subject%s/%s/IMU', subjectNum, activity), sprintf('myIMUMappings_%s.xml', activity));
-    xsensSettings = XsensDataReaderSettings(mappingsFile);
-    xsens = XsensDataReader(xsensSettings);
-    
-    % Get a table reference for the data
-    imuLowerExtremityPath = fullfile(imuPath, 'LowerExtremity/');
-    tables = xsens.read(imuLowerExtremityPath);
-    
-    % Get Orientation Data as quaternions
-    quatTable = xsens.getOrientationsTable(tables);
-    nRows_imu = quatTable.getNumRows();
-    fprintf('Untrimmed IMU data length: %d frames.\n', nRows_imu);
-   
-    % Apply IMU trimming if necessary
-    if imuTrimFromFrame > 1
-        imuTimeToTrim = quatTable.getIndependentColumn().get(imuTrimFromFrame - 1); % Adjust for 0-based indexing
-        quatTable.trimFrom(imuTimeToTrim);
-        fprintf('IMU data trimmed from frame %d for Subject %s. New length: %d frames.\n', imuTrimFromFrame, subjectNum, quatTable.getNumRows()); % Changed %s to %d for numRows
-    end
-    
-    % Reset the time to start from Zero. Makes it easier to sync in GUI.
-    % Ensure there are at least two rows to calculate rate
-    if quatTable.getNumRows() > 1
-        mRate = round(1/( quatTable.getIndependentColumn().get(1) - quatTable.getIndependentColumn().get(0)));
-    else
-        mRate = 100; % Default rate if not enough data to calculate
-        warning('Not enough IMU data rows to calculate frame rate. Using default %d Hz.\n', mRate);
-    end
-
-    for i = 0 : quatTable.getNumRows() - 1
-        quatTable.getIndependentColumn().set(i, i*(1/mRate));
-    end
-    
-    fprintf("Saving trimmed IMU data to %s...\n", orientationsFileName)
-    STOFileAdapterQuaternion.write(quatTable,  orientationsFileName);
-
-    %% Marker Data Trimming
-    mocapPath = sprintf('../Subject%s/%s/Mocap', subjectNum, activity);
-    trcFile = sprintf('%s.trc', activity); % This is the correct variable name
-    
-    trcData = TimeSeriesTableVec3(fullfile(mocapPath, trcFile)); 
-    ikFile = fullfile(mocapPath, 'ikResults', strrep(trcFile, '.trc', '_IK.mot'));
-    ikData = TimeSeriesTable(ikFile);
-    
-    % Apply Marker trimming if necessary
-    if TrimFromFrame > 1
-        timeToTrim = ikData.getIndependentColumn().get(TrimFromFrame - 1); % Adjust for 0-based indexing
-        % Trim the IK trial
-        disp('Performing trim of motion file ...');
-        ikData.trimFrom(timeToTrim);
-        fprintf('Marker motion data trimmed from frame %d for Subject %s. New length: %d frames.\n', TrimFromFrame, subjectNum, ikData.getNumRows());
-        % Trim the trc file
-        disp('Performing trim of trc file ...');
-        trcData.trimFrom(timeToTrim);
-        fprintf('TRC data trimmed from frame %d for Subject %s. New length: %d frames.\n', TrimFromFrame, subjectNum, trcData.getNumRows());
-    else
-        fprintf('No marker data trimming applied for Subject %s.\n', subjectNum);
-    end
-    
-    % Reset the time to start from Zero. Makes it easier to sync in GUI.
-    if ikData.getNumRows() > 1
-        mRate = round(1/( ikData.getIndependentColumn().get(1) - ikData.getIndependentColumn().get(0)));
-    else
-        mRate = 100; % Default rate if not enough data to calculate
-        warning('Not enough Marker IK data rows to calculate frame rate. Using default %d Hz.\n', mRate);
-    end
-
-    for i = 0 : ikData.getNumRows() - 1
-        ikData.getIndependentColumn().set(i, i*(1/mRate));
-        trcData.getIndependentColumn().set(i, i*(1/mRate));
-    end
-
-    trimmedTRCFile =  fullfile(mocapPath, strrep(trcFile, '.trc', '_trimmed.trc'));
-    fprintf("Saving trimmed mocap data to %s...\n", trimmedTRCFile); % Added newline
-    TRCFileAdapter().write(trcData, trimmedTRCFile); % Corrected trcFile
-    
-    trimmedIKFile = fullfile(mocapPath, 'ikResults', strrep(trcFile, '.trc', '_IK_trimmed.mot'));
-    fprintf("Saving trimmed mocap data to %s...\n", trimmedIKFile); % Added newline
-    STOFileAdapter().write(ikData, trimmedIKFile); % Corrected trcFile
-    
-    % Display output
-    disp('Trimming Complete. %s files saved to %s. Mocap files saved to %s and %s', imuMethod, orientationsFileName, trimmedTRCFile, trimmedIKFile);
 end
 
 function run_imu_ik(subjectNum, activity, imuMethod, startTime, endTime)

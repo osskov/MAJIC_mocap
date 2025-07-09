@@ -1,1 +1,0 @@
-from paper_data_pipeline.generate_kinematics_from_trial import
