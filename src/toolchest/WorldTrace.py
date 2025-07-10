@@ -286,8 +286,7 @@ class WorldTrace:
         """
         This function returns the sample frequency of the WorldTrace.
         """
-        return 1 / self.timestamps[1] - self.timestamps[0]
-        # return 1 / np.mean(np.diff(self.timestamps))
+        return 1 / np.mean(np.diff(self.timestamps))
 
     def lowpass_filter(self, cutoff_freq: float, order: int):
         """

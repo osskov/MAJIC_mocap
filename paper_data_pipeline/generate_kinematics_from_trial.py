@@ -169,8 +169,8 @@ if __name__ == "__main__":
     # GENERATING STO FILES
     num_frames = -1  # Use -1 to indicate all frames
 
-    for subject_num in ['02']: # ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11']:
-        for activity in ['walking']: #['complexTasks', 'walking']:
+    for subject_num in ['06', '07', '08', '09', '10', '11']:
+        for activity in ['walking', 'complexTasks']:
             print(f"-------Processing Subject {subject_num}, Activity {activity}...--------")
             # Load the plate trials for the current subject and activity
             try:
@@ -185,9 +185,9 @@ if __name__ == "__main__":
                         output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/Mocap/"
                     if not os.path.exists(output_dir):
                         os.makedirs(output_dir)
-                    _generate_orientation_sto_file_(output_dir,
-                                                    plate_trials,
-                                                    num_frames, condition)
+                    # _generate_orientation_sto_file_(output_dir,
+                    #                                 plate_trials,
+                    #                                 num_frames, condition)
             except Exception as e:
                 print(f"Failed to process Subject {subject_num}, Activity {activity}: {e}")
                 continue

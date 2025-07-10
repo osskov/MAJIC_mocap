@@ -71,6 +71,7 @@ class PlateTrial:
         kinematics_trace = KinematicsTrace.load_kinematics_from_mot_file(kinematics_file_path)
 
         plate_trials = []
+        imu_slice, world_slice = slice(0, 0), slice(0, 0)
         for imu_name, imu_trace in imu_traces.items():
             try:
                 world_trace = world_traces[IMU_TO_TRC_NAME_MAP[imu_name]]
@@ -78,7 +79,12 @@ class PlateTrial:
                 print(f"IMU {imu_name} not found in TRC file")
                 continue
 
-            imu_slice, world_slice = PlateTrial._sync_traces(imu_trace, world_trace)
+            if abs(imu_trace.get_sample_frequency() - world_trace.get_sample_frequency()) > 0.2:
+                print(f"Sample frequency mismatch for {imu_name}: IMU {imu_trace.get_sample_frequency()} Hz, World {world_trace.get_sample_frequency()} Hz")
+                imu_trace = imu_trace.resample(world_trace.get_sample_frequency())
+
+            if imu_slice == slice(0, 0) and world_slice == slice(0, 0):
+                imu_slice, world_slice = PlateTrial._sync_traces(imu_trace, world_trace)
             synced_imu_trace = imu_trace[imu_slice].re_zero_timestamps()
             synced_world_trace = world_trace[world_slice].re_zero_timestamps()
             new_plate_trial = PlateTrial(imu_name, synced_imu_trace, synced_world_trace)

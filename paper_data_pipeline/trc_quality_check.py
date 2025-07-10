@@ -8,7 +8,7 @@ def load_trc_to_dataframe(file_path):
         lines = f.readlines()
 
     # Extract header metadata
-    metadata = lines[:4]  # PathFileType, DataRate line, and column header line
+    metadata = lines[:5]  # PathFileType, DataRate line, and column header line
     marker_names = lines[3].strip().split('\t')[2:] # Skip the first column which is the frame number
     marker_names = [name for name in marker_names if name]  # Remove empty names
     column_names = lines[4].strip().split('\t')
@@ -27,10 +27,6 @@ def write_dataframe_to_trc(df, metadata, output_path):
         # Write metadata lines
         for line in metadata:
             f.write(line if line.endswith('\n') else line + '\n')
-
-        # Write column headers
-        header_line = '\t'.join(df.columns) + '\n'
-        f.write(header_line)
 
         # Write data
         df.to_csv(f, sep='\t', index=False, header=False, float_format='%.6f')
@@ -64,47 +60,47 @@ def swap_markers(df, marker1: str, marker2: str, index1: int, index2: int):
         df.loc[index1:index2, col1] = df.loc[index1:index2, col2].values
         df.loc[index1:index2, col2] = temp.values
 
-c1_trc_file = f"../data/ODay_Data/Subject01/complexTasks/Mocap/complexTasks.trc"
-df, metadata, transfer_dict = load_trc_to_dataframe(c1_trc_file)
-swap_markers(df, transfer_dict['L.Foot_IMU_D'], transfer_dict['L.Foot_IMU_O'], 45022, len(df) - 1)
-write_dataframe_to_trc(df, metadata, c1_trc_file.replace('.trc', '_modified.trc'))
+# c1_trc_file = f"../data/DO_NOT_MODIFY_AlBorno/Subject01/complexTasks/Mocap/complexTasks.trc"
+# df, metadata, transfer_dict = load_trc_to_dataframe(c1_trc_file)
+# swap_markers(df, transfer_dict['L.Foot_IMU_D'], transfer_dict['L.Foot_IMU_O'], 45022, len(df) - 1)
+# write_dataframe_to_trc(df, metadata, c1_trc_file.replace('DO_NOT_MODIFY_AlBorno', 'ODay_Data'))
+#
+# w6_trc_file = f"../data/DO_NOT_MODIFY_AlBorno/Subject06/walking/Mocap/walking.trc"
+# df, metadata, transfer_dict = load_trc_to_dataframe(w6_trc_file)
+# swap_markers(df, transfer_dict['L.Femur_IMU_D'], transfer_dict['L.Femur_IMU_Y'], 42087, len(df) - 1)
+# for axis in ['X', 'Y', 'Z']:
+#     # Swap values over the full slice
+#     df.loc[:, axis+transfer_dict["L.Femur_IMU_D"]] = df.loc[:, axis+transfer_dict["L.Femur_IMU_X"]].values + df.loc[:, axis+transfer_dict["L.Femur_IMU_Y"]].values - df.loc[:, axis+transfer_dict["L.Femur_IMU_O"]].values
+#     df.loc[:, axis + transfer_dict["L.Femur_IMU_5"]] = np.zeros(len(df))  # Set L.Femur_IMU_5 to zero
+# write_dataframe_to_trc(df, metadata, w6_trc_file.replace('DO_NOT_MODIFY_AlBorno', 'ODay_Data'))
+#
+# c6_trc_file = f"../data/DO_NOT_MODIFY_AlBorno/Subject06/complexTasks/Mocap/complexTasks.trc"
+# df, metadata, transfer_dict = load_trc_to_dataframe(c6_trc_file)
+# for axis in ['X', 'Y', 'Z']:
+#     # Swap values over the full slice
+#     df.loc[:, axis+transfer_dict["L.Femur_IMU_D"]] = df.loc[:, axis+transfer_dict["L.Femur_IMU_X"]].values + df.loc[:, axis+transfer_dict["L.Femur_IMU_Y"]].values - df.loc[:, axis+transfer_dict["L.Femur_IMU_O"]].values
+#     df.loc[:, axis+transfer_dict["L.Femur_IMU_5"]] = np.zeros(len(df))  # Set L.Femur_IMU_5 to zero
+# write_dataframe_to_trc(df, metadata, c6_trc_file.replace('DO_NOT_MODIFY_AlBorno', 'ODay_Data'))
+#
+# c9_trc_file = f"../data/DO_NOT_MODIFY_AlBorno/Subject09/complexTasks/Mocap/complexTasks.trc"
+# df, metadata, transfer_dict = load_trc_to_dataframe(c9_trc_file)
+# swap_markers(df, transfer_dict['R.Femur_IMU_D'], transfer_dict['R.Femur_IMU_X'], 1453, 1658)
+# swap_markers(df, transfer_dict['L.Tibia_IMU_D'], transfer_dict['L.Tibia_IMU_Y'], 1453, 1658)
+# write_dataframe_to_trc(df, metadata, c9_trc_file.replace('DO_NOT_MODIFY_AlBorno', 'ODay_Data'))
+#
+# w10_trc_file = f"../data/DO_NOT_MODIFY_AlBorno/Subject10/walking/Mocap/walking.trc"
+# df, metadata, transfer_dict = load_trc_to_dataframe(w10_trc_file)
+# swap_markers(df, transfer_dict['L.Tibia_IMU_D'], transfer_dict['L.Tibia_IMU_Y'], 51451, 51501)
+# swap_markers(df, transfer_dict['L.Tibia_IMU_O'], transfer_dict['L.Tibia_IMU_X'], 53863, 53933)
+# swap_markers(df, transfer_dict['L.Tibia_IMU_D'], transfer_dict['L.Tibia_IMU_Y'], 56466, 56536)
+# write_dataframe_to_trc(df, metadata, w10_trc_file.replace('DO_NOT_MODIFY_AlBorno', 'ODay_Data'))
 
-w6_trc_file = f"../data/ODay_Data/Subject06/walking/Mocap/walking.trc"
-df, metadata, transfer_dict = load_trc_to_dataframe(w6_trc_file)
-swap_markers(df, transfer_dict['L.Femur_IMU_D'], transfer_dict['L.Femur_IMU_Y'], 42087, len(df) - 1)
-for axis in ['X', 'Y', 'Z']:
-    # Swap values over the full slice
-    df.loc[:, axis+transfer_dict["L.Femur_IMU_D"]] = df.loc[:, axis+transfer_dict["L.Femur_IMU_X"]].values + df.loc[:, axis+transfer_dict["L.Femur_IMU_Y"]].values - df.loc[:, axis+transfer_dict["L.Femur_IMU_O"]].values
-    df.loc[:, axis + transfer_dict["L.Femur_IMU_5"]] = np.zeros(len(df))  # Set L.Femur_IMU_5 to zero
-write_dataframe_to_trc(df, metadata, w6_trc_file.replace('.trc', '_modified.trc'))
-
-c6_trc_file = f"../data/ODay_Data/Subject06/complexTasks/Mocap/complexTasks.trc"
-df, metadata, transfer_dict = load_trc_to_dataframe(c6_trc_file)
-for axis in ['X', 'Y', 'Z']:
-    # Swap values over the full slice
-    df.loc[:, axis+transfer_dict["L.Femur_IMU_D"]] = df.loc[:, axis+transfer_dict["L.Femur_IMU_X"]].values + df.loc[:, axis+transfer_dict["L.Femur_IMU_Y"]].values - df.loc[:, axis+transfer_dict["L.Femur_IMU_O"]].values
-    df.loc[:, axis+transfer_dict["L.Femur_IMU_5"]] = np.zeros(len(df))  # Set L.Femur_IMU_5 to zero
-write_dataframe_to_trc(df, metadata, c6_trc_file.replace('.trc', '_modified.trc'))
-
-c9_trc_file = f"../data/ODay_Data/Subject09/complexTasks/Mocap/complexTasks.trc"
-df, metadata, transfer_dict = load_trc_to_dataframe(c9_trc_file)
-swap_markers(df, transfer_dict['R.Femur_IMU_D'], transfer_dict['R.Femur_IMU_X'], 1453, 1658)
-swap_markers(df, transfer_dict['L.Tibia_IMU_D'], transfer_dict['L.Tibia_IMU_Y'], 1453, 1658)
-write_dataframe_to_trc(df, metadata, c9_trc_file.replace('.trc', '_modified.trc'))
-
-w10_trc_file = f"../data/ODay_Data/Subject10/walking/Mocap/walking.trc"
-df, metadata, transfer_dict = load_trc_to_dataframe(w10_trc_file)
-swap_markers(df, transfer_dict['L.Tibia_IMU_D'], transfer_dict['L.Tibia_IMU_Y'], 51451, 51501)
-swap_markers(df, transfer_dict['L.Tibia_IMU_O'], transfer_dict['L.Tibia_IMU_X'], 53863, 53933)
-swap_markers(df, transfer_dict['L.Tibia_IMU_D'], transfer_dict['L.Tibia_IMU_Y'], 56466, 56536)
-write_dataframe_to_trc(df, metadata, w10_trc_file.replace('.trc', '_modified.trc'))
-
-for subject_num in range(6, 7):  # Subjects 01 to 11
+for subject_num in range(3, 7):  # Subjects 01 to 11
     # Format subject number with leading zero
     subject = f"Subject{subject_num:02d}"
     for activity in ['walking', 'complexTasks']:
 
-        trc_file = f"../data/ODay_Data/{subject}/{activity}/MoCap/{activity}_modified.trc"
+        trc_file = f"../data/ODay_Data/{subject}/{activity}/MoCap/{activity}.trc"
         try:
             with open(trc_file, 'r') as file:
                 lines = file.readlines()

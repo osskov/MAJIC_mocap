@@ -223,24 +223,26 @@ class IMUTrace:
 
             file_name = f"{trial_prefix}{sensor_name}.txt"
             file_path = os.path.join(imu_folder_path, 'xsens', 'LowerExtremity', file_name)
+            try:
+                # Extract update rate
+                with open(file_path, "r") as f:
+                    for line in f:
+                        if line.startswith("// Update Rate"):
+                            freq = float(line.split(":")[1].split("Hz")[0])
+                            break
 
-            # Extract update rate
-            with open(file_path, "r") as f:
-                for line in f:
-                    if line.startswith("// Update Rate"):
-                        freq = float(line.split(":")[1].split("Hz")[0])
-                        break
+                # Read the file into a DataFrame
+                df = pd.read_csv(file_path, delimiter='\t', skiprows=5)
+                df = df.apply(pd.to_numeric)
 
-            # Read the file into a DataFrame
-            df = pd.read_csv(file_path, delimiter='\t', skiprows=5)
-            df = df.apply(pd.to_numeric)
+                # Extract data
+                timestamps = 1 / freq * np.arange(len(df))
+                acc = [np.array(row) for row in df[['Acc_X', 'Acc_Y', 'Acc_Z']].values]
+                gyro = [np.array(row) for row in df[['Gyr_X', 'Gyr_Y', 'Gyr_Z']].values]
+                mag = [np.array(row) for row in df[['Mag_X', 'Mag_Y', 'Mag_Z']].values]
 
-            # Extract data
-            timestamps = 1 / freq * np.arange(len(df))
-            acc = [np.array(row) for row in df[['Acc_X', 'Acc_Y', 'Acc_Z']].values]
-            gyro = [np.array(row) for row in df[['Gyr_X', 'Gyr_Y', 'Gyr_Z']].values]
-            mag = [np.array(row) for row in df[['Mag_X', 'Mag_Y', 'Mag_Z']].values]
-
-            # Create IMUTrace objects
-            imu_traces[name_in_model] = IMUTrace(timestamps=timestamps, acc=acc, gyro=gyro, mag=mag)
+                # Create IMUTrace objects
+                imu_traces[name_in_model] = IMUTrace(timestamps=timestamps, acc=acc, gyro=gyro, mag=mag)
+            except FileNotFoundError:
+                print(f"File {file_path} not found. Skipping sensor {sensor_name}.")
         return imu_traces

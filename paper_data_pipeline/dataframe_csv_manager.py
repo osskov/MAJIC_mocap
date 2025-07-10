@@ -5,7 +5,7 @@ data = []
 for i in range(1, 12):
     subject = f'Subject{i:02d}'
     for activity in ['walking', 'complexTasks']:
-        for method in ['ground truth', 'madgwick', 'markers', 'mag free', 'unprojected', 'never project']:
+        for method in ['madgwick', 'markers', 'mag free', 'unprojected', 'never project']:
             for joint in ['hip_flexion_r', 'hip_adduction_r', 'hip_rotation_r', 'knee_angle_r', 'ankle_angle_r', 'hip_flexion_l', 'hip_adduction_l', 'hip_rotation_l', 'knee_angle_l', 'ankle_angle_l', 'lumbar_extension', 'lumbar_bending', 'lumbar_rotation']:
                 rmse = 0.0  # Fake RMSE value
                 std = 0.0 # Fake std

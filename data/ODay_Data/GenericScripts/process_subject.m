@@ -3,7 +3,7 @@
 clear all; close all; clc;
 import org.opensim.modeling.*
 
-subjects = {"01","02","03","04","05","06","07","08","09","10","11"};
+subjects = {"06","07","08","09","10","11"};
 activities = {'walking', 'complexTasks'};
 methods = {"mocap", "unprojected", "never project", "mag free"};
 endStamp = Inf; % Change this to the desired end time in seconds (e.g., 2, 5, etc.). Inf for no limit.
@@ -13,34 +13,33 @@ endStamp = Inf; % Change this to the desired end time in seconds (e.g., 2, 5, et
 % using the IKTool. Some trials from the original Al Borno dataset had to be reprocessed.
 % The output of this function will then need to be trimmed using the
 % PlateTrial found in the python code.
-subjectNumNeedingIK = '01';
-activityNeedingIK = 'complexTasks';
-run_marker_ik(subjectNumNeedingIK, activityNeedingIK, -Inf, endStamp)
+% subjectNumNeedingIK = 'XX';
+% activityNeedingIK = 'ACTIVITY';
+% run_marker_ik(subjectNumNeedingIK, activityNeedingIK, -Inf, endStamp)
 
-% for i = 1:length(subjects)
-%     subject = subjects{i};
-% 
-%     for j = 1:length(activities)
-%         activity = activities{j};
-%         fprintf("~~~~~Processing data for Subject%s %s.~~~~~", subject, activity)
-% 
-%         %% Section 1. Calibrate the Registered Model
-%         % Use the posed model from the marker based IK solution to calibrate the placement
-%         % of the IMUs on     the model.
-%         calibrate_model(subjectNum, activity)
-% 
-%         %% Section 2. Run IK for IMU Based Capture
-%         % Perform IMU based IK, using the orientations of the marker plates as the cost
-%         % function.
-%         run_imu_ik(subjectNum, activity, 'mocap', -Inf, endStamp);
-% 
-%         %% Section 3. Perform IMU Based IK
-%         for k = 1:length(methods)
-%             method = methods{k};
-%             run_imu_ik(subjectNum, activity, method, -Inf, endStamp)
-%         end
-%     end
-% end
+for i = 1:length(subjects)
+    subject = subjects{i};
+
+    for j = 1:length(activities)
+        activity = activities{j};
+        fprintf("~~~~~Processing data for Subject%s %s.~~~~~\n", subject, activity)
+        try
+            %% Section 1. Calibrate the Registered Model
+            % Use the posed model from the marker based IK solution to calibrate the placement
+            % of the IMUs on the model.
+            calibrate_model(subject, activity)
+    
+            %% Section 2. Run IK for IMU Based Capture
+            for k = 1:length(methods)
+                method = methods{k};
+                    run_imu_ik(subject, activity, method, -Inf, endStamp)
+            end
+        catch
+            fprintf("WARNING: Could not process data for Subject%s %s.", subject, activity);
+            disp(ME.message);
+        end
+    end
+end
 
 %% Function Definitions
 function run_marker_ik(subjectNum, activity, startTime, endTime)
