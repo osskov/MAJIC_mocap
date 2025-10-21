@@ -6,6 +6,10 @@ import nimblephysics as nimble
 from .finite_difference_utils import central_difference
 from .gyro_utils import finite_difference_rotations
 from scipy.signal import butter, filtfilt
+from scipy.spatial.transform import Rotation
+from typing import Dict
+import xml.etree.ElementTree as ET
+import pandas as pd
 
 class WorldTrace:
     """
@@ -29,10 +33,10 @@ class WorldTrace:
         Allows us to subtract two WorldTrace instances. This will subtract the positions and rotations of the two traces.
         """
         if len(self) != len(other):
-            raise ValueError("WorldTraces must have the same length to subtract them.")
+            raise ValueError(f"WorldTraces must have the same length to subtract them. Got self {len(self)} and other {len(other)}.")
         assert np.array_equal(self.timestamps[0],
                               other.timestamps[0]), "WorldTraces must have the same start time to subtract them."
-        return WorldTrace(self.timestamps, [pos1 - pos2 for pos1, pos2 in zip(self.positions, other.positions)],
+        return WorldTrace(self.timestamps, [np.array(pos1) - np.array(pos2) for pos1, pos2 in zip(self.positions, other.positions)],
                           [rot1 @ rot2.T for rot1, rot2 in zip(self.rotations, other.rotations)])
 
     def __getitem__(self, key) -> 'WorldTrace':
@@ -334,3 +338,136 @@ class WorldTrace:
         error = R_w_parent @ parent_offset - R_w_child @ child_offset + r_c_p
         error = error.reshape(-1, 3)
         return parent_offset, child_offset, error
+
+    @staticmethod
+    def load_from_sto_file(sto_file: str) -> 'Dict[str, WorldTrace]':
+        """
+        This function loads a dictionary of WorldTrace objects from an OpenSim .sto file.
+
+        The file is expected to contain quaternion orientation data for multiple bodies.
+        Each body's trace will have its position set to the origin [0,0,0] at all times,
+        as this information is not present in the .sto orientation file.
+        
+        Args:
+            sto_file: The full path to the .sto file.
+
+        Returns:
+            A dictionary where keys are the body names (e.g., 'torso', 'pelvis') and
+            values are the corresponding WorldTrace objects.
+        """
+        # --- 1. Validate file existence and extension ---
+        if not os.path.isfile(sto_file) or not sto_file.lower().endswith('.sto'):
+            raise FileNotFoundError(f"No valid .sto file found at path: {sto_file}")
+
+        # --- 2. Read file and locate the end of the header ---
+        with open(sto_file, 'r') as f:
+            lines = f.readlines()
+
+        try:
+            # Find the line number where the header definition ends
+            header_end_index = next(i for i, line in enumerate(lines) if 'endheader' in line)
+        except StopIteration:
+            raise ValueError("'.sto' file is missing the 'endheader' line.")
+
+        # --- 3. Parse column headers ---
+        # The line immediately following 'endheader' contains the column names
+        column_headers = lines[header_end_index + 1].strip().split('\t')
+        try:
+            time_col_idx = column_headers.index('time')
+        except ValueError:
+            raise ValueError("'.sto' file is missing the 'time' column.")
+        
+        imu_headers = [h for h in column_headers if h != 'time']
+        if not imu_headers:
+            raise ValueError("No data columns found in the .sto file besides 'time'.")
+
+        # --- 4. Parse the data section ---
+        data_lines = lines[header_end_index + 2:]
+        
+        timestamps = []
+        # Initialize a dictionary to hold lists of quaternions for each IMU sensor
+        imu_quat_data = {header: [] for header in imu_headers}
+
+        for line in data_lines:
+            # Skip any blank lines, which can appear at the end of the file
+            if not line.strip():
+                continue
+            
+            parts = line.strip().split('\t')
+            timestamps.append(float(parts[time_col_idx]))
+            
+            for header in imu_headers:
+                header_idx = column_headers.index(header)
+                quat_str = parts[header_idx]
+                
+                # The .sto file format for quaternions is typically (w, x, y, z)
+                w, x, y, z = [float(v) for v in quat_str.split(',')]
+                
+                # scipy.spatial.transform.Rotation.from_quat expects the format (x, y, z, w)
+                imu_quat_data[header].append([x, y, z, w])
+
+        # --- 5. Construct WorldTrace objects for each IMU ---
+        world_traces: Dict[str, 'WorldTrace'] = {}
+        timestamps_np = np.array(timestamps)
+        num_frames = len(timestamps_np)
+        
+        # Since .sto orientation files do not contain position data, we use a zero vector for all frames.
+        positions = [np.zeros(3) for _ in range(num_frames)]
+
+        for header, quats in imu_quat_data.items():
+            # Convert the list of quaternions into a list of 3x3 rotation matrices
+            rotation_matrices = Rotation.from_quat(quats).as_matrix()
+            
+            world_traces[header] = WorldTrace(timestamps=timestamps_np, 
+                                              positions=positions, 
+                                              rotations=[rot for rot in rotation_matrices])
+        return world_traces
+    
+    @staticmethod
+    def load_WorldTraces_from_folder(imu_folder_path: str) -> Dict[str, 'WorldTrace']:
+        world_traces = {}
+
+        # Find the mapping xml file
+        mapping_file = next((f for f in os.listdir(imu_folder_path) if f.endswith('.xml')), None)
+        if mapping_file is None:
+            raise FileNotFoundError("No mapping file found in IMU folder")
+
+        # Parse the XML file
+        tree = ET.parse(os.path.join(imu_folder_path, mapping_file))
+        root = tree.getroot()
+        trial_prefix = root.find('.//trial_prefix').text
+
+        # Iterate over each ExperimentalSensor element and load its IMUTrace
+        for sensor in root.findall('.//ExperimentalSensor'):
+            sensor_name = sensor.get('name').strip()
+            name_in_model = sensor.find('name_in_model').text.strip()
+
+            file_name = f"{trial_prefix}{sensor_name}.txt"
+            file_path = os.path.join(imu_folder_path, 'madgwick', 'LowerExtremity', file_name)
+            try:
+                # Extract update rate
+                with open(file_path, "r") as f:
+                    for line in f:
+                        if line.startswith("// Update Rate"):
+                            freq = float(line.split(":")[1].split("Hz")[0])
+                            break
+
+                # Read the file into a DataFrame
+                df = pd.read_csv(file_path, delimiter='\t', skiprows=5)
+                df = df.apply(pd.to_numeric)
+                pd.set_option('display.max_columns', None)
+                print(df.head())
+                # Extract data
+                timestamps = 1 / freq * np.arange(len(df))
+                if df['Mat[3][3]'].isna().any():
+                    rotations = [np.array(row).reshape(3, 3) for row in df[['Mag_Z','Mat[3][1]', 'Mat[3][2]', 'Mat[1][1]', 'Mat[1][2]', 'Mat[1][3]', 'Mat[2][1]', 'Mat[2][2]', 'Mat[2][3]']].values]
+                else:
+                    rotations = [np.array(row).reshape(3, 3) for row in df[['Mat[1][1]', 'Mat[1][2]', 'Mat[1][3]', 'Mat[2][1]', 'Mat[2][2]', 'Mat[2][3]', 'Mat[3][1]', 'Mat[3][2]', 'Mat[3][3]']].values]
+                    
+                print(rotations[0:1])
+
+                # Create WorldTrace objects
+                world_traces[name_in_model] = WorldTrace(timestamps=timestamps, positions=[np.zeros(3) for _ in range(len(timestamps))], rotations=rotations)
+            except FileNotFoundError:
+                print(f"File {file_path} not found. Skipping sensor {sensor_name}.")
+        return world_traces

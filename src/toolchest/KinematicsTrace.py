@@ -14,10 +14,10 @@ class KinematicsTrace:
         Args:
             joint_angles (Dict[str, List[np.array]]): A dictionary mapping segment names to their orientations.
         """
-        # Filter out joint angles that don't change over time
-        for key in list(joint_angles.keys()):
-            if key != 'time' and np.std(joint_angles[key]) < 0.1:
-                del joint_angles[key]
+        # # Filter out joint angles that don't change over time
+        # for key in list(joint_angles.keys()):
+        #     if key != 'time' and np.std(joint_angles[key]) < 0.1:
+        #         del joint_angles[key]
         self.joint_angles = joint_angles
 
     def __len__(self) -> int:
@@ -56,7 +56,7 @@ class KinematicsTrace:
         """
         if not isinstance(other, KinematicsTrace):
             raise TypeError("Subtraction is only supported between two KinematicsTrace instances.")
-        if self.get_frequency() != other.get_frequency():
+        if abs(self.get_frequency() - other.get_frequency()) > 1:
             print(f"Resampling traces to {self.get_frequency()}.")
             other = other.resample(self.get_frequency())
             other = other.re_zero_timestamps()
@@ -84,6 +84,26 @@ class KinematicsTrace:
         """
         return f"KinematicsTrace with {len(self)} timestamps and segments: {list(self.joint_angles.keys())}"
 
+    def filter_low_std_joints(self, threshold: float = 0.1) -> 'KinematicsTrace':
+        """
+        Filters out joint angles that have a standard deviation below a given threshold.
+
+        Args:
+            threshold (float): The standard deviation threshold below which joints are filtered out.
+
+        Returns:
+            KinematicsTrace: A new KinematicsTrace instance with filtered joint angles.
+        """
+        filtered_joint_angles = {}
+        for key, values in self.joint_angles.items():
+            if key == 'time':
+                filtered_joint_angles[key] = values
+            else:
+                std_value = np.std(values)
+                if std_value >= threshold:
+                    filtered_joint_angles[key] = values
+
+        return KinematicsTrace(filtered_joint_angles)
     def re_zero_timestamps(self) -> 'KinematicsTrace':
         """
         Re-zeroes the timestamps of the KinematicsTrace.
@@ -210,6 +230,8 @@ class KinematicsTrace:
         """
         if target_frequency <= 0:
             raise ValueError("`target_frequency` must be positive.")
+        if abs(target_frequency - self.get_frequency()) < 0.5:
+            return self
 
         # Current time vector as float array
         t_orig = np.asarray(self.joint_angles['time'], dtype=float)
