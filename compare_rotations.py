@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import matplotlib.container as mpc
 from typing import List, Dict, Tuple
 from src.toolchest.PlateTrial import PlateTrial
 from src.toolchest.WorldTrace import WorldTrace
@@ -13,7 +14,7 @@ import os
 
 from paper_data_pipeline.generate_kinematics_from_trial import JOINT_SEGMENT_DICT
 
-# --- Global Constants and Helper Functions ---
+# --- Data Loading Functions ---
 
 # This function must be used to resync the timing of a given set of PlateTrials to target WorldTraces
 def resync_traces(plate_trials: List['PlateTrial'],
@@ -233,6 +234,7 @@ def load_joint_traces_for_subject_df(subject_id: str,
     return final_df
 
 # --- RMSE Calculation and Plotting Functions ---
+
 # This function calculates RMSE and STD between all methods and the 'Marker' method. 
 # The RMSE can be grouped by various levels: subject_id, trial_type, joint_name, axis.
 def calculate_rmse_and_std(all_data_df: pd.DataFrame, group_by: List[str]) -> pd.DataFrame:
@@ -272,9 +274,11 @@ def calculate_rmse_and_std(all_data_df: pd.DataFrame, group_by: List[str]) -> pd
         return pd.DataFrame()
 
     # 4. Calculate error (all methods - 'Marker')
-    # We subtract the 'Marker' Series from the entire DataFrame
-    # axis=0 (or 'index') ensures alignment on the multi-level index
-    error_df = data_wide.subtract(data_wide['Marker'], axis=0)
+    # Subtract the 'Marker' series from each method column in data_wide,
+    # using DataFrame.sub with an explicit Series to avoid type confusion.
+    marker_series = data_wide['Marker']
+    # Ensure marker_series is aligned to the DataFrame index, then subtract
+    error_df = data_wide.sub(marker_series, axis=0)
     
     # Drop the 'Marker' column itself (which is now all zeros)
     error_df = error_df.drop('Marker', axis=1, errors='ignore')
@@ -334,6 +338,8 @@ def plot_rmse_with_std(stats_df: pd.DataFrame, title: str, y_label: str = "RMSE 
         stats_df (pd.DataFrame): The DataFrame containing the statistics.
         title (str): The title for the plot.
         y_label (str): The label for the y-axis.
+        save_plot (bool): If True, saves the plot to a PNG file.
+        show_plot (bool): If True, displays the plot.
     """
     
     # --- 1. Validate and Prepare Data ---
@@ -343,12 +349,9 @@ def plot_rmse_with_std(stats_df: pd.DataFrame, title: str, y_label: str = "RMSE 
 
     try:
         # Select the RMSE data for the bar heights
-        # .xs() "cross-sections" the DataFrame, selecting 'RMSE' from column level 1
-        # The result is a DataFrame where columns are just the methods.
         rmse_data = stats_df.xs('RMSE', level=1, axis=1)
         
         # Select the STD data for the error bars
-        # This DataFrame will have the exact same shape as rmse_data
         std_data = stats_df.xs('STD', level=1, axis=1)
         
         # Ensure the columns match in case some methods don't have STD
@@ -371,7 +374,6 @@ def plot_rmse_with_std(stats_df: pd.DataFrame, title: str, y_label: str = "RMSE 
     # --- 2. Create the Plot ---
     
     # Create a figure and axes
-    # Using 'constrained_layout=True' is often better than 'tight_layout()'
     fig, ax = plt.subplots(figsize=(14, 7), constrained_layout=True)
 
     # Plot the bar chart
@@ -387,40 +389,86 @@ def plot_rmse_with_std(stats_df: pd.DataFrame, title: str, y_label: str = "RMSE 
 
     # --- 3. Customize and Style ---
     
-    # Set titles and labels
+    # --- 3a. Add Data Labels ---
+    max_plot_height = 0
+    try:
+        methods = rmse_data.columns
+        bar_containers = [c for c in ax.containers if isinstance(c, mpc.BarContainer)]
+
+        for i, container in enumerate(bar_containers): # Iterate over the filtered list
+            if i >= len(methods):
+                print(f"Warning: Found more bar containers ({len(bar_containers)}) than methods ({len(methods)}). Skipping extra containers.")
+                break
+                
+            method = methods[i]
+            
+            # Get the corresponding RMSE and STD data
+            rmse_values = rmse_data[method]
+            std_values = std_data[method]
+            
+            # Find the max height (bar + std) for this container
+            current_max = (rmse_values + std_values).max()
+            if current_max > max_plot_height:
+                max_plot_height = current_max
+            
+            # Create custom labels: "RMSE ± STD"
+            # Format to 2 decimal places (e.g., .2f)
+            labels = [f"{r:.2f} ± {s:.2f}" for r, s in zip(rmse_values, std_values)]
+            
+            # Add the labels to the bars in this container
+            ax.bar_label(
+                container,
+                labels=labels,
+                padding=3,           # Space above the error bar
+                fontsize=8,          # Smaller font size
+                rotation=90,         # Rotate for readability
+                fontweight='normal'
+            )
+    except (AttributeError, IndexError, KeyError) as e:
+        # AttributeError if ax.containers doesn't exist
+        print(f"Warning: Could not add bar labels. Error: {e}")
+
+    # --- 3b. Adjust Y-Limit for Labels ---
+    # Give 25% extra space above the highest error bar for the rotated labels
+    if max_plot_height > 0:
+        ax.set_ylim(top=max_plot_height * 1.25) 
+    
+    # --- 3c. Set titles and labels ---
     ax.set_title(title, fontsize=16, fontweight='bold')
     ax.set_ylabel(y_label, fontsize=12)
     ax.set_xlabel(stats_df.index.name or 'Group', fontsize=12)
     
-    # Customize legend
+    # --- 3d. Customize legend ---
     ax.legend(title="Method", title_fontsize=11, fontsize=10, loc='upper right')
     
-    # Customize grid and ticks
+    # --- 3e. Customize grid and ticks ---
     ax.grid(axis='y', linestyle='--', alpha=0.7)
     ax.set_axisbelow(True) # Put grid behind bars
     
-    # Improve x-axis label readability
-    # Get the number of index levels
+    # --- 3f. Improve x-axis label readability ---
     num_idx_levels = stats_df.index.nlevels
     
-    # Rotate labels if they are long or numerous
     if len(stats_df.index) > 5 or num_idx_levels > 1:
         plt.setp(ax.get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
     else:
         plt.setp(ax.get_xticklabels(), rotation=0)
 
-    # Remove top and right spines for a cleaner look
+    # Remove top and right spines
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
 
-    # --- 4. Show the Plot ---
-    # Suppress potential UserWarnings from matplotlib about layout
+    # --- 4. Show and/or Save the Plot ---
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         if save_plot:
             plt.savefig(f"{title.replace(' ', '_').lower()}_rmse_plot.png", dpi=150)
+            print(f"Plot saved as {title.replace(' ', '_').lower()}_rmse_plot.png")
         if show_plot:
             plt.show()
+        
+        # If not showing, close the plot to free memory
+        if not show_plot:
+            plt.close(fig)
 
 # --- Main Execution ---
 
@@ -431,9 +479,9 @@ if __name__ == "__main__":
     trial_type = "complexTasks"
     method_names_for_error = ['Madgwick', 'Mag-Free', 'Never Project']
     joints = list(JOINT_SEGMENT_DICT.keys()) # Assumes JOINT_SEGMENT_DICT is available
-    show_plots = True
-    save_plots = False
-    match_al_borno_dataset = True
+    show_plots = False
+    save_plots = True
+    match_al_borno_dataset = False
 
     # Assuming your DataFrame is named 'all_subjects_gait_df'
     file_path = f"data/ODay_Data/all_subject_data_{trial_type}.pkl"
@@ -465,9 +513,6 @@ if __name__ == "__main__":
         print("--- Concatenating all subjects ---")
         all_data_df = pd.concat(all_subject_dfs)
         
-        # Assuming your DataFrame is named 'all_subjects_gait_df'
-        file_path = f"output/all_subject_data_{trial_type}.pkl"
-
         # Save the DataFrame to a pickle file
         all_data_df.to_pickle(file_path)
 
@@ -488,56 +533,64 @@ if __name__ == "__main__":
                 idx_to_drop &= all_data_df.index.get_level_values('joint_name') == joint_name
                 all_data_df = all_data_df[~idx_to_drop]
 
-    # # --- PLOT BY JOINT AND AXIS RMSE ---
-    # print("Calculating and plotting RMSE by Joint and Axis...")
-    # by_joint_rmse = calculate_rmse_and_std(
-    #     all_data_df,
-    #     group_by=['joint_name', 'axis']
-    # )
-    # plot_rmse_with_std(
-    #     by_joint_rmse,
-    #     title="RMSE by Joint and Axis",
-    #     y_label="RMSE (degrees)",
-    #     save_plot=save_plots,
-    #     show_plot=show_plots
-    # )
+    # --- PLOT BY JOINT AND AXIS RMSE ---
+    by_joint_rmse_file_path = f"data/ODay_Data/rmse_by_joint_and_axis_{trial_type}_{match_al_borno_dataset}.pkl"
+    if os.path.exists(by_joint_rmse_file_path):
+        print(f"Loading existing RMSE by Joint and Axis DataFrame from {by_joint_rmse_file_path}...")
+        by_joint_rmse = pd.read_pickle(by_joint_rmse_file_path)
+    else:
+        by_joint_rmse = calculate_rmse_and_std(
+            all_data_df,
+            group_by=['joint_name', 'axis']
+        )
+        by_joint_rmse.to_pickle(by_joint_rmse_file_path)
+    plot_rmse_with_std(
+        by_joint_rmse,
+        title=f"RMSE by Joint and Axis for {trial_type} {'(AL Borno Matched)' if match_al_borno_dataset else ''}",
+        y_label="RMSE (degrees)",
+        save_plot=save_plots,
+        show_plot=show_plots
+    )
 
-    # # --- PLOT BY SUBJECT RMSE ---
-    # print("Calculating and plotting RMSE by Subject...")
-    # by_subject_rmse = calculate_rmse_and_std(
-    #     all_data_df,
-    #     group_by=['subject_id']
-    # )
-    # plot_rmse_with_std(
-    #     by_subject_rmse,
-    #     title="RMSE by Subject",
-    #     y_label="RMSE (degrees)",
-    #     save_plot=save_plots,
-    #     show_plot=show_plots
-    # )
+    # --- PLOT BY SUBJECT RMSE ---
+    print("Calculating and plotting RMSE by Subject...")
+    by_subject_rmse_file_path = f"data/ODay_Data/rmse_by_subject_{trial_type}_{match_al_borno_dataset}.pkl"
+    if os.path.exists(by_subject_rmse_file_path):
+        print(f"Loading existing RMSE by Subject DataFrame from {by_subject_rmse_file_path}...")
+        by_subject_rmse = pd.read_pickle(by_subject_rmse_file_path)
+    else:
+        by_subject_rmse = calculate_rmse_and_std(
+            all_data_df,
+            group_by=['subject_id']
+        )
+        by_subject_rmse.to_pickle(by_subject_rmse_file_path)
+    plot_rmse_with_std(
+        by_subject_rmse,
+        title=f"RMSE by Subject for {trial_type} {'(AL Borno Matched)' if match_al_borno_dataset else ''}",
+        y_label="RMSE (degrees)",
+        save_plot=save_plots,
+        show_plot=show_plots
+    )
 
     # --- PLOT RMSE ---
     print("Calculating and plotting Overall RMSE...")
-    overall_rmse: pd.DataFrame = calculate_rmse_and_std(
-        all_data_df,
-        group_by=[]
-    )
+    overall_rmse_file_path = f"data/ODay_Data/overall_rmse_{trial_type}_{match_al_borno_dataset}.pkl"
+    if os.path.exists(overall_rmse_file_path):
+        print(f"Loading existing Overall RMSE DataFrame from {overall_rmse_file_path}...")
+        overall_rmse = pd.read_pickle(overall_rmse_file_path)
+    else:
+         overall_rmse = calculate_rmse_and_std(
+            all_data_df,
+            group_by=[]
+        )
+         overall_rmse.to_pickle(overall_rmse_file_path) 
     if not overall_rmse.empty:
-        # .stack() pivots the columns ('RMSE', 'STD') into the index
-        # .to_frame().T transposes it to make the MultiIndex the columns
         overall_rmse = overall_rmse.stack().to_frame().T
-        
-        # 3. 'overall_rmse' now looks like this:
-        # Method   Madgwick        Mag-Free
-        # Metric       RMSE   STD      RMSE   STD
-        # 0           5.1   0.5       4.2   0.4
-        
-        # 4. Give the index a meaningful name
         overall_rmse.index = ['Overall']
         overall_rmse.index.name = 'Group'
     plot_rmse_with_std(
         overall_rmse,
-        title="Overall RMSE Across All Subjects and Joints",
+        title=f"Overall RMSE Across All Subjects and Joints for {trial_type} {'(AL Borno Matched)' if match_al_borno_dataset else ''}",
         y_label="RMSE (degrees)",
         save_plot=save_plots,
         show_plot=show_plots
