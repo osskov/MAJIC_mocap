@@ -2,8 +2,8 @@ import os
 from typing import List, Tuple, Dict, Any
 import numpy as np
 import nimblephysics as nimble
-from toolchest.PlateTrial import PlateTrial
-from RelativeFilter import RelativeFilter
+from src.toolchest.PlateTrial import PlateTrial
+from src.RelativeFilter import RelativeFilter
 
 JOINT_SEGMENT_DICT = {'R_Hip': ('pelvis_imu', 'femur_r_imu'),
                       'R_Knee': ('femur_r_imu', 'tibia_r_imu'),
@@ -74,7 +74,10 @@ def _generate_orientation_sto_file_(output_directory: str,
 
 def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
                                                child_trial: PlateTrial,
-                                               condition: str = 'never project') -> List[np.ndarray]:
+                                               condition: str = 'never project',
+                                               gyro_std: float = 0.01,
+                                               acc_std: float = 0.05,
+                                               mag_std: float = 0.05) -> List[np.ndarray]:
     """
     Estimates joint orientations between parent and child trials using specified filter conditions.
 
@@ -87,7 +90,7 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
         List[np.ndarray]: A list of joint orientation matrices.
     """
     # Create the filter structure
-    joint_filter = RelativeFilter()
+    joint_filter = RelativeFilter(gyro_std=np.ones(3) * gyro_std, acc_std=np.ones(3) * acc_std, mag_std=np.ones(3) * mag_std)
     joint_filter.set_qs(nimble.math.expToQuat(nimble.math.logMap(parent_trial.world_trace.rotations[0])),
                         nimble.math.expToQuat(nimble.math.logMap(child_trial.world_trace.rotations[0])))
     dt = parent_trial.imu_trace.timestamps[1] - parent_trial.imu_trace.timestamps[0]
@@ -97,6 +100,10 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
     if condition != 'unprojected':
         parent_joint_center_offset, child_joint_center_offset, error = parent_trial.world_trace.get_joint_center(
             child_trial.world_trace)
+        
+        if np.mean(np.linalg.norm(error, axis=1)) > 0.05:
+            print(f"Warning: High joint center error ({np.mean(np.linalg.norm(error, axis=1))} m) between "
+                  f"{parent_trial.name} and {child_trial.name}. Check marker placement.")
 
         parent_trial.imu_trace = parent_trial.project_imu_trace(parent_joint_center_offset)
         child_trial.imu_trace = child_trial.project_imu_trace(child_joint_center_offset)
@@ -169,7 +176,7 @@ if __name__ == "__main__":
     # GENERATING STO FILES
     num_frames = -1  # Use -1 to indicate all frames
 
-    for subject_num in ['06', '07', '08', '09', '10', '11']:
+    for subject_num in ['01', '02', '03', '04', '05', '06', '07','08', '09', '10', '11']:
         for activity in ['walking', 'complexTasks']:
             print(f"-------Processing Subject {subject_num}, Activity {activity}...--------")
             # Load the plate trials for the current subject and activity
@@ -179,15 +186,17 @@ if __name__ == "__main__":
                     align_plate_trials=True
                 )
 
-                for condition in ['marker', 'unprojected', 'mag free', 'never project']:
+                print(f"Loaded {len(plate_trials)} plate trials.")
+                print(f"Identified segments: {[plate.name for plate in plate_trials]}")
+                for condition in ['mag free', 'never project', 'unprojected', 'marker']:
                     output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/IMU/" + condition
                     if condition == 'marker':
                         output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/Mocap/"
                     if not os.path.exists(output_dir):
                         os.makedirs(output_dir)
-                    # _generate_orientation_sto_file_(output_dir,
-                    #                                 plate_trials,
-                    #                                 num_frames, condition)
+                    _generate_orientation_sto_file_(output_dir,
+                                                    plate_trials,
+                                                    num_frames, condition)
             except Exception as e:
                 print(f"Failed to process Subject {subject_num}, Activity {activity}: {e}")
                 continue

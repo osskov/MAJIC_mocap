@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # Load your data
-df = pd.read_csv("../data/ODay_Data/all_trial_statistics.csv")
+df = pd.read_csv("/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/all_trial_statistics.csv")
 
 # Filter by subject number
 df = df[df["subject"].isin([f"Subject{i:02d}" for i in range(1, 6)])]
@@ -16,6 +16,10 @@ df = df[df["method"].isin([
     "madgwick", "mag free", "never project"
 ])]
 
+# Filter by joint
+df = df[df["joint"].isin(["hip_flexion_l", "hip_adduction_l", "hip_rotation_l",
+                         "knee_angle_l", "hip_flexion_r",
+                         "hip_adduction_r", "hip_rotation_r", "knee_angle_r"])]
 
 # Group by method and joint
 def combine_squared(series):

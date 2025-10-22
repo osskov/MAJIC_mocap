@@ -93,6 +93,19 @@ class IMUTrace:
                 all(np.allclose(self.gyro[i], other.gyro[i], atol=atol) for i in range(len(self.gyro))) and
                 all(np.allclose(self.acc[i], other.acc[i], atol=atol) for i in range(len(self.acc))) and
                 all(np.allclose(self.mag[i], other.mag[i], atol=atol) for i in range(len(self.mag))))
+    
+    def copy(self) -> 'IMUTrace':
+        """
+        Returns a deep copy of the IMUTrace object, ensuring all underlying numpy arrays
+        (timestamps, gyro, acc, mag) are duplicated to prevent unintended modification of the original.
+        """
+        return IMUTrace(
+            timestamps=self.timestamps.copy(),
+            # Deep copy the lists of numpy arrays
+            gyro=[g.copy() for g in self.gyro],
+            acc=[a.copy() for a in self.acc],
+            mag=[m.copy() for m in self.mag]
+        )
 
     def _finite_difference_gyros(self, method='polyfit') -> List[np.ndarray]:
         """

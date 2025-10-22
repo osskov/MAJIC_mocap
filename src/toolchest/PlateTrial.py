@@ -39,6 +39,19 @@ class PlateTrial:
 
     def __getitem__(self, key):
         return PlateTrial(self.name, self.imu_trace[key], self.world_trace[key])
+    
+    def copy(self) -> 'PlateTrial':
+        """
+        Returns a deep copy of the PlateTrial object.
+
+        Note: This relies on IMUTrace and WorldTrace having a functioning .copy() method
+                to ensure the underlying data arrays are also duplicated.
+        """
+        return PlateTrial(
+            self.name,
+            self.imu_trace.copy(),
+            self.world_trace.copy()
+        )
 
     def _align_world_trace_to_imu_trace(self) -> 'PlateTrial':
         synthetic_imu_trace = self.world_trace.calculate_imu_trace()
@@ -80,7 +93,7 @@ class PlateTrial:
                 continue
 
             if abs(imu_trace.get_sample_frequency() - world_trace.get_sample_frequency()) > 0.2:
-                print(f"Sample frequency mismatch for {imu_name}: IMU {imu_trace.get_sample_frequency()} Hz, World {world_trace.get_sample_frequency()} Hz")
+                # print(f"Sample frequency mismatch for {imu_name}: IMU {imu_trace.get_sample_frequency()} Hz, World {world_trace.get_sample_frequency()} Hz")
                 imu_trace = imu_trace.resample(world_trace.get_sample_frequency())
 
             if imu_slice == slice(0, 0) and world_slice == slice(0, 0):
