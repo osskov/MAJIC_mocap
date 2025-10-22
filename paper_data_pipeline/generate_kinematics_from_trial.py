@@ -4,6 +4,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 from src.toolchest.PlateTrial import PlateTrial
 from src.RelativeFilter import RelativeFilter
+from src.toolchest.AHRSFilter import AHRSFilter
 
 JOINT_SEGMENT_DICT = {'R_Hip': ('pelvis_imu', 'femur_r_imu'),
                       'R_Knee': ('femur_r_imu', 'tibia_r_imu'),
@@ -45,7 +46,20 @@ def _generate_orientation_sto_file_(output_directory: str,
 
             segment_orientations[parent_plate.name] = parent_plate.world_trace.rotations[:num_frames]
             segment_orientations[child_plate.name] = child_plate.world_trace.rotations[:num_frames]
-
+    elif condition == 'mahony' or condition == 'madgwick' or condition == 'ekf':
+        segment_orientations = {}
+        for plate in plate_trials:
+            print(f'Processing {plate.name} with {condition} filter...')
+            ahrs_filter = AHRSFilter(select_filter=condition.capitalize())
+            R_ws = []
+            dt = np.mean(np.diff(plate.imu_trace.timestamps))
+            for t in range(len(plate)):
+                ahrs_filter.update(dt,
+                                   plate.imu_trace.acc[t],
+                                   plate.imu_trace.gyro[t],
+                                   plate.imu_trace.mag[t])
+                R_ws.append(ahrs_filter.get_last_R())
+            segment_orientations[plate.name] = R_ws
     else:
         # Estimate joint angles using RelativeFilter
         for joint_name, (parent_name, child_name) in JOINT_SEGMENT_DICT.items():
@@ -67,6 +81,8 @@ def _generate_orientation_sto_file_(output_directory: str,
 
     output_path = os.path.join(output_directory,
                                f'walking_orientations.sto' if 'walking' in output_directory else 'complexTasks_orientations.sto')
+    if not os.path.exists(output_directory):
+        os.makedirs(output_directory)
     _export_to_sto_(output_path, timestamps, segment_orientations)
     return timestamps[-1], list(segment_orientations.keys())
 
@@ -109,7 +125,10 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
         if condition == 'mag free':
             parent_trial.imu_trace.mag = [np.zeros(3)] * len(parent_trial)
             child_trial.imu_trace.mag = [np.zeros(3)] * len(child_trial)
-
+    elif condition == 'unprojected':
+        pass  # Use raw IMU data without projection
+    else:
+        raise ValueError(f"Unknown condition '{condition}' specified for joint orientation estimation.")
     for t in range(len(parent_trial)):
         joint_filter.update(parent_trial.imu_trace.gyro[t], child_trial.imu_trace.gyro[t],
                             parent_trial.imu_trace.acc[t], child_trial.imu_trace.acc[t],
@@ -199,7 +218,7 @@ if __name__ == "__main__":
 
                 print(f"Loaded {len(plate_trials)} plate trials.")
                 print(f"Identified segments: {[plate.name for plate in plate_trials]}")
-                for condition in ['mag free', 'never project', 'unprojected', 'marker']:
+                for condition in ['mahony', 'madgwick', 'ekf']:
                     output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/IMU/" + condition
                     if condition == 'marker':
                         output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/Mocap/"

@@ -95,12 +95,28 @@ def swap_markers(df, marker1: str, marker2: str, index1: int, index2: int):
 # swap_markers(df, transfer_dict['L.Tibia_IMU_D'], transfer_dict['L.Tibia_IMU_Y'], 56466, 56536)
 # write_dataframe_to_trc(df, metadata, w10_trc_file.replace('DO_NOT_MODIFY_AlBorno', 'ODay_Data'))
 
-for subject_num in range(3, 7):  # Subjects 01 to 11
+# w9_trc_file = f"data/DO_NOT_MODIFY_AlBorno/Subject09/walking/Mocap/walking.trc"
+# df, metadata, transfer_dict = load_trc_to_dataframe(w9_trc_file)
+# swap_markers(df, transfer_dict['R.Foot_IMU_D'], transfer_dict['L.Foot_IMU_D'], 0, len(df) - 1)
+# swap_markers(df, transfer_dict['R.Foot_IMU_O'], transfer_dict['L.Foot_IMU_O'], 0, len(df) - 1)
+# swap_markers(df, transfer_dict['R.Foot_IMU_X'], transfer_dict['L.Foot_IMU_X'], 0, len(df) - 1)
+# swap_markers(df, transfer_dict['R.Foot_IMU_Y'], transfer_dict['L.Foot_IMU_Y'], 0, len(df) - 1)
+# write_dataframe_to_trc(df, metadata, w9_trc_file.replace('DO_NOT_MODIFY_AlBorno', 'ODay_Data'))
+
+# w5_trc_file = f"data/DO_NOT_MODIFY_AlBorno/Subject05/walking/Mocap/walking.trc"
+# df, metadata, transfer_dict = load_trc_to_dataframe(w5_trc_file)
+# swap_markers(df, transfer_dict['R.Foot_IMU_D'], transfer_dict['L.Foot_IMU_D'], 0, len(df) - 1)
+# swap_markers(df, transfer_dict['R.Foot_IMU_O'], transfer_dict['L.Foot_IMU_O'], 0, len(df) - 1)
+# swap_markers(df, transfer_dict['R.Foot_IMU_X'], transfer_dict['L.Foot_IMU_X'], 0, len(df) - 1)
+# swap_markers(df, transfer_dict['R.Foot_IMU_Y'], transfer_dict['L.Foot_IMU_Y'], 0, len(df) - 1)
+# write_dataframe_to_trc(df, metadata, w5_trc_file.replace('DO_NOT_MODIFY_AlBorno', 'ODay_Data'))
+
+for subject_num in range(0, 12):  # Subjects 01 to 11
     # Format subject number with leading zero
     subject = f"Subject{subject_num:02d}"
     for activity in ['walking', 'complexTasks']:
 
-        trc_file = f"../data/ODay_Data/{subject}/{activity}/MoCap/{activity}.trc"
+        trc_file = f"data/ODay_Data/{subject}/{activity}/Mocap/{activity}.trc"
         try:
             with open(trc_file, 'r') as file:
                 lines = file.readlines()

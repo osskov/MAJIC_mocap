@@ -5,8 +5,9 @@ from src.toolchest.PlateTrial import PlateTrial
 from src.toolchest.WorldTrace import WorldTrace
 from scipy.spatial.transform import Rotation
 import numpy as np
-from scipy.stats import friedmanchisquare
-from scikit_posthocs import posthoc_nemenyi_friedman
+import scipy.stats as stats
+import itertools
+import sys
 import warnings
 import pandas as pd
 import os
@@ -37,8 +38,7 @@ def resync_traces(plate_trials: List['PlateTrial'],
             print(f"Sample frequency mismatch for {trial.name}: IMU {trial.imu_trace.get_sample_frequency()} Hz, World {trial.world_trace.get_sample_frequency()} Hz")
             trial.imu_trace = trial.imu_trace.resample(float(trial.world_trace.get_sample_frequency()))
 
-        if imu_slice == slice(0, 0) and world_slice == slice(0, 0):
-            imu_slice, world_slice = PlateTrial._sync_traces(trial.imu_trace, trial.world_trace)
+        imu_slice, world_slice = PlateTrial._sync_traces(trial.imu_trace, trial.world_trace)
         synced_imu_trace = trial.imu_trace[imu_slice].re_zero_timestamps()
         synced_world_trace = trial.world_trace[world_slice].re_zero_timestamps()
         new_plate_trial = PlateTrial(trial.name, synced_imu_trace, synced_world_trace)
@@ -299,6 +299,7 @@ def calculate_rmse_and_std(all_data_df: pd.DataFrame, group_by: List[str]) -> pd
         try:
             grouped_error = error_df.groupby(level=valid_group_by)
             grouped_sq_error = squared_error_df.groupby(level=valid_group_by)
+            # _perform_statistical_tests(grouped_error)
         except KeyError as e:
             print(f"Error: Grouping level not found: {e}. Available levels are: {error_df.index.names}")
             return pd.DataFrame()
@@ -470,14 +471,147 @@ def plot_rmse_with_std(stats_df: pd.DataFrame, title: str, y_label: str = "RMSE 
         if not show_plot:
             plt.close(fig)
 
+def _perform_statistical_tests(grouped_error, 
+                             output_file=sys.stdout, 
+                             normality_alpha=0.05, 
+                             min_samples=8,
+                             normality_test_limit=5000): # <-- [NEW]
+    """
+    Performs and prints statistical tests on the grouped error data to a file.
+    
+    Skips slow normality tests for N > normality_test_limit and defaults
+    to parametric tests, per the Central Limit Theorem.
+    """
+    print("\n" + "="*60, file=output_file)
+    print(" STATISTICAL SIGNIFICANCE TESTS", file=output_file)
+    print(f" (Normality test limit N={normality_test_limit})", file=output_file)
+    print("="*60, file=output_file)
+    
+    if not hasattr(grouped_error, 'groups'):
+        print("No groups to analyze. Skipping statistics.", file=output_file)
+        print("="*60 + "\n", file=output_file)
+        return
+
+    for name, group in grouped_error:
+        group = group.dropna(axis=0, how='all')
+        if group.empty:
+            continue
+            
+        methods = group.columns.tolist()
+        if len(methods) < 1:
+            continue
+
+        print(f"\n--- Group: {name} ---", file=output_file)
+
+        # --- 1. Bias Test (vs. Zero Error) ---
+        print("  1. Bias Test (Error vs. Zero):", file=output_file)
+        if len(methods) == 0:
+            print("    - No methods to test.", file=output_file)
+            
+        for method in methods:
+            data = group[method].dropna()
+            n_samples = len(data)
+            
+            if n_samples < 2: 
+                print(f"    - {method}: Insufficient data ({n_samples} samples).", file=output_file)
+                continue
+            
+            run_parametric = False
+            # [NEW] Logic to decide which test to run
+            if n_samples >= normality_test_limit:
+                run_parametric = True # Default to parametric for large N (CLT)
+            elif 3 <= n_samples < normality_test_limit:
+                # Only run Shapiro for "medium" N
+                try:
+                    _stat_s, p_s = stats.shapiro(data)
+                    if n_samples >= min_samples:
+                        run_parametric = p_s > normality_alpha
+                except ValueError:
+                    run_parametric = False # e.g., constant data
+            # else (n_samples < 3, or < min_samples), default to non-parametric
+
+            
+            if run_parametric:
+                # Parametric: One-sample T-test
+                if n_samples >= normality_test_limit:
+                     print(f"    - {method} (T-test, N={n_samples} > {normality_test_limit}): ", end="", file=output_file)
+                else:
+                     print(f"    - {method} (T-test, N={n_samples}, normal): ", end="", file=output_file)
+                _stat_t, p_t = stats.ttest_1samp(data, 0)
+                print(f"Mean={data.mean():.2f}°, p={p_t:.4f}", file=output_file)
+            else:
+                # Non-Parametric: Wilcoxon signed-rank test
+                if n_samples < min_samples:
+                    print(f"    - {method} (Wilcoxon, N={n_samples} < {min_samples}): ", end="", file=output_file)
+                else:
+                    print(f"    - {method} (Wilcoxon, N={n_samples}, non-normal): ", end="", file=output_file)
+                try:
+                    _stat_w, p_w = stats.wilcoxon(data, alternative='two-sided', zero_method='zsplit')
+                    print(f"Median={data.median():.2f}°, p={p_w:.4f}", file=output_file)
+                except ValueError as e:
+                    print(f"Test failed. (e.g., all values are zero).", file=output_file)
+
+        # --- 2. Pairwise Comparison (Method vs. Method) ---
+        if len(methods) < 2:
+            continue
+            
+        print("\n  2. Pairwise Comparison (Method vs. Method):", file=output_file)
+        for m1, m2 in itertools.combinations(methods, 2):
+            paired_data = group[[m1, m2]].dropna()
+            data1 = paired_data[m1]
+            data2 = paired_data[m2]
+            n_samples = len(data1)
+            
+            if n_samples < 2:
+                print(f"    - {m1} vs {m2}: Insufficient paired data ({n_samples} samples).", file=output_file)
+                continue
+
+            diff = data1 - data2
+            
+            run_parametric = False
+            # [NEW] Logic to decide which test to run
+            if n_samples >= normality_test_limit:
+                run_parametric = True # Default to parametric for large N (CLT)
+            elif 3 <= n_samples < normality_test_limit:
+                # Only run Shapiro on the *differences*
+                try:
+                    _stat_s, p_s = stats.shapiro(diff)
+                    if n_samples >= min_samples:
+                        run_parametric = p_s > normality_alpha
+                except ValueError:
+                    run_parametric = False
+            # else (n_samples < 3, or < min_samples), default to non-parametric
+
+            if run_parametric:
+                # Parametric: Paired T-test
+                if n_samples >= normality_test_limit:
+                    print(f"    - {m1} vs {m2} (Paired T-test, N={n_samples} > {normality_test_limit}): ", end="", file=output_file)
+                else:
+                    print(f"    - {m1} vs {m2} (Paired T-test, N={n_samples}, normal diff): ", end="", file=output_file)
+                _stat_t, p_t = stats.ttest_rel(data1, data2)
+                print(f"p={p_t:.4f}", file=output_file)
+            else:
+                # Non-Parametric: Wilcoxon signed-rank test
+                if n_samples < min_samples:
+                    print(f"    - {m1} vs {m2} (Wilcoxon, N={n_samples} < {min_samples}): ", end="", file=output_file)
+                else:
+                    print(f"    - {m1} vs {m2} (Wilcoxon, N={n_samples}, non-normal diff): ", end="", file=output_file)
+                try:
+                    _stat_w, p_w = stats.wilcoxon(data1, data2, alternative='two-sided', zero_method='zsplit')
+                    print(f"p={p_w:.4f}", file=output_file)
+                except ValueError as e:
+                    print(f"Test failed. (e.g., all differences are zero).", file=output_file)
+
+    print("="*60 + "\n", file=output_file)
 # --- Main Execution ---
 
 if __name__ == "__main__":
     # 1. Define the parameters
     # Change this list to include all your subjects!
-    SUBJECT_IDS: List[str] = ["Subject01", "Subject02", "Subject03", "Subject04", "Subject05", "Subject06", "Subject07", "Subject08", "Subject09", "Subject10", "Subject11"]
+    SUBJECT_IDS: List[str] = ["Subject01", "Subject02", "Subject03", "Subject04",
+                              "Subject05", "Subject06", "Subject07", "Subject08",
+                              "Subject09", "Subject10", "Subject11"]
     trial_type = "complexTasks"
-    method_names_for_error = ['Madgwick', 'Mag-Free', 'Never Project']
     joints = list(JOINT_SEGMENT_DICT.keys()) # Assumes JOINT_SEGMENT_DICT is available
     show_plots = False
     save_plots = True
@@ -522,10 +656,16 @@ if __name__ == "__main__":
 
     if match_al_borno_dataset:
         # Drop the following: "R_Ankle" for Subject 1 5 6 9 10 and 11, "L_Ankle" for Subject 1 8 9 and 11
-        al_borno_joints = [
-            ("R_Ankle", [1, 5, 6, 9, 10, 11]),
-            ("L_Ankle", [1, 8, 9, 11]),
-        ]
+        if trial_type == 'walking':
+            al_borno_joints = [
+                ("R_Ankle", [1, 5, 6, 9, 10, 11]),
+                ("L_Ankle", [1, 5, 8, 9, 11]),
+            ]
+        else:
+            al_borno_joints = [
+                ("R_Ankle", []),
+                ("L_Ankle", [1, 8, 9]),
+            ]
         for joint_name, subject_nums in al_borno_joints:
             for subject_num in subject_nums:
                 subject_id = f"Subject{subject_num:02d}"
@@ -591,6 +731,36 @@ if __name__ == "__main__":
     plot_rmse_with_std(
         overall_rmse,
         title=f"Overall RMSE Across All Subjects and Joints for {trial_type} {'(AL Borno Matched)' if match_al_borno_dataset else ''}",
+        y_label="RMSE (degrees)",
+        save_plot=save_plots,
+        show_plot=show_plots
+    )
+
+    # --- PLOT SUBJECT 5 RMSE ---
+    print("Calculating and plotting RMSE for Subject 5...")
+    all_subject_5_data_df = all_data_df.xs('Subject05', level='subject_id')
+    subject_5_error_df = calculate_rmse_and_std(
+        all_subject_5_data_df,
+        group_by=['joint_name', 'axis']
+    )
+    plot_rmse_with_std(
+        subject_5_error_df,
+        title=f"RMSE for Subject 5 by Joint and Axis for {trial_type}",
+        y_label="RMSE (degrees)",
+        save_plot=save_plots,
+        show_plot=show_plots
+    )
+
+    # --- PLOT SUBJECT 9 RMSE ---
+    print("Calculating and plotting RMSE for Subject 9...")
+    all_subject_9_data_df = all_data_df.xs('Subject09', level='subject_id')
+    subject_9_error_df = calculate_rmse_and_std(
+        all_subject_9_data_df,
+        group_by=['joint_name', 'axis']
+    )
+    plot_rmse_with_std(
+        subject_9_error_df,
+        title=f"RMSE for Subject 9 by Joint and Axis for {trial_type}",
         y_label="RMSE (degrees)",
         save_plot=save_plots,
         show_plot=show_plots

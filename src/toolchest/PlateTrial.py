@@ -5,6 +5,7 @@ from .IMUTrace import IMUTrace
 from .WorldTrace import WorldTrace
 from .KinematicsTrace import KinematicsTrace
 from typing import Tuple, List
+import matplotlib.pyplot as plt
 
 IMU_TO_TRC_NAME_MAP = {
     'pelvis_imu': 'Pelvis_IMU', 'femur_r_imu': 'R.Femur_IMU', 'femur_l_imu': 'L.Femur_IMU',
@@ -56,7 +57,7 @@ class PlateTrial:
     def _align_world_trace_to_imu_trace(self) -> 'PlateTrial':
         synthetic_imu_trace = self.world_trace.calculate_imu_trace()
         R_wt_it = synthetic_imu_trace.calculate_rotation_offset_from_gyros(self.imu_trace)
-        new_world_rotations = [R_wt_it.T @ rot for rot in self.world_trace.rotations]
+        new_world_rotations = [rot @ R_wt_it for rot in self.world_trace.rotations]
         new_world_trace = WorldTrace(self.world_trace.timestamps, self.world_trace.positions, new_world_rotations)
         return PlateTrial(self.name, self.imu_trace, new_world_trace)
 
@@ -96,16 +97,19 @@ class PlateTrial:
                 # print(f"Sample frequency mismatch for {imu_name}: IMU {imu_trace.get_sample_frequency()} Hz, World {world_trace.get_sample_frequency()} Hz")
                 imu_trace = imu_trace.resample(float(world_trace.get_sample_frequency()))
 
-            if imu_slice == slice(0, 0) and world_slice == slice(0, 0):
-                imu_slice, world_slice = PlateTrial._sync_traces(imu_trace, world_trace)
+            imu_slice, world_slice = PlateTrial._sync_traces(imu_trace, world_trace)
             synced_imu_trace = imu_trace[imu_slice].re_zero_timestamps()
             synced_world_trace = world_trace[world_slice].re_zero_timestamps()
             new_plate_trial = PlateTrial(imu_name, synced_imu_trace, synced_world_trace)
             if align_plate_trials:
                 new_plate_trial = new_plate_trial._align_world_trace_to_imu_trace()
-            if plate_trials and len(plate_trials[0]) != len(new_plate_trial):
-                raise ValueError("All PlateTrials must have the same length")
             plate_trials.append(new_plate_trial)
+
+        plate_trial_lengths = [len(plate_trial) for plate_trial in plate_trials]
+        if len(set(plate_trial_lengths)) > 1:
+            print(f"Warning: Plate trials have different lengths: {plate_trial_lengths}, Trimming to min length.")
+            min_length = min(plate_trial_lengths)
+            plate_trials = [plate_trial[:min_length] for plate_trial in plate_trials]
 
         synced_kinematics_file_path = kinematics_file_path.replace('.mot', '_trimmed.mot')
         synced_kinematics_trace = kinematics_trace[world_slice].re_zero_timestamps()
