@@ -2,7 +2,6 @@ import os
 from .IMUTrace import IMUTrace
 from typing import List, Tuple
 import numpy as np
-import nimblephysics as nimble
 from .finite_difference_utils import central_difference
 from .gyro_utils import finite_difference_rotations
 from scipy.signal import butter, filtfilt
@@ -381,9 +380,9 @@ class WorldTrace:
         cutoff = cutoff_freq / nyquist_freq
         b, a = butter(order, cutoff, btype='low')
         positions = filtfilt(b, a, self.positions, axis=0).tolist()
-        angle_axis = np.array([nimble.math.logMap(rot) for rot in self.rotations])
+        angle_axis = Rotation.from_matrix(self.rotations).as_rotvec()
         angle_axis = filtfilt(b, a, angle_axis, axis=0)
-        rotations = [nimble.math.expMapRot(axis) for axis in angle_axis]
+        rotations = Rotation.from_rotvec(angle_axis).as_matrix().tolist()
         return WorldTrace(self.timestamps, positions, rotations)
 
     def get_rotation_errors_deg(self, other_trace: 'WorldTrace') -> np.ndarray:
@@ -391,8 +390,11 @@ class WorldTrace:
         This function returns a time series list of the rotation errors in degrees between two WorldTrace instances.
         """
         assert len(self) == len(other_trace), "WorldTraces must have the same length to compare them."
-        return np.array([np.linalg.norm(nimble.math.logMap(rot1.T @ rot2)) * 180.0 / np.pi for rot1, rot2 in
-                         zip(self.rotations, other_trace.rotations)])
+        
+        errors = Rotation.from_matrix([rot1.T @ rot2 for rot1, rot2 in zip(self.rotations, other_trace.rotations)])
+        angle_axis = errors.as_rotvec()
+        angle_deg = np.linalg.norm(angle_axis, axis=1) * 180.0 / np.pi
+        return angle_deg
 
     def get_joint_center(self, other_world_trace: 'WorldTrace') -> Tuple[np.array, np.array, np.ndarray]:
         """ Given two world traces, solve for the best fit constant offset from a joint center.

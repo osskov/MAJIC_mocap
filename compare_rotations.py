@@ -1,5 +1,5 @@
 import matplotlib.pyplot as plt
-from typing import List, Dict, Union
+from typing import List, Dict, Tuple, Union
 
 from matplotlib.lines import Line2D
 from src.toolchest.PlateTrial import PlateTrial
@@ -16,7 +16,7 @@ from paper_data_pipeline.generate_kinematics_from_trial import JOINT_SEGMENT_DIC
 
 # --- Global Constants and Helper Functions ---
 
-# This function must be used to resync traces for each subject/trial combination
+# This function must be used to resync the timing of a given set of PlateTrials to target WorldTraces
 def resync_traces(plate_trials: List['PlateTrial'],
                   target_world_traces: Dict[str, 'WorldTrace']) -> List['PlateTrial']:
     
@@ -30,18 +30,13 @@ def resync_traces(plate_trials: List['PlateTrial'],
         try:
             target_world_trace = target_world_traces[trial.name]
         except KeyError:
-            # print(f"Warning: No target world trace found for trial {trial.name}. Skipping.")
+            print(f"Warning: No target world trace found for trial {trial.name}. Skipping.")
             continue
-        
-        # NOTE: The original code modified the world_trace of the input trials.
-        # This is preserved here for consistency with the original script's logic flow.
         trial.world_trace = target_world_trace
-        
-        if abs(trial.imu_trace.get_sample_frequency() - target_world_trace.get_sample_frequency()) > 0.2:
-            print(f"Sample frequency mismatch for {trial.name}: IMU {trial.imu_trace.get_sample_frequency()} Hz, World {target_world_trace.get_sample_frequency()} Hz")
-            trial.imu_trace = trial.imu_trace.resample(target_world_trace.get_sample_frequency())
-        
-        # PlateTrial._sync_traces is assumed to be a static method of PlateTrial
+        if abs(trial.imu_trace.get_sample_frequency() - trial.world_trace.get_sample_frequency()) > 0.2:
+            print(f"Sample frequency mismatch for {trial.name}: IMU {trial.imu_trace.get_sample_frequency()} Hz, World {trial.world_trace.get_sample_frequency()} Hz")
+            trial.imu_trace = trial.imu_trace.resample(trial.world_trace.get_sample_frequency())
+
         if imu_slice == slice(0, 0) and world_slice == slice(0, 0):
             imu_slice, world_slice = PlateTrial._sync_traces(trial.imu_trace, trial.world_trace)
         synced_imu_trace = trial.imu_trace[imu_slice].re_zero_timestamps()
@@ -53,7 +48,7 @@ def resync_traces(plate_trials: List['PlateTrial'],
         
     return new_plate_trials
 
-# This function calculates the joint traces (R_parent_world^T * R_child_world)
+# This function calculates the joint traces (R_parent_world^T * R_child_world) from PlateTrials
 def get_joint_traces(plate_trials: List['PlateTrial']) -> Dict[str, 'WorldTrace']:
     """Calculates joint rotations (child relative to parent) from WorldTraces."""
     joint_traces: Dict[str, 'WorldTrace'] = {}
@@ -74,73 +69,26 @@ def get_joint_traces(plate_trials: List['PlateTrial']) -> Dict[str, 'WorldTrace'
         )
     return joint_traces
 
-# This function calculates the error metrics
-def calculate_joint_errors_rmse_std(
-    marker_traces: Dict[str, 'WorldTrace'], 
-    imu_traces_list: List[Dict[str, 'WorldTrace']], 
-    method_names: List[str], 
-    joints: List[str]
-) -> Dict[str, Dict[str, Dict[str, tuple]]]:
+# This function loads all joint traces for a given subject and trial type
+def load_joint_traces_for_subject(subject_id: str, trial_type: str) -> Dict[str, Dict[str, 'WorldTrace']]:
     """
-    Calculates the RMSE and STD of Euler angle error for each IMU method 
-    relative to the Marker data, for each joint and axis.
+    Load joint traces for a specific subject and trial type.
+
+    Args:
+        subject_id (str): The ID of the subject.
+        trial_type (str): The type of trial (e.g., "marker", "madgwick", etc.).
 
     Returns:
-        A nested dictionary: {MethodName: {JointName: {AxisName: (RMSE, STD)}}}
+        Dict[str, Dict[str, 'WorldTrace']]: A dictionary mapping trial names to their corresponding WorldTraces.
     """
-    
-    axis_names = ['X', 'Y', 'Z']
-    all_results: Dict[str, Dict[str, Dict[str, tuple]]] = {
-        method: {joint: {} for joint in joints} for method in method_names
-    }
-
-    for k, trace in enumerate(imu_traces_list):
-        method_name = method_names[k]
-        
-        for joint in joints:
-            if joint in trace and joint in marker_traces:
-                imu_joint_trace = trace[joint]
-                marker_joint_trace = marker_traces[joint]
-                
-                if len(imu_joint_trace) != len(marker_joint_trace):
-                    continue
-                
-                # Calculate the error rotation R_error = R_marker @ R_imu.T
-                error_rotations = [R_m @ R_i.T for R_m, R_i in zip(marker_joint_trace.rotations, imu_joint_trace.rotations)]
-                
-                # Convert error rotations to Euler angles (XYZ order)
-                angles_rad_list = [Rotation.from_matrix(rot).as_euler('xyz', degrees=False) for rot in error_rotations]
-                angles_deg = np.array(angles_rad_list) * (180 / np.pi) 
-
-                for j in range(3):
-                    axis_name = axis_names[j]
-                    data_degrees = angles_deg[:, j]
-                    
-                    rmse = np.sqrt(np.mean(data_degrees**2))
-                    std = np.std(data_degrees)
-                    
-                    all_results[method_name][joint][axis_name] = (rmse, std)
-
-    return all_results
-
-# --- NEW FUNCTIONS FOR MULTI-SUBJECT ANALYSIS ---
-
-def get_subject_error_metrics(subject_id: str, trial_type: str) -> Dict[str, Dict[str, Dict[str, tuple]]]:
-    """
-    Loads data, resyncs, calculates joint traces, and computes RMSE/STD 
-    for a single subject.
-    """
-    
-    # 1. Load Data
     try:
-        # Load Marker trials (with world trace = True for initial loading, 
-        # then False for IMU methods to avoid re-using the same objects)
-        plate_trials: List['PlateTrial'] = PlateTrial.load_trial_from_folder(f"data/ODay_Data/{subject_id}/{trial_type}", True)
-        
+        # Load Marker trials
+        plate_trials_marker: List['PlateTrial'] = PlateTrial.load_trial_from_folder(f"data/ODay_Data/{subject_id}/{trial_type}", True)
+
         # Load fresh sets of PlateTrials for each IMU method
-        plate_trials_madgwick: List['PlateTrial'] = plate_trials.copy()
-        plate_trials_mag_free: List['PlateTrial'] = plate_trials.copy()
-        plate_trials_never_project: List['PlateTrial'] = plate_trials.copy()
+        plate_trials_madgwick: List['PlateTrial'] = plate_trials_marker.copy()
+        plate_trials_mag_free: List['PlateTrial'] = plate_trials_marker.copy()
+        plate_trials_never_project: List['PlateTrial'] = plate_trials_marker.copy()
 
         # Load WorldTraces (Orientations)
         madgwick_world_traces: Dict[str, 'WorldTrace'] = WorldTrace.load_WorldTraces_from_folder(
@@ -152,17 +100,16 @@ def get_subject_error_metrics(subject_id: str, trial_type: str) -> Dict[str, Dic
     except Exception as e:
         print(f"Error loading data for {subject_id}: {e}. Skipping subject.")
         return {} # Return empty dict on failure
+    assert len(plate_trials_marker) == len(plate_trials_madgwick) == len(plate_trials_mag_free) == len(plate_trials_never_project), "Mismatch in number of trials loaded."
 
-    # 2. Resync Traces (assigning WorldTrace and aligning)
+    # Resync Traces
     plate_trials_madgwick = resync_traces(plate_trials_madgwick, madgwick_world_traces)
     plate_trials_mag_free = resync_traces(plate_trials_mag_free, mag_free_world_traces)
     plate_trials_never_project = resync_traces(plate_trials_never_project, never_project_world_traces)
     
-    # 3. Trim to Minimum Length (Essential for alignment)
-    all_trials_lists = [plate_trials, plate_trials_madgwick, plate_trials_mag_free, plate_trials_never_project]
-    
-    # Get lengths of all trials across all methods/lists
-    all_lengths = [len(trial) for trials_list in all_trials_lists for trial in [plate_trials, plate_trials_madgwick, plate_trials_mag_free, plate_trials_never_project] for trial in trials_list]
+    # Trim to Minimum Length (Essential for alignment)
+    all_trials_lists = [plate_trials_marker, plate_trials_madgwick, plate_trials_mag_free, plate_trials_never_project]
+    all_lengths = [len(trial) for trials_list in all_trials_lists for trial in trials_list]
 
     if not all_lengths:
         print(f"No valid trials found for {subject_id} after resync/trim. Skipping subject.")
@@ -170,525 +117,435 @@ def get_subject_error_metrics(subject_id: str, trial_type: str) -> Dict[str, Dic
 
     current_min_length = min(all_lengths)
     
-    # Perform trimming to the minimum length
-    # Note: We loop over the number of trials in the original list for consistency
     for trials_list in all_trials_lists:
         for i in range(len(trials_list)):
             trials_list[i] = trials_list[i][:current_min_length]
 
-    # 4. Calculate Joint Traces (R_parent_world^T * R_child_world)
-    marker_joint_traces = get_joint_traces(plate_trials)
+    # Calculate Joint Traces
+    marker_joint_traces = get_joint_traces(plate_trials_marker)
     madgwick_joint_traces = get_joint_traces(plate_trials_madgwick)
     mag_free_joint_traces = get_joint_traces(plate_trials_mag_free)
     never_projected_joint_traces = get_joint_traces(plate_trials_never_project)
     
-    # 5. Calculate Error Metrics
-    joints = list(JOINT_SEGMENT_DICT.keys())
-    method_names_for_error = ['Madgwick', 'Mag-Free', 'Never Project']
-    trace_list_for_error = [madgwick_joint_traces, mag_free_joint_traces, never_projected_joint_traces]
-    
-    rmse_std_results = calculate_joint_errors_rmse_std(
-        marker_traces=marker_joint_traces,
-        imu_traces_list=trace_list_for_error,
-        method_names=method_names_for_error,
-        joints=joints
-    )
-    
-    return rmse_std_results
+    # Consolidate all joint traces for plotting
+    all_joint_traces_for_plotting = {
+        'Marker': marker_joint_traces,
+        'Madgwick': madgwick_joint_traces,
+        'Mag-Free': mag_free_joint_traces,
+        'Never Project': never_projected_joint_traces,
+    }
+    return all_joint_traces_for_plotting
 
-def aggregate_error_metrics(
-    all_subjects_results: List[Dict[str, Dict[str, Dict[str, tuple]]]]
-) -> Dict[str, Dict[str, Dict[str, tuple]]]:
+# --- RMSE Calculation Functions ---
+
+def calculate_euler_rmse_matrix(truth_trace: 'WorldTrace', test_trace: 'WorldTrace') -> Tuple[np.ndarray, np.ndarray]:
     """
-    Aggregates error metrics across multiple subjects by calculating the 
-    mean RMSE and mean STD for each (Method, Joint, Axis) combination.
+    Calculates the RMSE of Euler angles (xyz) between two WorldTraces,
+    correctly accounting for 360-degree angle wrapping.
+
+    Returns a 3-element array [rmse_x, rmse_y, rmse_z] and a
+    3-element array for the standard deviation of the absolute angular error.
     """
+    # Get Euler angles in degrees
+    truth_angles = np.array([Rotation.from_matrix(r).as_euler('xyz', degrees=True) for r in truth_trace.rotations])
+    test_angles = np.array([Rotation.from_matrix(r).as_euler('xyz', degrees=True) for r in test_trace.rotations])
+
+    if truth_angles.shape != test_angles.shape:
+        warnings.warn("Trace shapes mismatch, truncating to shortest.")
+        min_len = min(truth_angles.shape[0], test_angles.shape[0])
+        truth_angles = truth_angles[:min_len]
+        test_angles = test_angles[:min_len]
+
+    # Calculate the difference in angles
+    diff = truth_angles - test_angles
+
+    # Wrap the difference to the range [-180, 180] to get the shortest angle
+    wrapped_diff = (diff + 180) % 360 - 180
+    # --------------------------------------------------------
+
+    # Calculate squared error from the wrapped difference
+    sq_error = wrapped_diff ** 2
     
-    # Structure: {Method: {Joint: {Axis: [ (RMSE1, STD1), (RMSE2, STD2), ... ]}}}
-    all_data = {} 
+    # Mean squared error along the time axis (axis=0)
+    mean_sq_error = np.mean(sq_error, axis=0)
     
-    # 1. Collect all data points
-    for subject_results in all_subjects_results:
-        for method, joint_results in subject_results.items():
-            if method not in all_data:
-                all_data[method] = {}
-            for joint, axis_results in joint_results.items():
-                if joint not in all_data[method]:
-                    all_data[method][joint] = {}
-                for axis, (rmse, std) in axis_results.items():
-                    if axis not in all_data[method][joint]:
-                        all_data[method][joint][axis] = []
-                    all_data[method][joint][axis].append((rmse, std))
-
-    # 2. Calculate mean RMSE and mean STD
-    aggregated_results = {}
-    for method, joint_results in all_data.items():
-        aggregated_results[method] = {}
-        for joint, axis_results in joint_results.items():
-            aggregated_results[method][joint] = {}
-            for axis, data_points in axis_results.items():
-                # Separate RMSEs and STDs
-                rmses = np.array([d[0] for d in data_points])
-                stds = np.array([d[1] for d in data_points])
-                
-                # Calculate mean (combined) metrics
-                mean_rmse = np.mean(rmses)
-                mean_std = np.mean(stds)
-                
-                aggregated_results[method][joint][axis] = (mean_rmse, mean_std)
-                
-    return aggregated_results
-
-def calculate_overall_mean_error(
-    aggregated_rmse_std: Dict[str, Dict[str, Dict[str, tuple]]],
-    method_names: List[str]
-) -> Dict[str, tuple]:
-    """
-    Aggregates the mean RMSE and mean STD across all joints and all axes 
-    for each method.
+    # Root mean squared error
+    rmse = np.sqrt(mean_sq_error)
     
-    Returns:
-        A dictionary: {MethodName: (Overall Mean RMSE, Overall Mean STD)}
-    """
-    
-    overall_results: Dict[str, tuple] = {}
-    
-    for method_name in method_names:
-        method_rmses = []
-        method_stds = []
-        
-        if method_name in aggregated_rmse_std:
-            for joint in aggregated_rmse_std[method_name]:
-                for axis in aggregated_rmse_std[method_name][joint]:
-                    # These are the means already aggregated across all subjects
-                    mean_rmse, mean_std = aggregated_rmse_std[method_name][joint][axis]
-                    method_rmses.append(mean_rmse)
-                    method_stds.append(mean_std)
-        
-        if method_rmses:
-            # Calculate the mean of the mean-RMSEs and mean of the mean-STDs
-            overall_mean_rmse = np.mean(method_rmses)
-            overall_mean_std = np.mean(method_stds)
-            overall_results[method_name] = (overall_mean_rmse, overall_mean_std)
-            
-    return overall_results
+    # Calculate standard deviation of the absolute angular error
+    abs_error = np.abs(wrapped_diff)
+    std = np.std(abs_error, axis=0)
 
-# --- New Plotting Function ---
+    return rmse, std
 
-def plot_overall_mean_comparison(
-    overall_results: Dict[str, tuple], 
-    method_names: List[str]
-):
-    """
-    Creates a single bar plot comparing the Overall Mean RMSE and Overall Mean STD 
-    of Euler angle error across all joints and axes, aggregated across subjects.
-    Saves the plot to 'overall_mean_comparison.png'.
-    """
-    
-    fig, ax = plt.subplots(figsize=(6, 8))
-    plt.title('Overall Mean RMSE of Euler Angle Error (IMU vs. Marker)', fontsize=16)
-    ax.set_ylabel('Overall Mean Error (Degrees)', fontsize=12)
-    ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=1)
-
-    method_colors = {'Madgwick': 'lightblue', 'Mag-Free': 'lightgreen', 'Never Project': 'orange'} 
-    
-    methods_to_plot = [m for m in method_names if m in overall_results]
-    
-    x_positions = np.arange(len(methods_to_plot))
-    bar_heights = [overall_results[m][0] for m in methods_to_plot] # Overall Mean RMSE
-    error_whiskers = [overall_results[m][1] for m in methods_to_plot] # Overall Mean STD
-    bar_colors = [method_colors[m] for m in methods_to_plot]
-    
-    bar_width = 0.5 
-
-    # Draw Bars and Error Bars
-    ax.bar(x_positions, bar_heights, width=bar_width, color=bar_colors, edgecolor='black', zorder=3)
-    ax.errorbar(x_positions, bar_heights, yerr=error_whiskers, fmt='none', ecolor='k', capsize=6, zorder=4)
-
-    # Label the bars with Mean RMSE +/- Mean STD
-    max_label_y = 0.0
-    for i in range(len(x_positions)):
-        x = x_positions[i]
-        rmse = bar_heights[i]
-        std = error_whiskers[i]
-        
-        label_string = f'{rmse:.2f} $\\pm$ {std:.2f}$^\circ$' 
-        y_pos = rmse + error_whiskers[i] + 0.5
-        max_label_y = max(max_label_y, y_pos)
-        
-        ax.text(x, y_pos, label_string, 
-                ha='center', va='bottom', 
-                fontsize=10, 
-                rotation=0) 
-
-    # Set x-ticks and labels
-    ax.set_xticks(x_positions)
-    ax.set_xticklabels(methods_to_plot, fontsize=12)
-    
-    # Set Y-axis limits
-    if max_label_y > 0:
-        ax.set_ylim(bottom=0, top=max_label_y * 1.05) 
-
-    plt.tight_layout()
-    plt.savefig("overall_mean_comparison.png")
-# --- MODIFIED PLOTTING FUNCTION ---
-
-def plot_mean_rmse_std_comparison(
-    rmse_std_results: Dict[str, Dict[str, Dict[str, tuple]]], 
-    method_names: List[str], 
-    joints: List[str]
-):
-    """
-    Creates a bar plot comparing the MEAN RMSE and MEAN STD of Euler angle error 
-    for different IMU methods relative to Marker data, aggregated across subjects.
-    Saves the plot to 'mean_rmse_std_comparison.png'.
-    """
-    
-    num_joints = len(joints)
-    fig, ax = plt.subplots(num_joints, 1, figsize=(12, 3 * num_joints), sharex=False)
-    plt.suptitle('Mean RMSE of Euler Angle Error (IMU vs. Marker) by Joint and Axis', fontsize=16)
-
-    axis_names = ['X', 'Y', 'Z']
-    method_colors = {'Madgwick': 'lightblue', 'Mag-Free': 'lightgreen', 'Never Project': 'orange'} 
-
-    # Ensure ax is an array even for a single joint
-    if num_joints == 1:
-        ax = np.array([ax])
-
-    for i, joint in enumerate(joints):
-        current_ax = ax[i]
-        
-        x_positions = []
-        bar_heights = [] # Mean RMSE
-        error_whiskers = [] # Mean STD
-        bar_colors = []
-        
-        bar_width = 0.25 
-        group_width = bar_width * len(method_names) 
-        
-        for axis_idx, axis_name in enumerate(axis_names):
-            group_start_x = axis_idx * (group_width + bar_width) 
-            
-            for method_idx, method_name in enumerate(method_names):
-                if method_name in rmse_std_results and joint in rmse_std_results[method_name] and axis_name in rmse_std_results[method_name][joint]:
-                    
-                    mean_rmse, mean_std = rmse_std_results[method_name][joint][axis_name]
-                    
-                    bar_x = group_start_x + (method_idx * bar_width)
-                    
-                    x_positions.append(bar_x)
-                    bar_heights.append(mean_rmse)
-                    error_whiskers.append(mean_std)
-                    bar_colors.append(method_colors[method_name])
-
-        if x_positions:
-            current_ax.bar(x_positions, bar_heights, width=bar_width, color=bar_colors, edgecolor='black', zorder=3)
-            current_ax.errorbar(x_positions, bar_heights, yerr=error_whiskers, fmt='none', ecolor='k', capsize=4, zorder=4)
-            
-            max_label_y = 0.0 
-            for k in range(len(x_positions)):
-                x = x_positions[k]
-                rmse = bar_heights[k]
-                std = error_whiskers[k]
-                
-                label_string = f'{rmse:.2f} $\\pm$ {std:.2f}' 
-                
-                y_pos = rmse + error_whiskers[k] + 0.5 
-                max_label_y = max(max_label_y, y_pos)
-                
-                current_ax.text(x, y_pos, label_string, 
-                                ha='center', va='bottom', 
-                                fontsize=8, 
-                                rotation=45) 
-            
-            if max_label_y > 0:
-                current_ax.set_ylim(bottom=0, top=max_label_y * 1.05) 
-
-            axis_center_x = [ (axis_idx * (group_width + bar_width)) + (group_width / 2) - (bar_width / 2) for axis_idx in range(len(axis_names)) ]
-            current_ax.set_xticks(axis_center_x)
-            current_ax.set_xticklabels(axis_names, fontsize=12)
-
-            current_ax.set_title(f'{joint} Mean Error (RMSE $\\pm$ STD)', fontsize=14)
-            current_ax.set_ylabel('Error (Degrees)', fontsize=12)
-            
-            current_ax.grid(axis='y', linestyle='--', alpha=0.7)
-            
-            if i == 0:
-                custom_lines = [Line2D([0], [0], color=method_colors[m], lw=8) for m in method_names]
-                current_ax.legend(custom_lines, method_names, title='Method', loc='upper right')
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
-    plt.savefig("mean_rmse_std_comparison.png")
-    # print("Saved plot to mean_rmse_std_comparison.png") # Removed print for final output
-
-def plot_single_figure_all_metrics(
-    rmse_std_results: Dict[str, Dict[str, Dict[str, tuple]]], 
-    method_names: List[str], 
-    joints: List[str]
-):
-    """
-    Creates a single bar plot comparing the MEAN RMSE and MEAN STD of Euler angle 
-    error for different IMU methods, across all joints and axes, aggregated 
-    across subjects.
-    Saves the plot to 'single_figure_all_metrics_comparison.png'.
-    """
-    
-    # --- Setup Data for Plotting ---
-    axis_names = ['X', 'Y', 'Z']
-    method_colors = {'Madgwick': 'lightblue', 'Mag-Free': 'lightgreen', 'Never Project': 'orange'} 
-    
-    # Flatten the data structure
-    plot_data: List[Dict[str, Union[str, float]]] = []
-    
-    for method_name in method_names:
-        for joint in joints:
-            for axis_name in axis_names:
-                if method_name in rmse_std_results and \
-                   joint in rmse_std_results[method_name] and \
-                   axis_name in rmse_std_results[method_name][joint]:
-                    
-                    mean_rmse, mean_std = rmse_std_results[method_name][joint][axis_name]
-                    
-                    plot_data.append({
-                        'method': method_name,
-                        'joint_axis': f'{joint}-{axis_name}',
-                        'rmse': mean_rmse,
-                        'std': mean_std
-                    })
-
-    # Get the unique joint-axis labels for the x-axis
-    joint_axis_labels = sorted(list(set([d['joint_axis'] for d in plot_data])))
-    num_categories = len(joint_axis_labels)
-    num_methods = len(method_names)
-    
-    if num_categories == 0:
-        print("No data available to plot.")
-        return
-
-    # --- Plotting Configuration ---
-    bar_width = 0.25 
-    group_width = bar_width * num_methods
-    spacing = bar_width * 0.5 
-    
-    fig, ax = plt.subplots(figsize=(4 + num_categories * 0.5, 7)) # Dynamic figure size
-    
-    plt.title('Mean RMSE of Euler Angle Error (IMU vs. Marker) Across All Joints and Axes', fontsize=16)
-    ax.set_ylabel('Mean Error (Degrees)', fontsize=12)
-    ax.grid(axis='y', linestyle='--', alpha=0.7, zorder=1)
-    
-    x_positions = []
-    bar_heights = [] # Mean RMSE
-    error_whiskers = [] # Mean STD
-    bar_colors = []
-    
-    # --- Generate Plot Data Points ---
-    
-    # Calculate x-positions for each bar
-    for category_idx, label in enumerate(joint_axis_labels):
-        group_start_x = category_idx * (group_width + spacing)
-        
-        for method_idx, method_name in enumerate(method_names):
-            
-            # Find the data point for this method and joint-axis combination
-            data_point = next((d for d in plot_data if d['method'] == method_name and d['joint_axis'] == label), None)
-            
-            if data_point:
-                mean_rmse = data_point['rmse']
-                mean_std = data_point['std']
-                
-                bar_x = group_start_x + (method_idx * bar_width)
-                
-                x_positions.append(bar_x)
-                bar_heights.append(mean_rmse)
-                error_whiskers.append(mean_std)
-                bar_colors.append(method_colors[method_name])
-
-    # --- Draw Bars and Error Bars ---
-    ax.bar(x_positions, bar_heights, width=bar_width, color=bar_colors, edgecolor='black', zorder=3)
-    ax.errorbar(x_positions, bar_heights, yerr=error_whiskers, fmt='none', ecolor='k', capsize=4, zorder=4)
-
-    # --- Final Touches (Labels and Ticks) ---
-    
-    # Calculate the center x-position for each label group
-    label_center_x = [ (idx * (group_width + spacing)) + (group_width / 2) - (bar_width / 2) 
-                       for idx in range(num_categories) ]
-
-    ax.set_xticks(label_center_x)
-    ax.set_xticklabels(joint_axis_labels, rotation=45, ha='right', fontsize=10)
-    
-    # Create legend
-    custom_lines = [Line2D([0], [0], color=method_colors[m], lw=8) for m in method_names]
-    ax.legend(custom_lines, method_names, title='Method', loc='upper left')
-
-    plt.tight_layout()
-    plt.savefig("single_figure_all_metrics_comparison.png")
-    # print("Saved single figure plot to single_figure_all_metrics_comparison.png") # Removed print for final output
-
-# --- NEW FUNCTION FOR STATISTICAL ANALYSIS ---
-
-def analyze_significance(
-    all_subjects_results: List[Dict[str, Dict[str, Dict[str, tuple]]]],
+def calculate_multi_subject_euler_rmse_by_joint(
+    all_subjects_joint_traces: List[Dict[str, Dict[str, 'WorldTrace']]],
     method_names: List[str],
-    metric_type: str = 'rmse' # 'rmse' or 'std'
-) -> Dict[str, Dict[str, Union[float, str, Dict[str, float]]]]:
+    joints: List[str]
+) -> Dict[str, Dict[str, np.ndarray]]: # <-- 1. FIX: Changed return type hint
     """
-    Performs the Friedman test and Nemenyi post-hoc test on the error metric 
-    (RMSE or STD) across the three IMU methods for each joint-axis combination.
-
-    Args:
-        all_subjects_results: List of results (one dict per subject).
-        method_names: List of IMU method names.
-        metric_type: The metric to test ('rmse' or 'std').
-
-    Returns:
-        A dictionary: {Joint-Axis: { 'Friedman_p': p_value, 
-                                     'Friedman_sig': 'Significant'/'Not Significant',
-                                     'Nemenyi_p_values': { 'MethodA vs MethodB': p_value, ... } }
+    Calculates combined RMSE results for multiple subjects, organized by method and joint.
+    
+    Returns a dict where each value is a (2, 3) np.ndarray:
+    [[mean_rmse_x, mean_rmse_y, mean_rmse_z],
+     [mean_std_x,  mean_std_y,  mean_std_z]]
     """
-    
-    # 1. Prepare the structure for the statistical results
-    stats_results = {}
-    
-    # Define metric index: 0 for RMSE, 1 for STD
-    metric_idx = 0 if metric_type.lower() == 'rmse' else 1
-    
-    # Determine all unique joint-axis combinations
-    joint_axes = set()
-    for subject_result in all_subjects_results:
-        for method in subject_result:
-            for joint in subject_result[method]:
-                for axis in subject_result[method][joint]:
-                    joint_axes.add(f"{joint}-{axis}")
-    
-    # 2. Loop over each Joint-Axis combination
-    for ja_combo in sorted(list(joint_axes)):
-        joint, axis = ja_combo.split('-')
+    # --- Initial Data Collection Loop ---
+    results_list: Dict[str, Dict[str, List[np.ndarray]]] = \
+        {method: {joint: [] for joint in joints} for method in method_names}
 
-        # 3. Collect Data: N_subjects x N_methods matrix
-        # Columns will be the methods, rows will be the subjects
-        method_data = {method: [] for method in method_names}
-        
-        # Collect the target metric from each subject's results
-        for subject_result in all_subjects_results:
-            
-            # Find the metric value for each method
-            found_all_methods = True
-            for method in method_names:
-                if method in subject_result and joint in subject_result[method] and axis in subject_result[method][joint]:
-                    metric_value = subject_result[method][joint][axis][metric_idx]
-                    method_data[method].append(metric_value)
-                else:
-                    # Skip this subject for this combination if data is missing for any method
-                    found_all_methods = False
-                    break
-            
-            # If data was missing, remove the incomplete entry added in the last loop
-            if not found_all_methods:
-                for method in method_names:
-                    if method_data[method]:
-                        method_data[method].pop()
-
-        # Check if we have enough data (at least 5 subjects is generally preferred)
-        n_subjects = len(list(method_data.values())[0]) if method_data and method_data[method_names[0]] else 0
-        
-        if n_subjects < 5 or any(len(v) != n_subjects for v in method_data.values()):
-            # print(f"Skipping {ja_combo}: Not enough complete data points (N={n_subjects})")
+    for subject_traces in all_subjects_joint_traces:
+        if not subject_traces:
             continue
 
+        for method in method_names:
+            for joint in joints:
+                try:
+                    truth_trace = subject_traces['Marker'][joint]
+                    test_trace = subject_traces[method][joint]
+                    rmse_values, std_values = calculate_euler_rmse_matrix(truth_trace, test_trace)
+                    # Appending a (2, 3) array for each subject
+                    results_list[method][joint].append([rmse_values, std_values])
+                except KeyError:
+                    print(f"Warning: Missing data for RMSE calculation: {method} - {joint}")
+                    continue
 
-        # Prepare data for SciPy (list of arrays, one array per method)
-        data_for_friedman = [np.array(method_data[method]) for method in method_names]
+    # --- Final Processing Loop (with fixes) ---
+    
+    # This will be the final, type-stable dictionary
+    final_results: Dict[str, Dict[str, np.ndarray]] = \
+        {method: {} for method in method_names}
 
-        # 4. Perform Friedman Test
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning) # Ignore warning about ties
-            stat, p_friedman = friedmanchisquare(*data_for_friedman)
-        
-        is_significant = 'Significant' if p_friedman < 0.05 else 'Not Significant'
-        
-        current_ja_results = {
-            'Friedman_p': p_friedman,
-            'Friedman_sig': is_significant,
-            'N_subjects': n_subjects
-        }
-
-        # 5. Perform Nemenyi Post-Hoc Test if Friedman is significant
-        nemenyi_p_values = {}
-        if is_significant == 'Significant':
-            # Create a Pandas DataFrame for scikit_posthocs: Subjects x Methods
-            df_for_posthoc = pd.DataFrame(method_data)
+    for method in method_names:
+        for joint in joints:
             
-            # Nemenyi test (uses a table, not arrays like friedmanchisquare)
-            nemenyi_results = posthoc_nemenyi_friedman(df_for_posthoc.values)
+            subject_data_list = results_list[method][joint]
             
-            # Rename columns/index to method names for clarity
-            nemenyi_results.columns = method_names
-            nemenyi_results.index = method_names
-            
-            # Extract the p-values for the pairs (only need the upper triangle)
-            for i in range(len(method_names)):
-                for j in range(i + 1, len(method_names)):
-                    m1 = method_names[i]
-                    m2 = method_names[j]
-                    pair_key = f'{m1} vs {m2}'
-                    nemenyi_p_values[pair_key] = nemenyi_results.loc[m1, m2]
+            if subject_data_list:
+                # Convert list of (2, 3) arrays into one (N, 2, 3) array
+                # N = number of subjects
+                rmses_and_stds_array = np.array(subject_data_list)
+                
+                # Calculate the mean along the "subject" axis (axis=0)
+                # This results in a (2, 3) array
+                mean_results = np.mean(rmses_and_stds_array, axis=0)
+                final_results[method][joint] = mean_results
+            else:
+                # Handle the case where no data was found
+                # Instead of an empty list, store a (2, 3) array of NaNs
+                # to maintain type consistency.
+                final_results[method][joint] = np.full((2, 3), np.nan)
+    return final_results
 
-        current_ja_results['Nemenyi_p_values'] = nemenyi_p_values
-        
-        stats_results[ja_combo] = current_ja_results
-        
-    return stats_results
+# --- Single Subject Plotting and Error Calculation Functions ---
+
+def plot_subject_time_series(
+    all_joint_traces: Dict[str, Dict[str, 'WorldTrace']], 
+    subject_id: str, 
+    trial_type: str
+):
+    """
+    Plots the time-series joint angles for all methods against the Marker truth.
+    Creates one figure per subject, with subplots for each joint and axis.
+    """
+    print(f"Generating time-series plots for {subject_id}...")
+    
+    methods = ['Marker', 'Madgwick', 'Mag-Free', 'Never Project']
+    colors = {'Marker': 'k', 'Madgwick': 'r', 'Mag-Free': 'g', 'Never Project': 'b'}
+    linestyles = {'Marker': '--', 'Madgwick': '-', 'Mag-Free': '-', 'Never Project': '-'}
+    
+    # Get joint list from Marker data
+    joints = list(all_joint_traces.get('Marker', {}).keys())
+    if not joints:
+        print(f"No joints found for {subject_id}. Skipping time-series plot.")
+        return
+
+    num_joints = len(joints)
+    axes = ['X-axis (Add/Ab)', 'Y-axis (Int/Ext Rot)', 'Z-axis (Flex/Ext)']
+    
+    fig, axs = plt.subplots(num_joints, 3, 
+                            figsize=(20, 5 * num_joints), 
+                            sharex=True)
+    
+    # Ensure axs is always a 2D array
+    if num_joints == 1:
+        axs = np.array([axs])
+
+    for i, joint_name in enumerate(joints):
+        for j, axis_name in enumerate(axes):
+            ax = axs[i, j]
+            
+            for method_name in methods:
+                try:
+                    trace = all_joint_traces[method_name][joint_name]
+                    timestamps = trace.timestamps
+                    
+                    # Get Euler angles and extract the correct axis
+                    angles_deg = np.array([Rotation.from_matrix(r).as_euler('xyz', degrees=True) for r in trace.rotations])
+                    axis_data = angles_deg[:, j]
+                    
+                    ax.plot(timestamps, axis_data, 
+                            label=method_name, 
+                            color=colors[method_name], 
+                            linestyle=linestyles[method_name],
+                            linewidth=1.5)
+                    
+                except KeyError:
+                    print(f"Warning: No data for {method_name} - {joint_name}")
+            
+            ax.set_title(f"{joint_name} - {axis_name}")
+            ax.set_ylabel("Angle (degrees)")
+            if i == num_joints - 1:
+                ax.set_xlabel("Time (s)")
+            ax.grid(True, linestyle=':', alpha=0.6)
+
+    # Create a single legend for the whole figure
+    handles, labels = axs[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='upper right', fontsize='large')
+    
+    fig.suptitle(f"Joint Angle Time Series for {subject_id} ({trial_type})", 
+                 fontsize=20, y=1.02)
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    plt.savefig(f"{subject_id}_{trial_type}_time_series.png", dpi=150)
+    plt.show()
+
+def plot_subject_euler_error_bar_chart(
+    all_joint_traces: Dict[str, Dict[str, 'WorldTrace']], 
+    method_names: List[str], 
+    subject_id: str, 
+    trial_type: str
+):
+    """
+    Plots a grid of bar charts: one row per joint, with cols for X, Y, Z axes.
+    Each chart compares the RMSE of different methods.
+    Labels for RMSE and STD are printed above each bar.
+    """
+    print(f"Generating error bar charts for {subject_id}...")
+    
+    try:
+        truth_traces = all_joint_traces['Marker']
+    except KeyError:
+        print("Error: 'Marker' data not found. Cannot calculate RMSE.")
+        return
+
+    joints = list(truth_traces.keys())
+    if not joints:
+        print(f"No joints found for {subject_id}. Skipping RMSE plot.")
+        return
+
+    # Store results: {method: {joint: ([rmse_x, rmse_y, rmse_z], [std_x, std_y, std_z])}}
+    all_rmses: Dict[str, Dict[str, np.ndarray]] = {}
+
+    for method in method_names:
+        method_rmses = {}
+        for joint in joints:
+            try:
+                truth_trace = truth_traces[joint]
+                test_trace = all_joint_traces[method][joint]
+                # Returns (array[x,y,z], array[x,y,z])
+                rmse_values, rmse_std = calculate_euler_rmse_matrix(truth_trace, test_trace) 
+                method_rmses[joint] = (rmse_values, rmse_std) 
+                
+            except KeyError:
+                print(f"Warning: Missing data for RMSE: {method} - {joint}")
+                method_rmses[joint] = (np.array([np.nan, np.nan, np.nan]), np.array([np.nan, np.nan, np.nan]))
+        all_rmses[method] = method_rmses
+
+    # --- Plotting ---
+    num_joints = len(joints)
+    num_methods = len(method_names)
+    
+    axes_names = ['X-axis (Flex/Ext)', 'Y-axis (Ad/Ab)', 'Z-axis (Int/Ext Rot)']
+    
+    # NEW: Create a grid of subplots (rows=joints, cols=axes)
+    # figsize height is scaled by the number of joints
+    # squeeze=False ensures axs is always a 2D array, even if num_joints=1
+    fig, axs = plt.subplots(num_joints, 3, figsize=(22, 6 * num_joints), squeeze=False)
+
+    # Define consistent colors for each method
+    colors = plt.cm.get_cmap('tab10', num_methods)
+    method_colors = {method: colors(i) for i, method in enumerate(method_names)}
+
+    for j_idx, joint in enumerate(joints):
+        for a_idx, axis_name in enumerate(axes_names):
+            
+            ax = axs[j_idx, a_idx]
+            
+            # Prepare data for this specific subplot (this joint, this axis)
+            rmse_data = [all_rmses[method][joint][0][a_idx] for method in method_names]
+            std_data = [all_rmses[method][joint][1][a_idx] for method in method_names]
+            bar_colors = [method_colors[method] for method in method_names]
+
+            # Plot the bars for each method
+            bars = ax.bar(method_names, rmse_data, yerr=std_data, 
+                          capsize=5, color=bar_colors)
+
+            # NEW: Add labels above bars
+            labels = [f'{r:.2f}\n±{s:.2f}' if not np.isnan(r) else '' 
+                      for r, s in zip(rmse_data, std_data)]
+            ax.bar_label(bars, labels=labels, fontsize=9, padding=3, zorder=10)
+
+            # --- Formatting ---
+            ax.set_xticklabels(method_names, rotation=45, ha='right')
+            ax.grid(True, linestyle=':', alpha=0.6, axis='y')
+            
+            # Give 20% extra space at the top for the labels
+            if not all(np.isnan(rmse_data)):
+                ax.set_ylim(top=np.nanmax(rmse_data) * 1.25)
+            else:
+                ax.set_ylim(top=1.0) # Default if all data is NaN
+
+            # Set titles only for the top row
+            if j_idx == 0:
+                ax.set_title(axis_name, fontsize=14, pad=15)
+                
+            # Set Y-axis labels only for the left-most column
+            if a_idx == 0:
+                ax.set_ylabel(f"{joint}\nRMSE (degrees)", fontsize=12, labelpad=15)
+
+    fig.suptitle(f"Joint Angle RMSE vs. Marker for {subject_id} ({trial_type})", 
+                 fontsize=20, y=1.0) # y=1.0 is often cleaner with tight_layout
+    
+    # Adjust layout to prevent overlap and fit suptitle
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97]) 
+    
+    plt.savefig(f"{subject_id}_{trial_type}_rmse_barchart.png", dpi=150, bbox_inches='tight')
+    plt.show()
+
+# --- By Joint, Combined Subjects Plotting ---
+
+def plot_multi_subject_rmse(
+    all_results: Dict[str, Dict[str, np.ndarray]],
+    method_names: List[str],
+    joints: List[str],
+    title: str,
+    filename: str = "multi_subject_rmse.png"
+):
+    """
+    Plots a grid of bar charts for multi-subject mean RMSE.
+    
+    The input `all_results` is the direct output from
+    `calculate_multi_subject_euler_rmse_by_joint`.
+    
+    The plot layout has one row per joint and one column per axis (X, Y, Z).
+    """
+    print("Generating multi-subject mean RMSE plot...")
+    
+    num_joints = len(joints)
+    num_methods = len(method_names)
+    
+    if num_joints == 0 or num_methods == 0:
+        print("No joints or methods to plot. Skipping.")
+        return
+
+    axes_names = ['X-axis (Flex/Ext)', 'Y-axis (Ad/Ab)', 'Z-axis (Int/Ext Rot)']
+    
+    # Create a grid of subplots (rows=joints, cols=axes)
+    fig, axs = plt.subplots(num_joints, 3, 
+                          figsize=(20, 5 * num_joints), 
+                          squeeze=False)
+
+    # Define consistent colors for each method
+    colors = plt.cm.get_cmap('tab10', num_methods)
+    method_colors = {method: colors(i) for i, method in enumerate(method_names)}
+
+    for j_idx, joint in enumerate(joints):
+        for a_idx, axis_name in enumerate(axes_names):
+            
+            ax = axs[j_idx, a_idx]
+            
+            # Prepare data for this specific subplot (this joint, this axis)
+            rmse_data = []
+            std_data = []
+            bar_colors = []
+            
+            for method in method_names:
+                # Get the (2, 3) array for this method and joint
+                # [[rmse_x, rmse_y, rmse_z],
+                #  [std_x,  std_y,  std_z]]
+                data_array = all_results[method].get(joint, np.full((2, 3), np.nan))
+                
+                # Get the RMSE for this axis (a_idx)
+                rmse_data.append(data_array[0, a_idx]) 
+                # Get the STD for this axis (a_idx)
+                std_data.append(data_array[1, a_idx])
+                
+                bar_colors.append(method_colors[method])
+
+            # Plot the bars for each method
+            bars = ax.bar(method_names, rmse_data, yerr=std_data, 
+                          capsize=5, color=bar_colors)
+
+            # Add labels above bars (RMSE ± STD)
+            labels = [f'{r:.2f}\n±{s:.2f}' if not np.isnan(r) else 'N/A' 
+                      for r, s in zip(rmse_data, std_data)]
+            ax.bar_label(bars, labels=labels, fontsize=9, padding=3, zorder=10)
+
+            # --- Formatting ---
+            ax.set_xticklabels(method_names, rotation=45, ha='right')
+            ax.grid(True, linestyle=':', alpha=0.6, axis='y')
+            
+            # Give 20% extra space at the top for the labels
+            if not all(np.isnan(rmse_data)):
+                ax.set_ylim(top=np.nanmax(rmse_data) * 1.25)
+            else:
+                ax.set_ylim(top=1.0) # Default if all data is NaN
+
+            # Set titles only for the top row
+            if j_idx == 0:
+                ax.set_title(axis_name, fontsize=14, pad=15)
+                
+            # Set Y-axis labels only for the left-most column
+            if a_idx == 0:
+                ax.set_ylabel(f"{joint}\nMean RMSE (degrees)", fontsize=12, labelpad=15)
+
+    fig.suptitle(title, fontsize=20, y=1.0)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+    
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    plt.show()
+
+# --- Main Execution ---
 
 if __name__ == "__main__":
     # 1. Define the parameters
     # Change this list to include all your subjects!
-    SUBJECT_IDS: List[str] = ["Subject03"]
+    SUBJECT_IDS: List[str] = ["Subject03", "Subject04", "Subject05"]
     trial_type = "walking"  
     method_names_for_error = ['Madgwick', 'Mag-Free', 'Never Project']
     joints = list(JOINT_SEGMENT_DICT.keys()) # Assumes JOINT_SEGMENT_DICT is available
 
-    all_subjects_results = []
+    all_subjects_results = [{} for _ in range(11)]
 
-    # 2. Loop and Collect Results
+    # 2. Loop, Collect Results, and Generate Subject Plots
     for subject_id in SUBJECT_IDS:
-        print(f"Processing data for {subject_id}...")
-        subject_results = get_subject_error_metrics(subject_id, trial_type)
-        if subject_results:
-            all_subjects_results.append(subject_results)
+        # Cast subject number to an int
+        subject_num = int(subject_id.replace("Subject", ""))
+        print(f"\nProcessing data for {subject_id}...")
         
-    print("\nAggregation complete. Calculating mean errors...")
+        all_joint_traces_for_plotting = load_joint_traces_for_subject(subject_id, trial_type)
+        
+        # --- PLOT TIME-SERIES DATA FOR CURRENT SUBJECT ---
+        plot_subject_time_series(all_joint_traces_for_plotting, subject_id, trial_type)
+        
+        # --- PLOT PER JOINT, PER AXIS, PER METHOD BAR CHART ---
+        plot_subject_euler_error_bar_chart(all_joint_traces_for_plotting, method_names_for_error, subject_id, trial_type)
 
-    # 3. Aggregate the Error Metrics
-    if all_subjects_results:
-        aggregated_rmse_std = aggregate_error_metrics(all_subjects_results)
+        # Store results for group analysis later
+        all_subjects_results[subject_num] = all_joint_traces_for_plotting
 
-        # 4. Generate the Combined RMSE/STD Bar Plot
-        plot_mean_rmse_std_comparison(
-            rmse_std_results=aggregated_rmse_std,
-            method_names=method_names_for_error,
-            joints=joints
-        )
-        print("Combined RMSE/STD plot saved to 'mean_rmse_std_comparison.png'.")
+    # 3. Calculate Multi-Subject RMSE Results
+    multi_subject_results = calculate_multi_subject_euler_rmse_by_joint(
+        all_subjects_joint_traces=all_subjects_results,
+        method_names=method_names_for_error,
+        joints=joints
+    )
 
-        # # 5. Generate the Single Figure Plot
-        # plot_single_figure_all_metrics(
-        #     rmse_std_results=aggregated_rmse_std,
-        #     method_names=method_names_for_error,
-        #     joints=joints
-        # )
-        # print("Single figure plot saved to 'single_figure_all_metrics_comparison.png'.")
-
-        # Assuming 'aggregated_rmse_std' contains the aggregated results from previous steps
-        # and 'method_names_for_error' is ['Madgwick', 'Mag-Free', 'Never Project']
-
-        overall_results = calculate_overall_mean_error(
-            aggregated_rmse_std=aggregated_rmse_std,
-            method_names=method_names_for_error
-        )
-
-        plot_overall_mean_comparison(
-            overall_results=overall_results,
-            method_names=method_names_for_error
-        )
-    else:
-        print("No subjects processed successfully. Cannot generate plot.")
+    # 4. Plot Multi-Subject RMSE Results
+    plot_multi_subject_rmse(
+        all_results=multi_subject_results,
+        method_names=method_names_for_error,
+        joints=joints,
+        title="Multi-Subject Mean Joint Angle RMSE vs. Marker",
+        filename="multi_subject_mean_rmse.png"
+    )

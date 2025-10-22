@@ -1,7 +1,7 @@
 import os
 from typing import List, Tuple, Dict, Any
 import numpy as np
-import nimblephysics as nimble
+from scipy.spatial.transform import Rotation
 from src.toolchest.PlateTrial import PlateTrial
 from src.RelativeFilter import RelativeFilter
 
@@ -23,10 +23,9 @@ def _generate_orientation_sto_file_(output_directory: str,
 
     Args:
         output_directory (str): Directory to save the .sto file.
-        trc_name (str): Name of the TRC file.
+        plate_trials (List[PlateTrial]): List of loaded plate trials.
         num_frames (int): Number of frames to include.
-        joints_to_include (List[str]): Joints to include in the analysis.
-        condition (str): Filter condition (Cascade, EKF, etc.).
+        condition (str): Filter condition (marker, mag free, unprojected, etc.).
 
     Returns:
         Tuple[float, List[str]]: Returns the final time and the list of segment names.
@@ -91,8 +90,7 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
     """
     # Create the filter structure
     joint_filter = RelativeFilter(gyro_std=np.ones(3) * gyro_std, acc_std=np.ones(3) * acc_std, mag_std=np.ones(3) * mag_std)
-    joint_filter.set_qs(nimble.math.expToQuat(nimble.math.logMap(parent_trial.world_trace.rotations[0])),
-                        nimble.math.expToQuat(nimble.math.logMap(child_trial.world_trace.rotations[0])))
+    joint_filter.set_qs(Rotation.from_matrix(parent_trial.world_trace.rotations[0]), Rotation.from_matrix(child_trial.world_trace.rotations[0]))
     dt = parent_trial.imu_trace.timestamps[1] - parent_trial.imu_trace.timestamps[0]
     R_pc = []
 
@@ -125,7 +123,7 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
 
 def _export_to_sto_(filename,
                     timestamps,
-                    segment_orientations,
+                    segment_orientations: Dict[str, List[np.ndarray]],
                     datatype="Quaternion",
                     version=3,
                     opensim_version="4.2"):
@@ -135,7 +133,7 @@ def _export_to_sto_(filename,
         Args:
             filename (str): File path to save the .sto file.
             timestamps (List[float]): List of timestamps for the orientation data.
-            segment_orientations (Dict[str, List[np.ndarray]]): Segment orientations for each body segment.
+            segment_orientations (Dict[str, List[np.ndarray]]): Segment orientations for each body segment (3x3 matrices).
             datatype (str): Data type for the .sto file.
             version (int): STO file version.
             opensim_version (str): OpenSim version to be added in the file header.
@@ -148,12 +146,25 @@ def _export_to_sto_(filename,
     headers.insert(0, 'time')
 
     data = []
+    # Pre-calculate all quaternions for efficiency
+    all_segment_quaternions: Dict[str, np.ndarray] = {}
+    for segment_name, rotations in segment_orientations.items():
+        # Convert List[np.ndarray] (3x3 matrices) to a single Rotation object, then to quat array (N, 4)
+        # SciPy returns [x, y, z, w]. OpenSim/STO typically expects [w, x, y, z].
+        # The original nimble.math.Quaternion.wxyz() returned [w, x, y, z].
+        quats_xyzw = Rotation.from_matrix(rotations).as_quat()
+        
+        # Reorder to [w, x, y, z] to match the original nimble output format for OpenSim
+        quats_wxyz = quats_xyzw[:, [3, 0, 1, 2]]
+        all_segment_quaternions[segment_name] = quats_wxyz
+
+
     for i, timestamp in enumerate(timestamps):
         row = [str(timestamp)]
         for segment_name in segment_orientations:
-            quaternion_str = str(
-                nimble.math.expToQuat(nimble.math.logMap(segment_orientations[segment_name][i])).wxyz())
-            quaternion_str = ",".join(quaternion_str.strip('[]').split())
+            quat = all_segment_quaternions[segment_name][i]
+            # Format the quaternion string (w,x,y,z) separated by commas
+            quaternion_str = ",".join([f"{val:.16f}" for val in quat])
             row.append(quaternion_str)
         data.append(row)
 
@@ -176,8 +187,8 @@ if __name__ == "__main__":
     # GENERATING STO FILES
     num_frames = -1  # Use -1 to indicate all frames
 
-    for subject_num in ['01', '02', '03', '04', '05', '06', '07','08', '09', '10', '11']:
-        for activity in ['walking', 'complexTasks']:
+    for subject_num in ['11']:
+        for activity in ['complexTasks']:
             print(f"-------Processing Subject {subject_num}, Activity {activity}...--------")
             # Load the plate trials for the current subject and activity
             try:

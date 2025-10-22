@@ -1,10 +1,8 @@
 import os
-
 import numpy as np
 from typing import List, Dict, Tuple, Union
 import xml.etree.ElementTree as ET
 import pandas as pd
-import scipy.stats
 from scipy.interpolate import interp1d
 from scipy.optimize import minimize
 
