@@ -152,7 +152,7 @@ def _export_to_sto_(filename,
         # Convert List[np.ndarray] (3x3 matrices) to a single Rotation object, then to quat array (N, 4)
         # SciPy returns [x, y, z, w]. OpenSim/STO typically expects [w, x, y, z].
         # The original nimble.math.Quaternion.wxyz() returned [w, x, y, z].
-        quats_xyzw = Rotation.from_matrix(rotations).as_quat()
+        quats_xyzw = Rotation.from_matrix(rotations).as_quat(canonical=True)
         
         # Reorder to [w, x, y, z] to match the original nimble output format for OpenSim
         quats_wxyz = quats_xyzw[:, [3, 0, 1, 2]]
@@ -187,8 +187,8 @@ if __name__ == "__main__":
     # GENERATING STO FILES
     num_frames = -1  # Use -1 to indicate all frames
 
-    for subject_num in ['11']:
-        for activity in ['complexTasks']:
+    for subject_num in ['04']:
+        for activity in ['walking']:
             print(f"-------Processing Subject {subject_num}, Activity {activity}...--------")
             # Load the plate trials for the current subject and activity
             try:

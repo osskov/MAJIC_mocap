@@ -35,7 +35,7 @@ def resync_traces(plate_trials: List['PlateTrial'],
         trial.world_trace = target_world_trace
         if abs(trial.imu_trace.get_sample_frequency() - trial.world_trace.get_sample_frequency()) > 0.2:
             print(f"Sample frequency mismatch for {trial.name}: IMU {trial.imu_trace.get_sample_frequency()} Hz, World {trial.world_trace.get_sample_frequency()} Hz")
-            trial.imu_trace = trial.imu_trace.resample(trial.world_trace.get_sample_frequency())
+            trial.imu_trace = trial.imu_trace.resample(float(trial.world_trace.get_sample_frequency()))
 
         if imu_slice == slice(0, 0) and world_slice == slice(0, 0):
             imu_slice, world_slice = PlateTrial._sync_traces(trial.imu_trace, trial.world_trace)
@@ -205,7 +205,7 @@ def calculate_multi_subject_euler_rmse_by_joint(
                     test_trace = subject_traces[method][joint]
                     rmse_values, std_values = calculate_euler_rmse_matrix(truth_trace, test_trace)
                     # Appending a (2, 3) array for each subject
-                    results_list[method][joint].append([rmse_values, std_values])
+                    results_list[method][joint].append(np.array([rmse_values, std_values]))
                 except KeyError:
                     print(f"Warning: Missing data for RMSE calculation: {method} - {joint}")
                     continue
@@ -305,7 +305,7 @@ def plot_subject_time_series(
     
     fig.suptitle(f"Joint Angle Time Series for {subject_id} ({trial_type})", 
                  fontsize=20, y=1.02)
-    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    plt.tight_layout(rect=(0., 0., 1., 0.98))
     plt.savefig(f"{subject_id}_{trial_type}_time_series.png", dpi=150)
     plt.show()
 
@@ -407,7 +407,7 @@ def plot_subject_euler_error_bar_chart(
                  fontsize=20, y=1.0) # y=1.0 is often cleaner with tight_layout
     
     # Adjust layout to prevent overlap and fit suptitle
-    plt.tight_layout(rect=[0, 0.03, 1, 0.97]) 
+    plt.tight_layout(rect=(0, 0.03, 1, 0.97))
     
     plt.savefig(f"{subject_id}_{trial_type}_rmse_barchart.png", dpi=150, bbox_inches='tight')
     plt.show()
@@ -500,7 +500,7 @@ def plot_multi_subject_rmse(
                 ax.set_ylabel(f"{joint}\nMean RMSE (degrees)", fontsize=12, labelpad=15)
 
     fig.suptitle(title, fontsize=20, y=1.0)
-    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+    plt.tight_layout(rect=(0, 0.03, 1, 0.97))
     
     plt.savefig(filename, dpi=150, bbox_inches='tight')
     plt.show()
@@ -526,10 +526,10 @@ if __name__ == "__main__":
         all_joint_traces_for_plotting = load_joint_traces_for_subject(subject_id, trial_type)
         
         # --- PLOT TIME-SERIES DATA FOR CURRENT SUBJECT ---
-        plot_subject_time_series(all_joint_traces_for_plotting, subject_id, trial_type)
+        # plot_subject_time_series(all_joint_traces_for_plotting, subject_id, trial_type)
         
         # --- PLOT PER JOINT, PER AXIS, PER METHOD BAR CHART ---
-        plot_subject_euler_error_bar_chart(all_joint_traces_for_plotting, method_names_for_error, subject_id, trial_type)
+        # plot_subject_euler_error_bar_chart(all_joint_traces_for_plotting, method_names_for_error, subject_id, trial_type)
 
         # Store results for group analysis later
         all_subjects_results[subject_num] = all_joint_traces_for_plotting

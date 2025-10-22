@@ -153,7 +153,7 @@ class WorldTrace:
 
         # 3. Interpolate Rotations (SLERP via Quaternions)
         # Convert 3x3 rotation matrices to quaternions (x, y, z, w)
-        original_quats = Rotation.from_matrix(self.rotations).as_quat()
+        original_quats = Rotation.from_matrix(self.rotations).as_quat(canonical=True)
 
         # Create a Rotation object for interpolation
         # from_quat creates a set of rotations
@@ -378,7 +378,7 @@ class WorldTrace:
         sample_freq = self.get_sample_frequency()
         nyquist_freq = 0.5 * sample_freq
         cutoff = cutoff_freq / nyquist_freq
-        b, a = butter(order, cutoff, btype='low')
+        b, a = butter(order, cutoff, btype='low') # type: ignore
         positions = filtfilt(b, a, self.positions, axis=0).tolist()
         angle_axis = Rotation.from_matrix(self.rotations).as_rotvec()
         angle_axis = filtfilt(b, a, angle_axis, axis=0)
@@ -396,7 +396,7 @@ class WorldTrace:
         angle_deg = np.linalg.norm(angle_axis, axis=1) * 180.0 / np.pi
         return angle_deg
 
-    def get_joint_center(self, other_world_trace: 'WorldTrace') -> Tuple[np.array, np.array, np.ndarray]:
+    def get_joint_center(self, other_world_trace: 'WorldTrace') -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """ Given two world traces, solve for the best fit constant offset from a joint center.
         This is done by minimizing the sum of the squared differences between the two traces. """
         # Parent is other, child is self
@@ -517,15 +517,30 @@ class WorldTrace:
         # Parse the XML file
         tree = ET.parse(os.path.join(imu_folder_path, mapping_file))
         root = tree.getroot()
-        trial_prefix = root.find('.//trial_prefix').text
+        trial_prefix_elem = root.find('.//trial_prefix')
+        if trial_prefix_elem is None or trial_prefix_elem.text is None:
+            raise ValueError("Mapping XML missing 'trial_prefix' element or its text.")
+        trial_prefix = trial_prefix_elem.text.strip()
 
         # Iterate over each ExperimentalSensor element and load its IMUTrace
         for sensor in root.findall('.//ExperimentalSensor'):
-            sensor_name = sensor.get('name').strip()
-            name_in_model = sensor.find('name_in_model').text.strip()
+            # Safely get the 'name' attribute; skip this sensor if it's missing
+            name_attr = sensor.get('name')
+            if name_attr is None:
+                print("ExperimentalSensor missing 'name' attribute; skipping.")
+                continue
+            sensor_name = name_attr.strip()
+
+            # Safely get the name_in_model element and its text; skip if missing
+            name_in_model_elem = sensor.find('name_in_model')
+            if name_in_model_elem is None or name_in_model_elem.text is None:
+                print(f"ExperimentalSensor '{sensor_name}' missing 'name_in_model'; skipping.")
+                continue
+            name_in_model = name_in_model_elem.text.strip()
 
             file_name = f"{trial_prefix}{sensor_name}.txt"
             file_path = os.path.join(imu_folder_path, 'madgwick', 'LowerExtremity', file_name)
+            freq = 100.0  # Default frequency
             try:
                 # Extract update rate
                 with open(file_path, "r") as f:

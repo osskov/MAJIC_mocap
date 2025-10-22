@@ -94,7 +94,7 @@ class PlateTrial:
 
             if abs(imu_trace.get_sample_frequency() - world_trace.get_sample_frequency()) > 0.2:
                 # print(f"Sample frequency mismatch for {imu_name}: IMU {imu_trace.get_sample_frequency()} Hz, World {world_trace.get_sample_frequency()} Hz")
-                imu_trace = imu_trace.resample(world_trace.get_sample_frequency())
+                imu_trace = imu_trace.resample(float(world_trace.get_sample_frequency()))
 
             if imu_slice == slice(0, 0) and world_slice == slice(0, 0):
                 imu_slice, world_slice = PlateTrial._sync_traces(imu_trace, world_trace)
@@ -115,7 +115,7 @@ class PlateTrial:
     @staticmethod
     def _sync_traces(imu_trace: IMUTrace, world_trace: WorldTrace) -> Tuple[slice, slice]:
         if not np.isclose(imu_trace.get_sample_frequency(), world_trace.get_sample_frequency(), rtol=0.2):
-            imu_trace = imu_trace.resample(world_trace.get_sample_frequency())
+            imu_trace = imu_trace.resample(float(world_trace.get_sample_frequency()))
 
         synthetic_imu_trace = world_trace.calculate_imu_trace()
         imu_slice, world_slice = PlateTrial._sync_arrays(
