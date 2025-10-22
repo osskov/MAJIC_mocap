@@ -1,15 +1,14 @@
 import matplotlib.pyplot as plt
-from typing import List, Dict, Tuple, Union
-
-from matplotlib.lines import Line2D
+from typing import List, Dict, Tuple
 from src.toolchest.PlateTrial import PlateTrial
 from src.toolchest.WorldTrace import WorldTrace
 from scipy.spatial.transform import Rotation
 import numpy as np
 from scipy.stats import friedmanchisquare
 from scikit_posthocs import posthoc_nemenyi_friedman
-import pandas as pd
 import warnings
+import pandas as pd
+import os
 
 
 from paper_data_pipeline.generate_kinematics_from_trial import JOINT_SEGMENT_DICT
@@ -42,8 +41,7 @@ def resync_traces(plate_trials: List['PlateTrial'],
         synced_imu_trace = trial.imu_trace[imu_slice].re_zero_timestamps()
         synced_world_trace = trial.world_trace[world_slice].re_zero_timestamps()
         new_plate_trial = PlateTrial(trial.name, synced_imu_trace, synced_world_trace)
-        new_plate_trial = new_plate_trial._align_world_trace_to_imu_trace()
-        
+
         new_plate_trials.append(new_plate_trial)
         
     return new_plate_trials
@@ -69,6 +67,70 @@ def get_joint_traces(plate_trials: List['PlateTrial']) -> Dict[str, 'WorldTrace'
         )
     return joint_traces
 
+def get_joint_traces_df(plate_trials: List['PlateTrial'], euler_order: str = 'ZYX') -> pd.DataFrame:
+    """
+    Calculates joint rotations (child relative to parent) from PlateTrials
+    and returns them in a long-form pandas DataFrame using Euler angles.
+    
+    Args:
+        plate_trials (List['PlateTrial']): Assumes all trials in this list 
+                                          have been resynced and trimmed.
+        euler_order (str): The order of intrinsic Euler angle rotations 
+                           (e.g., 'ZYX', 'YXZ').
+                           Angles are in RADIANS.
+
+    Returns:
+        pd.DataFrame: A DataFrame with columns for metadata and Euler angles
+                      (e.g., 'euler_Z_rad', 'euler_Y_rad', 'euler_X_rad').
+    """
+    all_joint_data = [] # List of dictionaries for DataFrame creation
+    
+    for joint_name, (parent_name, child_name) in JOINT_SEGMENT_DICT.items():
+        # Find the parent and child trials
+        parent_trial = next((p for p in plate_trials if parent_name in p.name), None)
+        child_trial = next((p for p in plate_trials if child_name in p.name), None)
+        
+        if not parent_trial or not child_trial:
+            continue
+            
+        timestamps = parent_trial.imu_trace.timestamps
+        
+        try:
+            # Calculate joint rotations: R_joint = R_parent_world.T @ R_child_world
+            joint_rotations_mat = [Rwp.T @ Rwc for Rwp, Rwc in zip(parent_trial.world_trace.rotations, child_trial.world_trace.rotations)]
+            
+            if not joint_rotations_mat:
+                print(f"Warning: No rotations calculated for {joint_name}. Skipping.")
+                continue
+
+            # Convert 3x3 matrices to Euler angles (in radians)
+            joint_rotations_euler = Rotation.from_matrix(joint_rotations_mat).as_euler(euler_order) # (N, 3)
+        
+        except (ValueError, TypeError, AttributeError) as e:
+            print(f"Error processing rotations for {joint_name} ({parent_name}/{child_name}): {e}. Skipping.")
+            continue
+
+        # Create a dictionary for this joint's data
+        # Dynamically name columns based on the Euler order
+        joint_df_data = {
+            'timestamp': timestamps,
+            f'euler_{euler_order[0]}_rad': joint_rotations_euler[:, 0],
+            f'euler_{euler_order[1]}_rad': joint_rotations_euler[:, 1],
+            f'euler_{euler_order[2]}_rad': joint_rotations_euler[:, 2],
+        }
+        
+        joint_df = pd.DataFrame(joint_df_data)
+        joint_df['joint_name'] = joint_name
+        
+        all_joint_data.append(joint_df)
+    
+    if not all_joint_data:
+        return pd.DataFrame() # Return empty DF if no joints were processed
+
+    final_df = pd.concat(all_joint_data, ignore_index=True)
+    
+    return final_df
+
 # This function loads all joint traces for a given subject and trial type
 def load_joint_traces_for_subject(subject_id: str, trial_type: str) -> Dict[str, Dict[str, 'WorldTrace']]:
     """
@@ -83,13 +145,13 @@ def load_joint_traces_for_subject(subject_id: str, trial_type: str) -> Dict[str,
     """
     try:
         # Load Marker trials
-        plate_trials_marker: List['PlateTrial'] = PlateTrial.load_trial_from_folder(f"data/ODay_Data/{subject_id}/{trial_type}", True)
+        plate_trials_marker: List['PlateTrial'] = PlateTrial.load_trial_from_folder(f"data/ODay_Data/{subject_id}/{trial_type}", align_plate_trials = True)
 
         # Load fresh sets of PlateTrials for each IMU method
-        plate_trials_never_project: List['PlateTrial'] = plate_trials_marker.copy()
-        plate_trials_madgwick: List['PlateTrial'] = plate_trials_marker.copy()
-        plate_trials_mag_free: List['PlateTrial'] = plate_trials_marker.copy()
-        
+        plate_trials_never_project: List['PlateTrial'] = [trial.copy() for trial in plate_trials_marker]
+        plate_trials_madgwick: List['PlateTrial'] = [trial.copy() for trial in plate_trials_marker]
+        plate_trials_mag_free: List['PlateTrial'] = [trial.copy() for trial in plate_trials_marker]
+
         # Load WorldTraces (Orientations)
         never_project_world_traces: Dict[str, 'WorldTrace'] = WorldTrace.load_from_sto_file(
             f"data/ODay_Data/{subject_id}/{trial_type}/IMU/never project/{trial_type}_orientations.sto")
@@ -137,6 +199,126 @@ def load_joint_traces_for_subject(subject_id: str, trial_type: str) -> Dict[str,
         'Never Project': never_projected_joint_traces,
     }
     return all_joint_traces_for_plotting
+
+def load_joint_traces_for_subject_df(subject_id: str, 
+                                     trial_type: str, 
+                                     euler_order: str = 'ZYX') -> pd.DataFrame:
+    """
+    Loads, resyncs, and processes joint traces for a specific subject and
+    trial type, returning a consolidated pandas DataFrame with Euler angles.
+
+    Args:
+        subject_id (str): The subject identifier.
+        trial_type (str): The trial type (e.g., "Gait").
+        euler_order (str): The order of intrinsic Euler angle rotations 
+                           (e.g., 'ZYX', 'YXZ') to be passed to get_joint_traces_df.
+
+    Returns:
+        pd.DataFrame: A multi-indexed DataFrame containing all joint data.
+    """
+    try:
+        plate_trials_marker: List['PlateTrial'] = PlateTrial.load_trial_from_folder(
+            f"data/ODay_Data/{subject_id}/{trial_type}"
+        )
+        plate_trials_never_project: List['PlateTrial'] = [trial.copy() for trial in plate_trials_marker]
+        plate_trials_madgwick: List['PlateTrial'] = [trial.copy() for trial in plate_trials_marker]
+        plate_trials_unprojected: List['PlateTrial'] = [trial.copy() for trial in plate_trials_marker]
+        plate_trials_mag_free: List['PlateTrial'] = [trial.copy() for trial in plate_trials_marker]
+
+        never_project_world_traces: Dict[str, 'WorldTrace'] = WorldTrace.load_from_sto_file(
+            f"data/ODay_Data/{subject_id}/{trial_type}/IMU/never project/{trial_type}_orientations.sto")
+        madgwick_world_traces: Dict[str, 'WorldTrace'] = WorldTrace.load_WorldTraces_from_folder(
+            f"data/ODay_Data/{subject_id}/{trial_type}/IMU")
+        unprojected_world_traces: Dict[str, 'WorldTrace'] = WorldTrace.load_from_sto_file(
+            f"data/ODay_Data/{subject_id}/{trial_type}/IMU/unprojected/{trial_type}_orientations.sto")
+        mag_free_world_traces: Dict[str, 'WorldTrace'] = WorldTrace.load_from_sto_file(
+            f"data/ODay_Data/{subject_id}/{trial_type}/IMU/mag free/{trial_type}_orientations.sto")
+    
+    except Exception as e:
+        print(f"Error loading data for {subject_id}: {e}. Skipping subject.")
+        return pd.DataFrame() 
+    
+    # --- Resync Traces ---
+    plate_trials_never_project = resync_traces(plate_trials_never_project, never_project_world_traces)
+    plate_trials_madgwick = resync_traces(plate_trials_madgwick, madgwick_world_traces)
+    plate_trials_mag_free = resync_traces(plate_trials_mag_free, mag_free_world_traces)
+    plate_trials_unprojected = resync_traces(plate_trials_unprojected, unprojected_world_traces)
+    
+    # --- Trim to Minimum Length ---
+    all_trials_lists = [plate_trials_marker, plate_trials_madgwick, plate_trials_mag_free, plate_trials_never_project, plate_trials_unprojected]
+
+    all_lengths = [len(trial) for trials_list in all_trials_lists for trial in trials_list]
+    all_lengths.append(60000)
+
+    if not all_lengths or min(all_lengths) == 0:
+        print(f"No valid trials found for {subject_id} after resync/trim. Skipping subject.")
+        return pd.DataFrame()
+
+    current_min_length = min(all_lengths)
+    
+    all_trials_lists_trimmed = []
+    for trials_list in all_trials_lists:
+        new_list = []
+        for trial in trials_list:
+            if len(trial) >= current_min_length:
+                new_list.append(trial[-current_min_length:])
+            else:
+                print(f"Skipping trial {trial.name} as it is shorter ({len(trial)}) than min_length ({current_min_length}).")
+        all_trials_lists_trimmed.append(new_list)
+        
+    (plate_trials_marker_trimmed, 
+     plate_trials_madgwick_trimmed, 
+     plate_trials_mag_free_trimmed, 
+     plate_trials_never_project_trimmed,
+     plate_trials_unprojected_trimmed) = all_trials_lists_trimmed
+
+    # --- Calculate Joint Traces (using new DF function) ---
+    method_data = [
+        ('Marker', plate_trials_marker_trimmed),
+        ('Madgwick', plate_trials_madgwick_trimmed),
+        ('Mag-Free', plate_trials_mag_free_trimmed),
+        ('Never Project', plate_trials_never_project_trimmed),
+        ('Unprojected', plate_trials_unprojected_trimmed)
+    ]
+    
+    all_method_dfs = []
+    for method_name, trials_list in method_data:
+        if not trials_list:
+            print(f"No valid trimmed trials for method {method_name}. Skipping.")
+            continue
+        
+        # Pass the euler_order argument
+        joint_df = get_joint_traces_df(trials_list, euler_order=euler_order)
+        
+        if not joint_df.empty:
+            joint_df['method'] = method_name
+            all_method_dfs.append(joint_df)
+
+    if not all_method_dfs:
+        print(f"No joint data processed for {subject_id}. Returning empty DataFrame.")
+        return pd.DataFrame()
+        
+    # --- Consolidate into a single DataFrame ---
+    final_df = pd.concat(all_method_dfs, ignore_index=True)
+    
+    final_df['subject_id'] = subject_id
+    final_df['trial_type'] = trial_type
+    
+    # Dynamically define column order
+    meta_cols = ['subject_id', 'trial_type', 'method', 'joint_name', 'timestamp']
+    euler_cols = [f'euler_{c}_rad' for c in euler_order] # e.g., ['euler_Z_rad', 'euler_Y_rad', 'euler_X_rad']
+    
+    columns_order = meta_cols + euler_cols
+    
+    # Reorder columns
+    final_df = final_df[columns_order]
+
+    # Set a final multi-index for easy access
+    final_df = final_df.set_index(
+        ['subject_id', 'trial_type', 'method', 'joint_name', 'timestamp']
+    ).sort_index()
+
+    return final_df
 
 # --- RMSE Calculation Functions ---
 
@@ -295,6 +477,88 @@ def calculate_euler_rmse_by_axis(
             final_results[method] = np.full((2, 3), np.nan)
             
     return final_results
+
+def calculate_rmse_and_std(all_data_df: pd.DataFrame, group_by: List[str]) -> pd.DataFrame:
+    """
+    Calculates RMSE and STD of the error between all methods and the 'Marker' method.
+
+    Args:
+        all_data_df (pd.DataFrame): The input DataFrame, indexed by 
+            ['subject_id', 'trial_type', 'method', 'joint_name', 'timestamp'].
+            Columns are the Euler angles (e.g., 'euler_X_rad', 'euler_Y_rad').
+        group_by (List[str]): A list of index level names to group by. 
+            Can include 'subject_id', 'trial_type', 'joint_name', and 'axis'.
+
+    Returns:
+        pd.DataFrame: A DataFrame with RMSE and STD values, grouped as specified,
+                      with methods as the first column level and metrics (RMSE, STD)
+                      as the second.
+    """
+    
+    # 1. Stack Euler angle columns (e.g., 'euler_X_rad') to be a new index level 'axis'
+    # This makes grouping by axis possible.
+    original_index_names = all_data_df.index.names
+    data_stacked = all_data_df.stack().rename_axis(original_index_names + ['axis'])
+    
+    # 2. Unstack by 'method' to get methods as columns for comparison
+    # Index: ['subject_id', 'trial_type', 'joint_name', 'timestamp', 'axis']
+    # Columns: ['Marker', 'Madgwick', 'Mag-Free', ...]
+    try:
+        data_wide = data_stacked.unstack('method')
+    except KeyError:
+        print("Error: 'method' not found in the DataFrame's index.")
+        return pd.DataFrame()
+
+    # 3. Check if 'Marker' column exists
+    if 'Marker' not in data_wide.columns:
+        print("Warning: 'Marker' method not found. Cannot calculate error.")
+        return pd.DataFrame()
+
+    # 4. Calculate error (all methods - 'Marker')
+    # We subtract the 'Marker' Series from the entire DataFrame
+    # axis=0 (or 'index') ensures alignment on the multi-level index
+    error_df = data_wide.subtract(data_wide['Marker'], axis=0)
+    
+    # Drop the 'Marker' column itself (which is now all zeros)
+    error_df = error_df.drop('Marker', axis=1, errors='ignore')
+
+    # 5. Calculate Squared Error for RMSE
+    squared_error_df = error_df ** 2
+
+    # 6. Group by the specified levels
+    # Filter for group_by levels that actually exist in the index
+    valid_group_by = [level for level in group_by if level in error_df.index.names]
+    
+    if not valid_group_by:
+        # If group_by is empty, calculate metrics over the entire dataset
+        grouped_error = error_df
+        grouped_sq_error = squared_error_df
+    else:
+        try:
+            grouped_error = error_df.groupby(level=valid_group_by)
+            grouped_sq_error = squared_error_df.groupby(level=valid_group_by)
+        except KeyError as e:
+            print(f"Error: Grouping level not found: {e}. Available levels are: {error_df.index.names}")
+            return pd.DataFrame()
+
+    # 7. Calculate final metrics
+    # RMSE = sqrt(mean(squared_error))
+    rmse = np.sqrt(grouped_sq_error.mean())
+    
+    # STD = std(error)
+    std_dev = grouped_error.std()
+
+    # 8. Combine into a final DataFrame with multi-index columns
+    results_df = pd.concat(
+        {'RMSE': rmse, 'STD': std_dev},
+        axis=1  # Concatenate as columns
+    )
+    
+    # Reorder column levels to have method first, then metric
+    if not results_df.empty:
+        results_df = results_df.swaplevel(0, 1, axis=1).sort_index(axis=1)
+
+    return results_df
 
 # --- Single Subject Plotting and Error Calculation Functions ---
 
@@ -676,64 +940,83 @@ def plot_by_axis_rmse(
     if show_plots:
         plt.show()
 
+# --- By Method, Combined Subjects Plotting ---
+
+def plot_by_method_rmse():
+    per_method_errors = {}
+    for subject in range(len(all_subjects_results)):
+        for method in method_names_for_error:
+            if method not in per_method_errors:
+                per_method_errors[method] = []
+            for joint in joints:
+                try:
+                    truth_trace = all_subjects_results[subject]['Marker'][joint]
+                    test_trace = all_subjects_results[subject][method][joint]
+                    rmse_values, rmse_std = calculate_euler_rmse_matrix(truth_trace, test_trace)
+                    # Store or plot as needed
+                    per_method_errors[method].append(rmse_values)
+                except KeyError:
+                    print(f"Warning: Missing data for RMSE calculation: Subject {subject}, {method} - {joint}")
+                    continue
 # --- Main Execution ---
 
 if __name__ == "__main__":
     # 1. Define the parameters
     # Change this list to include all your subjects!
     SUBJECT_IDS: List[str] = ["Subject01", "Subject02", "Subject03", "Subject04", "Subject05", "Subject06", "Subject07", "Subject08", "Subject09", "Subject10", "Subject11"]
-    trial_type = "walking"  
+    trial_type = "complexTasks"
     method_names_for_error = ['Madgwick', 'Mag-Free', 'Never Project']
     joints = list(JOINT_SEGMENT_DICT.keys()) # Assumes JOINT_SEGMENT_DICT is available
     show_plots = False
     save_plots = True
 
-    all_subjects_results = [{} for _ in range(11)]
+    # Assuming your DataFrame is named 'all_subjects_gait_df'
+    file_path = f"data/ODay_Data/all_subject_data_{trial_type}.pkl"
 
-    # 2. Loop, Collect Results, and Generate Subject Plots
-    for subject_id in SUBJECT_IDS:
-        # Cast subject number to an int
-        subject_num = int(subject_id.replace("Subject", ""))
-        print(f"\nProcessing data for {subject_id}...")
+    if os.path.exists(file_path):
+        print(f"Loading existing DataFrame from {file_path}...")
+        all_data_df = pd.read_pickle(file_path)
+    else:
+        # 2. Loop, load, and collect
+        all_subject_dfs = []
+        for subject_id in SUBJECT_IDS:
+            print(f"--- Processing {subject_id} ---")
+            subject_df = load_joint_traces_for_subject_df(
+                subject_id=subject_id,
+                trial_type=trial_type,
+                euler_order='XYZ'
+            )
+            
+            if not subject_df.empty:
+                all_subject_dfs.append(subject_df)
+            else:
+                print(f"No data returned for {subject_id}, skipping.")
+
+        # 3. Concatenate all DataFrames
+        if not all_subject_dfs:
+            print("No data was loaded for any subject. Exiting.")
+            exit()
+
+        print("--- Concatenating all subjects ---")
+        all_data_df = pd.concat(all_subject_dfs)
         
-        all_joint_traces_for_plotting = load_joint_traces_for_subject(subject_id, trial_type)
+        # Assuming your DataFrame is named 'all_subjects_gait_df'
+        file_path = f"output/all_subject_data_{trial_type}.pkl"
 
-        if all_joint_traces_for_plotting == {}:
-            print(f"Skipping {subject_id} due to data loading issues.")
-            continue
-        
-        # --- PLOT TIME-SERIES DATA FOR CURRENT SUBJECT ---
-        plot_subject_time_series(all_joint_traces_for_plotting, subject_id, trial_type, show_plots=show_plots, save_plots=save_plots)
-        
-        # --- PLOT PER JOINT, PER AXIS, PER METHOD BAR CHART ---
-        plot_subject_euler_error_bar_chart(all_joint_traces_for_plotting, method_names_for_error, subject_id, trial_type, show_plots=show_plots, save_plots=save_plots)
+        # Save the DataFrame to a pickle file
+        all_data_df.to_pickle(file_path)
 
-        # Store results for group analysis later
-        all_subjects_results[subject_num] = all_joint_traces_for_plotting
+        print(f"DataFrame saved to {file_path}")
+        all_subjects_results = [{} for _ in range(12)]
+    print("Data loading and concatenation complete.")
 
-    # 3. Plot Multi-Subject RMSE Results
-    plot_by_joint_rmse(
-        all_results=calculate_euler_rmse_by_joint(
-                            all_subjects_joint_traces=all_subjects_results,
-                            method_names=method_names_for_error,
-                            joints=joints),
-        method_names=method_names_for_error,
-        joints=joints,
-        title="Multi-Subject Mean Joint Angle RMSE vs. Marker",
-        filename=f"multi_subject_mean_joint_rmse_{trial_type}.png",
-        show_plots=show_plots,
-        save_plots=save_plots
+    by_joint_rmse = calculate_rmse_and_std(
+        all_data_df,
+        group_by=['joint_name', 'axis']
     )
+    print(by_joint_rmse.head())
 
-    # 4. Plot Multi-Subject RMSE Results by Axis
-    plot_by_axis_rmse(
-        all_results=calculate_euler_rmse_by_axis(
-                        all_subjects_joint_traces=all_subjects_results,
-                        method_names=method_names_for_error,
-                        joints=joints),
-        method_names=method_names_for_error,
-        title="Multi-Subject Mean Joint Angle RMSE vs. Marker (By Axis)",
-        filename=f"multi_subject_mean_axis_rmse_{trial_type}.png",
-        show_plots=show_plots,
-        save_plots=save_plots
-    )
+    by_subject_rmse = calculate_rmse_and_std(
+        all_data_df,
+        group_by=['subject_id'])
+    print(by_subject_rmse.head())

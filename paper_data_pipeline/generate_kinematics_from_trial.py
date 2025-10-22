@@ -187,8 +187,8 @@ if __name__ == "__main__":
     # GENERATING STO FILES
     num_frames = -1  # Use -1 to indicate all frames
 
-    for subject_num in ['04']:
-        for activity in ['walking']:
+    for subject_num in ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11']:
+        for activity in ['walking', 'complexTasks']:
             print(f"-------Processing Subject {subject_num}, Activity {activity}...--------")
             # Load the plate trials for the current subject and activity
             try:
