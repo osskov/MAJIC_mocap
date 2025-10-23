@@ -84,9 +84,9 @@ class PlateTrial:
         
         for imu_name, imu_trace in imu_traces.items():
             try:
-                world_trace = world_traces[IMU_TO_TRC_NAME_MAP[imu_name]]
+                world_trace = world_traces[imu_name] if imu_name in world_traces else world_traces[IMU_TO_TRC_NAME_MAP[imu_name]]
             except KeyError:
-                print(f"IMU {imu_name} not found in TRC file")
+                print(f"IMU {imu_name} not found in world traces. Skipping.")
                 continue
 
             # Resample if frequencies don't match
@@ -187,3 +187,17 @@ class PlateTrial:
         i1, i2 = max(0, lag), max(0, -lag)
         new_len = min(len(array1) - i1, len(array2) - i2)
         return slice(i1, i1 + new_len), slice(i2, i2 + new_len)
+    
+    def get_imu_trace_in_global_frame(self) -> IMUTrace:
+        """
+        Rotates the IMU trace data into the global frame using the world trace rotations.
+        """
+        rotated_acc = [r @ a for r, a in zip(self.world_trace.rotations, self.imu_trace.acc)]
+        rotated_gyro = [r @ g for r, g in zip(self.world_trace.rotations, self.imu_trace.gyro)]
+        rotated_mag = [r @ m for r, m in zip(self.world_trace.rotations, self.imu_trace.mag)]
+        
+        return IMUTrace(
+            timestamps=self.imu_trace.timestamps,
+            acc=rotated_acc,
+            gyro=rotated_gyro,
+            mag=rotated_mag)

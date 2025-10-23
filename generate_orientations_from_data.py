@@ -86,7 +86,7 @@ def _generate_orientation_sto_file_(output_directory: str,
                                                       zip(segment_orientations[parent_trial.name], joint_orientations)]
 
     output_path = os.path.join(output_directory,
-                               f'walking_orientations_{condition.lower().replace(" ", "_")}.sto' if 'walking' in output_directory else f'complexTasks_orientations_{condition.lower().replace(" ", "_")}.sto')
+                               f'walking_orientations_{condition.lower().replace(" ", "_")}_2.sto' if 'walking' in output_directory else f'complexTasks_orientations_{condition.lower().replace(" ", "_")}_2.sto')
     if not os.path.exists(output_directory):
         os.makedirs(output_directory)
     _export_to_sto_(output_path, timestamps, segment_orientations)
@@ -230,29 +230,24 @@ def _export_to_sto_(filename,
 if __name__ == "__main__":
     # GENERATING STO FILES
     num_frames = -1  # Use -1 to indicate all frames
-    skip_feet = True
 
     for subject_num in ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11']:
         for activity in ['walking', 'complexTasks']:
             print(f"-------Processing Subject {subject_num}, Activity {activity}...--------")
             # Load the plate trials for the current subject and activity
             try:
-                plate_trials = PlateTrial.load_trial_from_Al_Borno_folder(
-                    f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}",
+                subject_activity_folder = os.path.abspath(os.path.join("data", "data", f"Subject{subject_num}", activity))
+                plate_trials = PlateTrial.load_trial_from_folder(
+                    subject_activity_folder,
                     align_plate_trials=True
                 )
 
-                if skip_feet:
-                    # While data for all segments is available in the dataset, these segments are ommitted in the publication.
-                    plate_trials = [plate for plate in plate_trials if
-                                     (plate.name.__contains__('calcn'))]
-
                 print(f"Loaded {len(plate_trials)} plate trials.")
                 print(f"Identified segments: {[plate.name for plate in plate_trials]}")
-                for condition in ['ekf', 'marker', 'mahony', 'madgwick', 'mag free', 'unprojected', 'never project', 'cascade']:
-                    output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/IMU/" + condition
-                    if condition == 'marker':
-                        output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/Mocap/"
+                
+                
+                for condition in ['marker', 'ekf', 'mahony', 'madgwick', 'mag free', 'unprojected', 'never project', 'cascade']:
+                    output_dir = subject_activity_folder
                     if not os.path.exists(output_dir):
                         os.makedirs(output_dir)
                     _generate_orientation_sto_file_(output_dir,

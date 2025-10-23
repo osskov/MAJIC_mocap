@@ -506,16 +506,37 @@ class WorldTrace:
         return world_traces
     
     @staticmethod
-    def load_WorldTraces_from_folder(imu_folder_path: str) -> Dict[str, 'WorldTrace']:
-        world_traces = {}
-
+    def load_WorldTraces_from_AlBorno_folder(imu_folder_path: str) -> Dict[str, 'WorldTrace']:
         # Find the mapping xml file
         mapping_file = next((f for f in os.listdir(imu_folder_path) if f.endswith('.xml')), None)
-        if mapping_file is None:
+        mapping_file_path = os.path.join(imu_folder_path, mapping_file) if mapping_file else None
+        if mapping_file_path is None:
             raise FileNotFoundError("No mapping file found in IMU folder")
 
+        file_path = os.path.join(imu_folder_path, 'madgwick', 'LowerExtremity')
+        if not os.path.isdir(file_path):
+            raise FileNotFoundError(f"Expected folder not found: {file_path}")
+        return WorldTrace._load_WorldTraces_from_mapping_file_and_folder(file_path, mapping_file_path)
+    
+    @staticmethod
+    def load_WorldTraces_from_folder(folder_path: str) -> Dict[str, 'WorldTrace']:
+        parent_folder = os.path.dirname(os.path.abspath(folder_path))
+        mapping_file = next((os.path.join(parent_folder, f) for f in os.listdir(parent_folder) if f.endswith('.xml')), None)
+        mapping_file_path = os.path.join(parent_folder, mapping_file) if mapping_file else None
+        if mapping_file_path is None:
+            raise FileNotFoundError(f"No mapping file found at {os.path.join(parent_folder)}")
+
+        file_path = os.path.abspath(folder_path)
+        if not os.path.isdir(file_path):
+            raise FileNotFoundError(f"Expected folder not found: {file_path}")
+        return WorldTrace._load_WorldTraces_from_mapping_file_and_folder(file_path, mapping_file_path)
+    
+    @staticmethod
+    def _load_WorldTraces_from_mapping_file_and_folder(folder_path: str, mapping_file: str) -> Dict[str, 'WorldTrace']:
+        world_traces = {}
+
         # Parse the XML file
-        tree = ET.parse(os.path.join(imu_folder_path, mapping_file))
+        tree = ET.parse(mapping_file)
         root = tree.getroot()
         trial_prefix_elem = root.find('.//trial_prefix')
         if trial_prefix_elem is None or trial_prefix_elem.text is None:
@@ -539,7 +560,7 @@ class WorldTrace:
             name_in_model = name_in_model_elem.text.strip()
 
             file_name = f"{trial_prefix}{sensor_name}.txt"
-            file_path = os.path.join(imu_folder_path, 'madgwick', 'LowerExtremity', file_name)
+            file_path = os.path.join(folder_path, file_name)
             freq = 100.0  # Default frequency
             try:
                 # Extract update rate
@@ -547,7 +568,7 @@ class WorldTrace:
                     for line in f:
                         if line.startswith("// Update Rate"):
                             freq = float(line.split(":")[1].split("Hz")[0])
-                            if "Subject06" in imu_folder_path or "Subject10" in imu_folder_path:
+                            if "Subject06" in folder_path or "Subject10" in folder_path:
                                 freq = 40.0  # Fix for known incorrect frequency in these subjects madgwick files specifically
                             break
 
@@ -568,6 +589,7 @@ class WorldTrace:
             except FileNotFoundError:
                 print(f"File {file_path} not found. Skipping sensor {sensor_name}.")
         return world_traces
+
 
     def find_best_fit_rotation(self, other_trace: 'WorldTrace') -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
