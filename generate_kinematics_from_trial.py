@@ -241,12 +241,13 @@ if __name__ == "__main__":
                 )
 
                 if skip_feet:
+                    # While data for all segments is available in the dataset, these segments are ommitted in the publication.
                     plate_trials = [plate for plate in plate_trials if
                                     not (plate.name.__contains__('calcn'))]
 
                 print(f"Loaded {len(plate_trials)} plate trials.")
                 print(f"Identified segments: {[plate.name for plate in plate_trials]}")
-                for condition in ['cascade']:
+                for condition in ['marker', 'mahony', 'madgwick', 'mag free', 'unprojected', 'never project', 'cascade']:
                     output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/IMU/" + condition
                     if condition == 'marker':
                         output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/Mocap/"

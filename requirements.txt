@@ -1,7 +1,5 @@
-nimblephysics
 numpy~=1.26.0
 ahrs
 pandas~=2.2.3
 scipy~=1.13.1
 matplotlib~=3.9.2
-torc

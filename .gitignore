@@ -1,0 +1,15 @@
+# Ignore the data folder
+data/
+
+# Ignore any __pycache__ folders anywhere in the project
+**/__pycache__/
+
+# Ignore any .DS_Store and .idea files (macOS specific)
+.DS_Store
+.idea/
+
+# Ignore venv folder
+venv/
+
+# Ignore plots folder
+plots/
