@@ -75,6 +75,51 @@ def load_and_process_imu_data(subject_num: str, trial_type: str, max_frames: int
         print(f"An error occurred loading data for {subject_id} {trial_type}: {e}", file=sys.stderr)
         return [] # Return empty list on failure
 
+def get_pooled_summary(df: pd.DataFrame, group_by_cols: List[str], data_cols: List[str]) -> pd.DataFrame:
+    """
+    Pools data using the Law of Total Variance.
+    
+    Args:
+        df: The full DataFrame.
+        group_by_cols: List of columns to group by (e.g., ['segment'] or ['segment', 'trial_type']).
+        data_cols: List of data prefixes to pool (e.g., ['acc_x', 'mag_y']).
+    """
+    
+    # First, calculate variance (std^2) for each trial
+    var_cols = []
+    for col in data_cols:
+        mean_col = col
+        std_col = f"{col}_std"
+        var_col = f"{col}_var"
+        
+        # Ensure columns exist before trying to square them
+        if std_col in df.columns:
+            df[var_col] = df[std_col]**2
+            var_cols.append(var_col)
+        else:
+            print(f"Warning: Missing std column {std_col}. Cannot calculate variance.")
+
+    # Group by the specified columns (e.g., 'segment')
+    grouped = df.groupby(group_by_cols)
+    
+    # Calculate the two parts of the Law of Total Variance
+    mean_of_means = grouped[data_cols].mean()     # E[Y|X] -> new dot
+    var_of_means = grouped[data_cols].var()       # Var(E[Y|X]) -> inter-trial variance
+    mean_of_vars = grouped[var_cols].mean()     # E[Var(Y|X)] -> mean intra-trial variance
+    
+    # The mean_of_vars DataFrame will have '_var' suffixes. Rename for easy addition.
+    mean_of_vars.columns = [col.replace('_var', '') for col in mean_of_vars.columns]
+    
+    # Calculate Total Variance and Total Std Dev
+    total_var = var_of_means + mean_of_vars
+    total_std = np.sqrt(total_var)
+    
+    # Combine into a new summary DataFrame
+    summary_df = mean_of_means.rename(columns={c: f"{c}_mean" for c in data_cols})
+    summary_std_df = total_std.rename(columns={c: f"{c}_std" for c in data_cols})
+    
+    return summary_df.join(summary_std_df)
+
 def plot_subject_segment_dots(df: pd.DataFrame):
     """
     Generates 6 dot-and-whisker plots (one for each axis of acc/mag).
@@ -257,6 +302,197 @@ def plot_subject_segment_dots(df: pd.DataFrame):
     # Adjust layout to make room on the *left*
     plt.tight_layout(rect=[0.15, 0, 1.0, 0.95])
 
+def plot_pooled_data(df: pd.DataFrame):
+    """
+    Generates 6 dot-and-whisker plots (one for each axis of acc/mag)
+    from a POOLED DataFrame.
+    
+    In each plot:
+    - X-axis: Body Segment (in a specific order)
+    - Y-axis: Measurement
+    - Dot: Pooled Mean value
+    - Whisker: Pooled Total Std Dev.
+    - Color: Determined by Segment
+    - Fill (Marker Fill): Determined by Trial Type (if 'trial_type' is a column)
+    """
+    
+    print("Plotting pooled data...")
+
+    # 1. Setup and Detect Groupings
+    
+    # CRITICAL: Reset index to turn 'segment' and 'trial_type' into columns
+    df_plot = df.reset_index()
+
+    segment_order = [
+        'torso_imu', 'pelvis_imu', 
+        'femur_r_imu', 'femur_l_imu', 
+        'tibia_r_imu', 'tibia_l_imu', 
+        'calcn_r_imu', 'calcn_l_imu'
+    ]
+    
+    # Filter dataframe to only include segments in our desired list
+    df_plot = df_plot[df_plot['segment'].isin(segment_order)].copy()
+    
+    # Automatically detect if we are plotting by trial_type
+    if 'trial_type' in df_plot.columns:
+        trial_types = sorted(df_plot['trial_type'].unique())
+    else:
+        trial_types = []
+    
+    n_segments = len(segment_order)
+    n_trials = len(trial_types)
+    
+    print(f"Generating plots for {n_segments} segments.")
+    if n_trials > 0:
+        print(f"Plot will be dodged by {n_trials} trial types.")
+
+    # 2. Create Mappings
+    
+    # Color map for Segments
+    if n_segments <= 10:
+        colors = plt.cm.tab10(np.linspace(0, 1, n_segments))
+    else:
+        colors = plt.cm.tab20(np.linspace(0, 1, n_segments))
+    segment_colors = {segment: colors[i] for i, segment in enumerate(segment_order)}
+    
+    # Fill map for Trial Types
+    trial_fills = {trial: 'full' for trial in trial_types}
+    if n_trials > 1:
+        trial_fills[trial_types[0]] = 'none' # e.g., 'complexTasks' = hollow
+        trial_fills[trial_types[1]] = 'full' # e.g., 'walking' = solid
+
+    # 3. Create the 6 subplots (3 rows, 2 columns)
+    fig, axes = plt.subplots(3, 2, figsize=(18, 24), sharex=True)
+    fig.suptitle('Pooled IMU Measurements by Segment\n(Dot = Pooled Mean, Whisker = Pooled Total Std Dev)', fontsize=16)
+    
+    ax_list = axes.flatten()
+    
+    # Define what to plot in each subplot
+    # --- CHANGED: Using the _mean and _std suffixes from get_pooled_summary ---
+    plot_specs = [
+        {'col_mean': 'acc_x_mean', 'col_std': 'acc_x_std', 'title': 'Acceleration (X-axis)', 'ylabel': 'm/s²'},
+        {'col_mean': 'mag_x_mean', 'col_std': 'mag_x_std', 'title': 'Magnetometer (X-axis)', 'ylabel': 'µT'},
+        {'col_mean': 'acc_y_mean', 'col_std': 'acc_y_std', 'title': 'Acceleration (Y-axis)', 'ylabel': 'm/s²'},
+        {'col_mean': 'mag_y_mean', 'col_std': 'mag_y_std', 'title': 'Magnetometer (Y-axis)', 'ylabel': 'µT'},
+        {'col_mean': 'acc_z_mean', 'col_std': 'acc_z_std', 'title': 'Acceleration (Z-axis)', 'ylabel': 'm/s²'},
+        {'col_mean': 'mag_z_mean', 'col_std': 'mag_z_std', 'title': 'Magnetometer (Z-axis)', 'ylabel': 'µT'},
+    ]
+
+    # 4. Main Plotting Loop
+    
+    # Calculate horizontal dodge positions
+    if n_trials > 1:
+        dodge = np.linspace(-0.2, 0.2, n_trials)
+    else:
+        dodge = [0]
+    
+    for ax, spec in zip(ax_list, plot_specs):
+        for i_seg, segment in enumerate(segment_order):
+            
+            # Get all data for this segment
+            segment_data = df_plot[df_plot['segment'] == segment]
+            
+            if segment_data.empty:
+                continue
+
+            # Case 1: No trial types, plot one dot
+            if n_trials <= 1:
+                x_pos = i_seg
+                data = segment_data.iloc[0] # Should only be one row
+                fillstyle = 'full'
+                
+                ax.errorbar(
+                    x=x_pos,
+                    y=data[spec['col_mean']],
+                    yerr=data[spec['col_std']],
+                    marker='o', # Use a consistent marker
+                    color=segment_colors[segment],
+                    fillstyle=fillstyle,
+                    linestyle='none',
+                    capsize=5, # Wider capsize
+                    markersize=10,
+                    alpha=0.8,
+                    markeredgecolor=segment_colors[segment],
+                )
+            
+            # Case 2: Plot dodged dots for each trial type
+            else:
+                for i_trial, trial_type in enumerate(trial_types):
+                    x_pos = i_seg + dodge[i_trial]
+                    
+                    # Find the single row for this segment/trial
+                    data_row = segment_data[segment_data['trial_type'] == trial_type]
+                    
+                    if data_row.empty:
+                        continue
+                        
+                    data = data_row.iloc[0] # Get the series
+                    mean_val = data[spec['col_mean']]
+                    std_val = data[spec['col_std']]
+                    
+                    color = segment_colors[segment]
+                    fillstyle = trial_fills[trial_type]
+                    
+                    ax.errorbar(
+                        x=x_pos,
+                        y=mean_val,
+                        yerr=std_val,
+                        marker='o', # Use a consistent marker
+                        color=color,
+                        fillstyle=fillstyle,
+                        linestyle='none',
+                        capsize=5,
+                        markersize=10,
+                        alpha=0.8,
+                        markeredgecolor=color,
+                    )
+        
+        # 5. Configure Axes
+        ax.set_title(spec['title'])
+        ax.set_ylabel(spec['ylabel'])
+        ax.axhline(0, color='gray', linestyle='-', linewidth=0.5)
+        
+        if ax in axes[2, :]: # If in the last row
+            ax.set_xticks(range(n_segments))
+            ax.set_xticklabels(segment_order, rotation=45, ha='right')
+        
+        ax.grid(axis='y', linestyle='--', alpha=0.6)
+        ax.set_xlim(-0.5, n_segments - 0.5)
+
+        # Adjust Y-axis for Acc-Y plot
+        if spec['col_mean'] == 'acc_y_mean':
+            data_means = df_plot[spec['col_mean']]
+            data_stds = df_plot[spec['col_std']]
+            
+            valid_data = ~data_means.isna() & ~data_stds.isna()
+            if valid_data.any():
+                plot_min = (data_means[valid_data] - data_stds[valid_data]).min()
+                plot_max = (data_means[valid_data] + data_stds[valid_data]).max()
+                
+                padding = (plot_max - plot_min) * 0.1
+                if padding == 0: padding = 0.1 
+                
+                ax.set_ylim(plot_min - padding, plot_max + padding)
+
+    # 6. Create Custom Legends
+    
+    # Color (Segment) legend
+    segment_patches = [mpatches.Patch(color=color, label=segment) 
+                       for segment, color in segment_colors.items()]
+    fig.legend(handles=segment_patches, title='Body Segment (Color)', 
+               bbox_to_anchor=(0.15, 0.75), loc='upper right', frameon=True)
+    
+    # Trial Type (Fill) Legend (Only if we have trials)
+    if n_trials > 1:
+        trial_lines = [mlines.Line2D([], [], color='gray', marker='o', linestyle='None',
+                                    markersize=10, label=trial, fillstyle=fill,
+                                    markeredgecolor='gray')
+                       for trial, fill in trial_fills.items()]
+        fig.legend(handles=trial_lines, title='Trial Type (Fill)',
+                   bbox_to_anchor=(0.15, 0.45), loc='upper right', frameon=True)
+    
+    plt.tight_layout(rect=[0.15, 0, 1.0, 0.95])
+
 
 if __name__ == "__main__":
     pkl_file = "imu_data_summary.pkl"
@@ -287,18 +523,18 @@ if __name__ == "__main__":
         df = pd.DataFrame(all_results)
         df.to_pickle(pkl_file)  # Save the *new* data with std dev
 
-    # --- Add Mean Torso Magnetic Field ---
-    torso_mag_data = df[df['segment'] == 'torso_imu'][['mag_x', 'mag_y', 'mag_z']]
-    if not torso_mag_data.empty:
-        # Calculate mean across all subjects and trials for torso
-        mean_torso_mag_vec = torso_mag_data.mean().values
-        
-        print(f"\nOverall Mean Torso Magnetic Field: {mean_torso_mag_vec[0]:.3g}, {mean_torso_mag_vec[1]:.3g}, {mean_torso_mag_vec[2]:.3g} µT")
-    else:
-        print("\nNo 'torso_imu' data found to plot mean magnetic field.")
-    
     # Create the new visualization
-    plot_subject_segment_dots(df)
+    # plot_subject_segment_dots(df)
+    # plt.show()
+
     
-    # Finally, display the plot
+    # --- Generate Grouped Summary DataFrames ---
+    print("\nGenerating pooled summary DataFrames...")
+    pooled_by_segment = get_pooled_summary(
+        df,
+        group_by_cols=['segment', 'trial_type'],
+        data_cols=['acc_x', 'acc_y', 'acc_z', 'mag_x', 'mag_y', 'mag_z']
+    )
+
+    plot_pooled_data(pooled_by_segment)
     plt.show()
