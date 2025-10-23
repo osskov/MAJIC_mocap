@@ -1,16 +1,12 @@
 import os
 import numpy as np
-from typing import List, Dict, Tuple, Union
+from typing import List, Dict, Union
 import xml.etree.ElementTree as ET
 import pandas as pd
 from scipy.interpolate import interp1d
-from scipy.optimize import minimize
 
 from .finite_difference_utils import central_difference, forward_difference, polynomial_fit_derivative
-from scipy.signal import butter, filtfilt
-from .gyro_utils import integrate_rotations, finite_difference_rotations, calculate_best_fit_rotation, \
-    angular_velocity_to_rotation_matrix
-
+from .gyro_utils import calculate_best_fit_rotation
 
 class IMUTrace:
     timestamps: np.ndarray

@@ -13,7 +13,7 @@ import pandas as pd
 import os
 
 
-from generate_kinematics_from_trial import JOINT_SEGMENT_DICT
+from generate_orientations_from_data import JOINT_SEGMENT_DICT
 
 # --- Data Loading Functions ---
 
