@@ -3,8 +3,7 @@ import numpy as np
 import scipy.signal as signal
 from .IMUTrace import IMUTrace
 from .WorldTrace import WorldTrace
-from .KinematicsTrace import KinematicsTrace
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 import matplotlib.pyplot as plt
 
 IMU_TO_TRC_NAME_MAP = {
@@ -66,26 +65,23 @@ class PlateTrial:
         This function estimates the values for an IMUTrace at a different location relative to the plate.
         """
         return self.imu_trace.project_acc(local_offset)
-
+    
     @staticmethod
-    def load_trial_from_Al_Borno_folder(folder_path: str, align_plate_trials=True) -> List['PlateTrial']:
-        imu_traces = IMUTrace.load_IMUTraces_from_Al_Borno_folder(os.path.join(folder_path, 'IMU'))
-
-        trc_file_path = [os.path.join(folder_path, 'Mocap', file)
-            for file in os.listdir(os.path.join(folder_path, 'Mocap'))
-            if '.trc' in file][0]
-
-        world_traces = WorldTrace.load_from_trc_file(trc_file_path)
-
-        kinematics_file_path = [
-            os.path.join(folder_path, 'Mocap', 'ikResults', file)
-            for file in os.listdir(os.path.join(folder_path, 'Mocap', 'ikResults'))
-            if '.mot' in file][0]
-
-        kinematics_trace = KinematicsTrace.load_kinematics_from_mot_file(kinematics_file_path)
-
+    def generate_plate_from_traces(
+        imu_traces: Dict[str, 'IMUTrace'], 
+        world_traces: Dict[str, 'WorldTrace'], 
+        align_plate_trials: bool
+    ) -> List['PlateTrial']:
+        """
+        Private helper to synchronize, align, and trim IMU and World traces.
+        """
         plate_trials = []
         imu_slice, world_slice = slice(0, 0), slice(0, 0)
+        
+        if not imu_traces:
+            print("Warning: No IMU traces loaded.")
+            return []
+        
         for imu_name, imu_trace in imu_traces.items():
             try:
                 world_trace = world_traces[IMU_TO_TRC_NAME_MAP[imu_name]]
@@ -93,78 +89,82 @@ class PlateTrial:
                 print(f"IMU {imu_name} not found in TRC file")
                 continue
 
+            # Resample if frequencies don't match
             if abs(imu_trace.get_sample_frequency() - world_trace.get_sample_frequency()) > 0.2:
                 # print(f"Sample frequency mismatch for {imu_name}: IMU {imu_trace.get_sample_frequency()} Hz, World {world_trace.get_sample_frequency()} Hz")
                 imu_trace = imu_trace.resample(float(world_trace.get_sample_frequency()))
 
+            # Sync traces and create PlateTrial
             imu_slice, world_slice = PlateTrial._sync_traces(imu_trace, world_trace)
             synced_imu_trace = imu_trace[imu_slice].re_zero_timestamps()
             synced_world_trace = world_trace[world_slice].re_zero_timestamps()
+            
             new_plate_trial = PlateTrial(imu_name, synced_imu_trace, synced_world_trace)
+            
             if align_plate_trials:
                 new_plate_trial = new_plate_trial._align_world_trace_to_imu_trace()
+                
             plate_trials.append(new_plate_trial)
 
+        # Trim all trials to the same minimum length
         plate_trial_lengths = [len(plate_trial) for plate_trial in plate_trials]
         if len(set(plate_trial_lengths)) > 1:
             print(f"Warning: Plate trials have different lengths: {plate_trial_lengths}, Trimming to min length.")
             min_length = min(plate_trial_lengths)
             plate_trials = [plate_trial[:min_length] for plate_trial in plate_trials]
 
-        synced_kinematics_file_path = kinematics_file_path.replace('.mot', '_trimmed.mot')
-        synced_kinematics_trace = kinematics_trace[world_slice].re_zero_timestamps()
-        synced_kinematics_trace.write_kinematics_to_mot(synced_kinematics_file_path)
+        return plate_trials
+
+    @staticmethod
+    def load_trial_from_Al_Borno_folder(folder_path: str, align_plate_trials=True) -> List['PlateTrial']:
+        """
+        Loads a trial from the Al Borno data structure.
+        - IMU data in /IMU
+        - Mocap data in /Mocap
+        """
+        # 1. Load IMU Traces
+        imu_folder = os.path.join(folder_path, 'IMU')
+        imu_traces = IMUTrace.load_IMUTraces_from_Al_Borno_folder(imu_folder)
+
+        # 2. Load World Traces
+        mocap_folder = os.path.join(folder_path, 'Mocap/')
+        trc_file_path = [file for file in os.listdir(mocap_folder) if file.endswith('.trc') and 'static' not in file][0]
+        trc_file_path = os.path.abspath(os.path.join(mocap_folder, trc_file_path))
+        world_traces = WorldTrace.load_from_trc_file(trc_file_path)
+
+        print(f"Loaded {len(imu_traces)} IMU traces and {len(world_traces)} World traces. Generating PlateTrials...")
+
+        # 3. Process all traces
+        plate_trials = PlateTrial.generate_plate_from_traces(
+            imu_traces, world_traces, align_plate_trials
+        )
+
         return plate_trials
     
     @staticmethod
     def load_trial_from_folder(folder_path: str, align_plate_trials=True) -> List['PlateTrial']:
-        imu_traces = IMUTrace.load_IMUTraces_from_folder(os.path.join(folder_path, 'imu data'))
+        """
+        Loads a trial from the Skov data structure.
+        - IMU data in /imu data
+        - Mocap data in root folder
+        """
+        # 1. Load IMU Traces
+        imu_traces = IMUTrace.load_IMUTraces_from_Skov_folder(folder_path)
 
-        trc_file_path = [os.path.join(folder_path, file)
-            for file in os.listdir(folder_path)
-            if '.trc' in file][0]
-
+        # 2. Load World Traces
+        trc_file_path = [file for file in os.listdir(folder_path) if file.endswith('.trc')][0]
+        trc_file_path = os.path.abspath(os.path.join(folder_path, trc_file_path))
         world_traces = WorldTrace.load_from_trc_file(trc_file_path)
 
-        kinematics_file_path = [
-            os.path.join(folder_path, 'Mocap', 'ikResults', file)
-            for file in os.listdir(os.path.join(folder_path, 'Mocap', 'ikResults'))
-            if '.mot' in file][0]
+        print(f"Loaded {len(imu_traces)} IMU traces and {len(world_traces)} World traces. Generating PlateTrials...")
 
-        kinematics_trace = KinematicsTrace.load_kinematics_from_mot_file(kinematics_file_path)
-
-        plate_trials = []
-        imu_slice, world_slice = slice(0, 0), slice(0, 0)
-        for imu_name, imu_trace in imu_traces.items():
-            try:
-                world_trace = world_traces[IMU_TO_TRC_NAME_MAP[imu_name]]
-            except KeyError:
-                print(f"IMU {imu_name} not found in TRC file")
-                continue
-
-            if abs(imu_trace.get_sample_frequency() - world_trace.get_sample_frequency()) > 0.2:
-                # print(f"Sample frequency mismatch for {imu_name}: IMU {imu_trace.get_sample_frequency()} Hz, World {world_trace.get_sample_frequency()} Hz")
-                imu_trace = imu_trace.resample(float(world_trace.get_sample_frequency()))
-
-            imu_slice, world_slice = PlateTrial._sync_traces(imu_trace, world_trace)
-            synced_imu_trace = imu_trace[imu_slice].re_zero_timestamps()
-            synced_world_trace = world_trace[world_slice].re_zero_timestamps()
-            new_plate_trial = PlateTrial(imu_name, synced_imu_trace, synced_world_trace)
-            if align_plate_trials:
-                new_plate_trial = new_plate_trial._align_world_trace_to_imu_trace()
-            plate_trials.append(new_plate_trial)
-
-        plate_trial_lengths = [len(plate_trial) for plate_trial in plate_trials]
-        if len(set(plate_trial_lengths)) > 1:
-            print(f"Warning: Plate trials have different lengths: {plate_trial_lengths}, Trimming to min length.")
-            min_length = min(plate_trial_lengths)
-            plate_trials = [plate_trial[:min_length] for plate_trial in plate_trials]
-
-        synced_kinematics_file_path = kinematics_file_path.replace('.mot', '_trimmed.mot')
-        synced_kinematics_trace = kinematics_trace[world_slice].re_zero_timestamps()
-        synced_kinematics_trace.write_kinematics_to_mot(synced_kinematics_file_path)
+        # 3. Process all traces
+        plate_trials = PlateTrial.generate_plate_from_traces(
+            imu_traces, world_traces, align_plate_trials
+        )
+        
         return plate_trials
-
+    
     @staticmethod
     def _sync_traces(imu_trace: IMUTrace, world_trace: WorldTrace) -> Tuple[slice, slice]:
         if not np.isclose(imu_trace.get_sample_frequency(), world_trace.get_sample_frequency(), rtol=0.2):

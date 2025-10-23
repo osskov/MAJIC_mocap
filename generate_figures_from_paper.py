@@ -133,7 +133,7 @@ def load_joint_traces_for_subject_df(subject_id: str,
     plate_trials_by_method: Dict[str, List['PlateTrial']] = {}
     world_traces_by_method: Dict[str, Dict[str, 'WorldTrace']] = {}
     plate_trials_by_method['Marker'] = PlateTrial.load_trial_from_folder(
-                    f"data/ODay_Data/{subject_id}/{trial_type}"
+                    f"data/data/{subject_id}/{trial_type}"
                 )
     min_length = min(len(trial) for trial in plate_trials_by_method['Marker'])
     min_length = min(min_length, 60000)  # Cap at 60000 frames to avoid excessive lengths
@@ -581,81 +581,81 @@ if __name__ == "__main__":
     METHODS: List[str] = ['Marker', 
                           'Mahony', 'Madgwick (ODAY)', 'Madgwick', 'EKF',
                           'Never Project', 'Mag Free', 'Unprojected', 'Cascade'] # Capitalization is sensitive!
-    trial_type = "complexTasks"
+    trial_types = ["complexTasks", "walking"]
     joints = list(JOINT_SEGMENT_DICT.keys()) # Assumes JOINT_SEGMENT_DICT is available
     show_plots = False
     save_plots = True
     drop_ankles = False
+    for trial_type in trial_types:
+        file_path = f"data/ODay_Data/all_subject_data_{trial_type}.pkl"
+        os.mkdir("plots") if not os.path.exists("plots") else None
+        if os.path.exists(file_path):
+            print(f"Loading existing DataFrame from {file_path}...")
+            all_data_df = pd.read_pickle(file_path)
+        else:
+            # 2. Loop, load, and collect
+            all_subject_dfs = []
+            for subject_id in SUBJECT_IDS:
+                print(f"--- Processing {subject_id} ---")
+                try:
+                    subject_df = load_joint_traces_for_subject_df(
+                        subject_id=subject_id,
+                        methods=METHODS,
+                        trial_type=trial_type,
+                        euler_order='XYZ'
+                    )
+                except Exception as e:
+                    print(f"Error processing {subject_id}: {e}. Skipping subject.")
+                    continue
+                
+                if not subject_df.empty:
+                    all_subject_dfs.append(subject_df)
+                else:
+                    print(f"No data returned for {subject_id}, skipping.")
 
-    file_path = f"data/ODay_Data/all_subject_data_{trial_type}.pkl"
-    os.mkdir("plots") if not os.path.exists("plots") else None
-    if os.path.exists(file_path):
-        print(f"Loading existing DataFrame from {file_path}...")
-        all_data_df = pd.read_pickle(file_path)
-    else:
-        # 2. Loop, load, and collect
-        all_subject_dfs = []
-        for subject_id in SUBJECT_IDS:
-            print(f"--- Processing {subject_id} ---")
-            try:
-                subject_df = load_joint_traces_for_subject_df(
-                    subject_id=subject_id,
-                    methods=METHODS,
-                    trial_type=trial_type,
-                    euler_order='XYZ'
-                )
-            except Exception as e:
-                print(f"Error processing {subject_id}: {e}. Skipping subject.")
-                continue
+            # 3. Concatenate all DataFrames
+            if not all_subject_dfs:
+                print("No data was loaded for any subject. Exiting.")
+                exit()
+
+            print("--- Concatenating all subjects ---")
+            all_data_df = pd.concat(all_subject_dfs)
             
-            if not subject_df.empty:
-                all_subject_dfs.append(subject_df)
-            else:
-                print(f"No data returned for {subject_id}, skipping.")
+            # Save the DataFrame to a pickle file
+            all_data_df.to_pickle(file_path)
 
-        # 3. Concatenate all DataFrames
-        if not all_subject_dfs:
-            print("No data was loaded for any subject. Exiting.")
-            exit()
+            print(f"DataFrame saved to {file_path}")
+            all_subjects_results = [{} for _ in range(12)]
+        print("Data loading and concatenation complete.")
 
-        print("--- Concatenating all subjects ---")
-        all_data_df = pd.concat(all_subject_dfs)
+    # # --- Get RMSE by all groups ---
+    # by_all_group_rmse = calculate_rmse_and_std(
+    #     all_data_df,
+    #     group_by=['joint_name', 'axis', 'subject_id', 'axis']
+    # )
+    # by_all_group_rmse_file_path = f"data/ODay_Data/rmse_by_all_groups_{trial_type}.pkl"
+    # by_all_group_rmse.to_pickle(by_all_group_rmse_file_path)
+
+    # # --- Filter Dataset as Needed ---
+    # if drop_ankles or METHODS != all_data_df.index.get_level_values('method').unique().tolist() or SUBJECT_IDS != all_data_df.index.get_level_values('subject_id').unique().tolist():
+    #     print("Filtering dataset based on specified criteria...")
+    #     if drop_ankles:
+    #         print("Dropping ankle joints from the dataset...")
+    #         idx_to_drop = all_data_df.index.get_level_values('joint_name').isin(['L_Ankle', 'R_Ankle'])
+    #         all_data_df = all_data_df[~idx_to_drop]
         
-        # Save the DataFrame to a pickle file
-        all_data_df.to_pickle(file_path)
+    #     if METHODS != all_data_df.index.get_level_values('method').unique().tolist():
+    #         # Drop any methods not in the METHODS list
+    #         print("Filtering methods to match the specified METHODS list...")
+    #         idx_to_keep = all_data_df.index.get_level_values('method').isin(METHODS)
+    #         all_data_df = all_data_df[idx_to_keep]
 
-        print(f"DataFrame saved to {file_path}")
-        all_subjects_results = [{} for _ in range(12)]
-    print("Data loading and concatenation complete.")
-
-    # --- Get RMSE by all groups ---
-    by_all_group_rmse = calculate_rmse_and_std(
-        all_data_df,
-        group_by=['joint_name', 'axis', 'subject_id', 'axis']
-    )
-    by_all_group_rmse_file_path = f"data/ODay_Data/rmse_by_all_groups_{trial_type}.pkl"
-    by_all_group_rmse.to_pickle(by_all_group_rmse_file_path)
-
-    # --- Filter Dataset as Needed ---
-    if drop_ankles or METHODS != all_data_df.index.get_level_values('method').unique().tolist() or SUBJECT_IDS != all_data_df.index.get_level_values('subject_id').unique().tolist():
-        print("Filtering dataset based on specified criteria...")
-        if drop_ankles:
-            print("Dropping ankle joints from the dataset...")
-            idx_to_drop = all_data_df.index.get_level_values('joint_name').isin(['L_Ankle', 'R_Ankle'])
-            all_data_df = all_data_df[~idx_to_drop]
-        
-        if METHODS != all_data_df.index.get_level_values('method').unique().tolist():
-            # Drop any methods not in the METHODS list
-            print("Filtering methods to match the specified METHODS list...")
-            idx_to_keep = all_data_df.index.get_level_values('method').isin(METHODS)
-            all_data_df = all_data_df[idx_to_keep]
-
-        if SUBJECT_IDS != all_data_df.index.get_level_values('subject_id').unique().tolist():
-            # Drop any subjects not in the SUBJECT_IDS list
-            print("Filtering subjects to match the specified SUBJECT_IDS list...")
-            idx_to_keep = all_data_df.index.get_level_values('subject_id').isin(SUBJECT_IDS)
-            all_data_df = all_data_df[idx_to_keep]
-        print("Dataset filtering complete.")
+    #     if SUBJECT_IDS != all_data_df.index.get_level_values('subject_id').unique().tolist():
+    #         # Drop any subjects not in the SUBJECT_IDS list
+    #         print("Filtering subjects to match the specified SUBJECT_IDS list...")
+    #         idx_to_keep = all_data_df.index.get_level_values('subject_id').isin(SUBJECT_IDS)
+    #         all_data_df = all_data_df[idx_to_keep]
+    #     print("Dataset filtering complete.")
 
     # --- PLOT BY JOINT AND AXIS RMSE ---
     by_joint_rmse = calculate_rmse_and_std(
@@ -708,22 +708,22 @@ if __name__ == "__main__":
         show_plot=show_plots
     )
 
-    # --- PLOT SINGLE SUBJECT RMSE ---
-    for subject_id in SUBJECT_IDS:
-        try: 
-            print(f"Calculating and plotting RMSE for {subject_id}...")
-            all_subject_data_df = all_data_df.xs(subject_id, level='subject_id')
-            subject_error_df = calculate_rmse_and_std(
-                all_subject_data_df,
-                group_by=['joint_name', 'axis']
-            )
-            plot_rmse_with_std(
-                subject_error_df,
-                title=f"RMSE for {subject_id} by Joint and Axis for {trial_type}",
-                y_label="RMSE (degrees)",
-                save_plot=save_plots,
-                show_plot=show_plots
-            )
-        except KeyError:
-            print(f"No data found for {subject_id}, skipping RMSE plot.")
-            continue
+    # # --- PLOT SINGLE SUBJECT RMSE ---
+    # for subject_id in SUBJECT_IDS:
+    #     try: 
+    #         print(f"Calculating and plotting RMSE for {subject_id}...")
+    #         all_subject_data_df = all_data_df.xs(subject_id, level='subject_id')
+    #         subject_error_df = calculate_rmse_and_std(
+    #             all_subject_data_df,
+    #             group_by=['joint_name', 'axis']
+    #         )
+    #         plot_rmse_with_std(
+    #             subject_error_df,
+    #             title=f"RMSE for {subject_id} by Joint and Axis for {trial_type}",
+    #             y_label="RMSE (degrees)",
+    #             save_plot=save_plots,
+    #             show_plot=show_plots
+    #         )
+    #     except KeyError:
+    #         print(f"No data found for {subject_id}, skipping RMSE plot.")
+    #         continue

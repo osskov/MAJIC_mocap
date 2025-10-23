@@ -57,6 +57,8 @@ def _generate_orientation_sto_file_(output_directory: str,
             ahrs_filter.set_last_q(q_initial)
             R_ws = []
             dt = np.mean(np.diff(plate.imu_trace.timestamps))
+            for _ in range(2000):
+                ahrs_filter.update(dt, plate.imu_trace.acc[0], np.array([0, 0, 0]), plate.imu_trace.mag[0])
             for t in range(len(plate)):
                 ahrs_filter.update(dt,
                                    plate.imu_trace.acc[t],
@@ -84,7 +86,7 @@ def _generate_orientation_sto_file_(output_directory: str,
                                                       zip(segment_orientations[parent_trial.name], joint_orientations)]
 
     output_path = os.path.join(output_directory,
-                               f'walking_orientations.sto' if 'walking' in output_directory else 'complexTasks_orientations.sto')
+                               f'walking_orientations_{condition.lower().replace(" ", "_")}.sto' if 'walking' in output_directory else f'complexTasks_orientations_{condition.lower().replace(" ", "_")}.sto')
     if not os.path.exists(output_directory):
         os.makedirs(output_directory)
     _export_to_sto_(output_path, timestamps, segment_orientations)
@@ -230,12 +232,12 @@ if __name__ == "__main__":
     num_frames = -1  # Use -1 to indicate all frames
     skip_feet = True
 
-    for subject_num in ['01', '02', '03', '04', '05', '06']:
+    for subject_num in ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11']:
         for activity in ['walking', 'complexTasks']:
             print(f"-------Processing Subject {subject_num}, Activity {activity}...--------")
             # Load the plate trials for the current subject and activity
             try:
-                plate_trials = PlateTrial.load_trial_from_folder(
+                plate_trials = PlateTrial.load_trial_from_Al_Borno_folder(
                     f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}",
                     align_plate_trials=True
                 )
@@ -243,11 +245,11 @@ if __name__ == "__main__":
                 if skip_feet:
                     # While data for all segments is available in the dataset, these segments are ommitted in the publication.
                     plate_trials = [plate for plate in plate_trials if
-                                    not (plate.name.__contains__('calcn'))]
+                                     (plate.name.__contains__('calcn'))]
 
                 print(f"Loaded {len(plate_trials)} plate trials.")
                 print(f"Identified segments: {[plate.name for plate in plate_trials]}")
-                for condition in ['marker', 'mahony', 'madgwick', 'mag free', 'unprojected', 'never project', 'cascade']:
+                for condition in ['ekf', 'marker', 'mahony', 'madgwick', 'mag free', 'unprojected', 'never project', 'cascade']:
                     output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/IMU/" + condition
                     if condition == 'marker':
                         output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/Mocap/"
