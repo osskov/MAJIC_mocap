@@ -55,7 +55,7 @@ class PlateTrial:
         )
 
     def _align_world_trace_to_imu_trace(self) -> 'PlateTrial':
-        synthetic_imu_trace = self.world_trace.calculate_imu_trace()
+        synthetic_imu_trace = self.world_trace.calculate_imu_trace(skip_lin_acc=True)
         R_wt_it = synthetic_imu_trace.calculate_rotation_offset_from_gyros(self.imu_trace)
         new_world_rotations = [rot @ R_wt_it for rot in self.world_trace.rotations]
         new_world_trace = WorldTrace(self.world_trace.timestamps, self.world_trace.positions, new_world_rotations)
@@ -68,11 +68,60 @@ class PlateTrial:
         return self.imu_trace.project_acc(local_offset)
 
     @staticmethod
-    def load_trial_from_folder(folder_path: str, align_plate_trials=True) -> List['PlateTrial']:
-        imu_traces = IMUTrace.load_IMUTraces_from_folder(os.path.join(folder_path, 'IMU'))
+    def load_trial_from_Al_Borno_folder(folder_path: str, align_plate_trials=True) -> List['PlateTrial']:
+        imu_traces = IMUTrace.load_IMUTraces_from_Al_Borno_folder(os.path.join(folder_path, 'IMU'))
 
         trc_file_path = [os.path.join(folder_path, 'Mocap', file)
             for file in os.listdir(os.path.join(folder_path, 'Mocap'))
+            if '.trc' in file][0]
+
+        world_traces = WorldTrace.load_from_trc_file(trc_file_path)
+
+        kinematics_file_path = [
+            os.path.join(folder_path, 'Mocap', 'ikResults', file)
+            for file in os.listdir(os.path.join(folder_path, 'Mocap', 'ikResults'))
+            if '.mot' in file][0]
+
+        kinematics_trace = KinematicsTrace.load_kinematics_from_mot_file(kinematics_file_path)
+
+        plate_trials = []
+        imu_slice, world_slice = slice(0, 0), slice(0, 0)
+        for imu_name, imu_trace in imu_traces.items():
+            try:
+                world_trace = world_traces[IMU_TO_TRC_NAME_MAP[imu_name]]
+            except KeyError:
+                print(f"IMU {imu_name} not found in TRC file")
+                continue
+
+            if abs(imu_trace.get_sample_frequency() - world_trace.get_sample_frequency()) > 0.2:
+                # print(f"Sample frequency mismatch for {imu_name}: IMU {imu_trace.get_sample_frequency()} Hz, World {world_trace.get_sample_frequency()} Hz")
+                imu_trace = imu_trace.resample(float(world_trace.get_sample_frequency()))
+
+            imu_slice, world_slice = PlateTrial._sync_traces(imu_trace, world_trace)
+            synced_imu_trace = imu_trace[imu_slice].re_zero_timestamps()
+            synced_world_trace = world_trace[world_slice].re_zero_timestamps()
+            new_plate_trial = PlateTrial(imu_name, synced_imu_trace, synced_world_trace)
+            if align_plate_trials:
+                new_plate_trial = new_plate_trial._align_world_trace_to_imu_trace()
+            plate_trials.append(new_plate_trial)
+
+        plate_trial_lengths = [len(plate_trial) for plate_trial in plate_trials]
+        if len(set(plate_trial_lengths)) > 1:
+            print(f"Warning: Plate trials have different lengths: {plate_trial_lengths}, Trimming to min length.")
+            min_length = min(plate_trial_lengths)
+            plate_trials = [plate_trial[:min_length] for plate_trial in plate_trials]
+
+        synced_kinematics_file_path = kinematics_file_path.replace('.mot', '_trimmed.mot')
+        synced_kinematics_trace = kinematics_trace[world_slice].re_zero_timestamps()
+        synced_kinematics_trace.write_kinematics_to_mot(synced_kinematics_file_path)
+        return plate_trials
+    
+    @staticmethod
+    def load_trial_from_folder(folder_path: str, align_plate_trials=True) -> List['PlateTrial']:
+        imu_traces = IMUTrace.load_IMUTraces_from_folder(os.path.join(folder_path, 'imu data'))
+
+        trc_file_path = [os.path.join(folder_path, file)
+            for file in os.listdir(folder_path)
             if '.trc' in file][0]
 
         world_traces = WorldTrace.load_from_trc_file(trc_file_path)
@@ -121,7 +170,7 @@ class PlateTrial:
         if not np.isclose(imu_trace.get_sample_frequency(), world_trace.get_sample_frequency(), rtol=0.2):
             imu_trace = imu_trace.resample(float(world_trace.get_sample_frequency()))
 
-        synthetic_imu_trace = world_trace.calculate_imu_trace()
+        synthetic_imu_trace = world_trace.calculate_imu_trace(skip_lin_acc=True)
         imu_slice, world_slice = PlateTrial._sync_arrays(
             np.linalg.norm(imu_trace.gyro, axis=1),
             np.linalg.norm(synthetic_imu_trace.gyro, axis=1)

@@ -432,7 +432,7 @@ def plot_rmse_with_std(stats_df: pd.DataFrame, title: str, y_label: str = "RMSE 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         if save_plot:
-            plt.savefig(f"{title.replace(' ', '_').lower()}_rmse_plot.png", dpi=150)
+            plt.savefig(f"plots/{title.replace(' ', '_').lower()}_rmse_plot.png", dpi=150)
             print(f"Plot saved as {title.replace(' ', '_').lower()}_rmse_plot.png")
         if show_plot:
             plt.show()
@@ -487,7 +487,6 @@ def _perform_statistical_tests(grouped_error,
                 continue
             
             run_parametric = False
-            # [NEW] Logic to decide which test to run
             if n_samples >= normality_test_limit:
                 run_parametric = True # Default to parametric for large N (CLT)
             elif 3 <= n_samples < normality_test_limit:
@@ -539,7 +538,6 @@ def _perform_statistical_tests(grouped_error,
             diff = data1 - data2
             
             run_parametric = False
-            # [NEW] Logic to decide which test to run
             if n_samples >= normality_test_limit:
                 run_parametric = True # Default to parametric for large N (CLT)
             elif 3 <= n_samples < normality_test_limit:
@@ -580,17 +578,17 @@ if __name__ == "__main__":
     # Change this list to include all your subjects!
     SUBJECT_IDS: List[str] = ["Subject01", "Subject02", "Subject03", "Subject04", "Subject05", "Subject06",
                               "Subject07", "Subject08", "Subject09", "Subject10", "Subject11"]
-    METHODS: List[str] = ['Marker', 'Cascade', 'Never Project', 'Mag Free', 'Mahony', 'Unprojected', 'Madgwick', 'Madgwick (ODAY)'] # Capitalization is sensitive!
+    METHODS: List[str] = ['Marker', 
+                          'Mahony', 'Madgwick (ODAY)', 'Madgwick', 'EKF',
+                          'Never Project', 'Mag Free', 'Unprojected', 'Cascade'] # Capitalization is sensitive!
     trial_type = "complexTasks"
     joints = list(JOINT_SEGMENT_DICT.keys()) # Assumes JOINT_SEGMENT_DICT is available
-    show_plots = True
-    save_plots = False
-    match_al_borno_dataset = False
+    show_plots = False
+    save_plots = True
     drop_ankles = False
 
-    # Assuming your DataFrame is named 'all_subjects_gait_df'
     file_path = f"data/ODay_Data/all_subject_data_{trial_type}.pkl"
-
+    os.mkdir("plots") if not os.path.exists("plots") else None
     if os.path.exists(file_path):
         print(f"Loading existing DataFrame from {file_path}...")
         all_data_df = pd.read_pickle(file_path)
@@ -639,27 +637,8 @@ if __name__ == "__main__":
     by_all_group_rmse.to_pickle(by_all_group_rmse_file_path)
 
     # --- Filter Dataset as Needed ---
-    if match_al_borno_dataset or drop_ankles or METHODS != all_data_df.index.get_level_values('method').unique().tolist() or SUBJECT_IDS != all_data_df.index.get_level_values('subject_id').unique().tolist():
+    if drop_ankles or METHODS != all_data_df.index.get_level_values('method').unique().tolist() or SUBJECT_IDS != all_data_df.index.get_level_values('subject_id').unique().tolist():
         print("Filtering dataset based on specified criteria...")
-        if match_al_borno_dataset:
-            # Drop the following: "R_Ankle" for Subject 1 5 6 9 10 and 11, "L_Ankle" for Subject 1 8 9 and 11
-            if trial_type == 'walking':
-                al_borno_joints = [
-                    ("R_Ankle", [1, 5, 6, 9, 10, 11]),
-                    ("L_Ankle", [1, 5, 8, 9, 11]),
-                ]
-            else:
-                al_borno_joints = [
-                    ("R_Ankle", []),
-                    ("L_Ankle", [1, 8, 9]),
-                ]
-            for joint_name, subject_nums in al_borno_joints:
-                for subject_num in subject_nums:
-                    subject_id = f"Subject{subject_num:02d}"
-                    idx_to_drop = all_data_df.index.get_level_values('subject_id') == subject_id
-                    idx_to_drop &= all_data_df.index.get_level_values('joint_name') == joint_name
-                    all_data_df = all_data_df[~idx_to_drop]
-
         if drop_ankles:
             print("Dropping ankle joints from the dataset...")
             idx_to_drop = all_data_df.index.get_level_values('joint_name').isin(['L_Ankle', 'R_Ankle'])
@@ -699,7 +678,7 @@ if __name__ == "__main__":
     )
     plot_rmse_with_std(
         by_subject_rmse,
-        title=f"RMSE by Subject for {trial_type}{' (AL Borno Matched)' if match_al_borno_dataset else ''}",
+        title=f"RMSE by Subject for {trial_type}",
         y_label="RMSE (degrees)",
         save_plot=save_plots,
         show_plot=show_plots
@@ -707,7 +686,7 @@ if __name__ == "__main__":
 
     # --- PLOT RMSE ---
     print("Calculating and plotting Overall RMSE...")
-    overall_rmse_file_path = f"data/ODay_Data/overall_rmse_{trial_type}_{match_al_borno_dataset}.pkl"
+    overall_rmse_file_path = f"data/ODay_Data/overall_rmse_{trial_type}.pkl"
     # if os.path.exists(overall_rmse_file_path):
     #     print(f"Loading existing Overall RMSE DataFrame from {overall_rmse_file_path}...")
     #     overall_rmse = pd.read_pickle(overall_rmse_file_path)
@@ -723,7 +702,7 @@ if __name__ == "__main__":
         overall_rmse.index.name = 'Group'
     plot_rmse_with_std(
         overall_rmse,
-        title=f"Overall RMSE Across All Subjects and Joints for {trial_type}{' (AL Borno Matched)' if match_al_borno_dataset else ''}",
+        title=f"Overall RMSE Across All Subjects and Joints for {trial_type}",
         y_label="RMSE (degrees)",
         save_plot=save_plots,
         show_plot=show_plots

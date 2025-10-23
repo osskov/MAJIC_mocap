@@ -568,3 +568,53 @@ class WorldTrace:
             except FileNotFoundError:
                 print(f"File {file_path} not found. Skipping sensor {sensor_name}.")
         return world_traces
+
+    def find_best_fit_rotation(self, other_trace: 'WorldTrace') -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Given another WorldTrace, compute the best fit rotation matrix R
+        that aligns this trace to the other trace.
+
+        It solves the Orthogonal Procrustes problem:
+        R = argmin_R sum_i || R @ A_i - B_i ||_F^2
+        
+        The solution is found via SVD of the matrix M = sum(B_i @ A_i.T).
+        """
+        assert len(self) == len(other_trace), "WorldTraces must have the same length to compute best fit rotation." 
+
+        # 1. Get pre-alignment error
+        error_before = self.get_rotation_errors_deg(other_trace)
+
+        # 2. Stack matrices
+        A = np.stack(self.rotations)  # shape (N, 3, 3)
+        B = np.stack(other_trace.rotations)  # shape (N, 3, 3)
+
+        # 3. Compute the matrix M = sum(B_i @ A_i.T)
+        # A.transpose(0, 2, 1) creates all A_i.T
+        # B @ ... performs N matrix multiplications
+        # np.sum(..., axis=0) sums the N resulting matrices
+        M = np.sum(B @ A.transpose(0, 2, 1), axis=0)
+
+        # 4. SVD
+        U, S, Vt = np.linalg.svd(M)
+
+        # 5. Calculate the optimal rotation R = V @ U.T
+        # Note: Vt is V.T, so V = Vt.T
+        R = Vt.T @ U.T
+
+        # 6. Ensure right-handedness (det(R) = +1)
+        if np.linalg.det(R) < 0:
+            # We are in the reflection case.
+            # Flip the sign of the 3rd column of V (or U)
+            # R = V @ diag(1, 1, -1) @ U.T
+            Vt_corr = Vt.copy()
+            Vt_corr[-1, :] *= -1
+            R = Vt_corr.T @ U.T
+            
+            # Double-check determinant, though it should be +1 now
+            # assert np.isclose(np.linalg.det(R), 1.0)
+
+        # 7. Get post-alignment error
+        # Apply R to self and check error against other_trace
+        error_after = self.get_rotation_errors_deg(other_trace.transform(rotate=R))
+
+        return R, error_before, error_after

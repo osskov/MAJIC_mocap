@@ -25,7 +25,15 @@ class AHRSFilter:
         if select_filter in ALL_FILTERS.keys():
             self.filter_type = select_filter
             filter_call, self.gyro_req, self.acc_req, self.mag_req, self.a_ref, self.m_ref = ALL_FILTERS[select_filter]
-            self.filter = filter_call()
+            if select_filter == 'Madgwick':
+                self.filter = filter_call(beta=1)
+            elif select_filter == 'Ekf':
+                self.filter = filter_call(noises=[0.01, 0.05, 0.05])
+                self.filter.mag = True
+            elif select_filter == 'Mahony':
+                self.filter = filter_call(Kp=1.0, Ki=0.0)
+            else:
+                self.filter = filter_call()
         else:
             raise ValueError(f"Warning! {select_filter} isn't a valid filter type.")
 
