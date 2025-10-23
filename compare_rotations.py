@@ -114,7 +114,8 @@ def get_joint_traces_df(plate_trials: List['PlateTrial'], euler_order: str = 'ZY
 
 # This function loads, resyncs, trims, and processes joint traces for a subject and trial type
 def load_joint_traces_for_subject_df(subject_id: str, 
-                                     trial_type: str, 
+                                     trial_type: str,
+                                     methods: List[str] = ['Marker', 'Madgwick', 'Mag Free', 'Never Project'],
                                      euler_order: str = 'ZYX') -> pd.DataFrame:
     """
     Loads, resyncs, and processes joint traces for a specific subject and
@@ -129,73 +130,42 @@ def load_joint_traces_for_subject_df(subject_id: str,
     Returns:
         pd.DataFrame: A multi-indexed DataFrame containing all joint data.
     """
-    try:
-        plate_trials_marker: List['PlateTrial'] = PlateTrial.load_trial_from_folder(
-            f"data/ODay_Data/{subject_id}/{trial_type}"
-        )
-        plate_trials_never_project: List['PlateTrial'] = [trial.copy() for trial in plate_trials_marker]
-        plate_trials_madgwick: List['PlateTrial'] = [trial.copy() for trial in plate_trials_marker]
-        plate_trials_unprojected: List['PlateTrial'] = [trial.copy() for trial in plate_trials_marker]
-        plate_trials_mag_free: List['PlateTrial'] = [trial.copy() for trial in plate_trials_marker]
-
-        never_project_world_traces: Dict[str, 'WorldTrace'] = WorldTrace.load_from_sto_file(
-            f"data/ODay_Data/{subject_id}/{trial_type}/IMU/never project/{trial_type}_orientations.sto")
-        madgwick_world_traces: Dict[str, 'WorldTrace'] = WorldTrace.load_WorldTraces_from_folder(
-            f"data/ODay_Data/{subject_id}/{trial_type}/IMU")
-        unprojected_world_traces: Dict[str, 'WorldTrace'] = WorldTrace.load_from_sto_file(
-            f"data/ODay_Data/{subject_id}/{trial_type}/IMU/unprojected/{trial_type}_orientations.sto")
-        mag_free_world_traces: Dict[str, 'WorldTrace'] = WorldTrace.load_from_sto_file(
-            f"data/ODay_Data/{subject_id}/{trial_type}/IMU/mag free/{trial_type}_orientations.sto")
+    plate_trials_by_method: Dict[str, List['PlateTrial']] = {}
+    world_traces_by_method: Dict[str, Dict[str, 'WorldTrace']] = {}
+    plate_trials_by_method['Marker'] = PlateTrial.load_trial_from_folder(
+                    f"data/ODay_Data/{subject_id}/{trial_type}"
+                )
+    min_length = min(len(trial) for trial in plate_trials_by_method['Marker'])
+    min_length = min(min_length, 60000)  # Cap at 60000 frames to avoid excessive lengths
     
+    try:
+        for method in methods:
+            if method == 'Marker':
+                continue
+            else:
+                plate_trials_for_method = [trial.copy() for trial in plate_trials_by_method['Marker']]
+                if method == 'Madgwick (ODAY)':
+                    world_traces_by_method[method] = WorldTrace.load_WorldTraces_from_folder(
+                        f"data/ODay_Data/{subject_id}/{trial_type}/IMU"
+                    )
+                else:
+                    world_traces_by_method[method] = WorldTrace.load_from_sto_file(
+                        f"data/ODay_Data/{subject_id}/{trial_type}/IMU/{method.lower()}/{trial_type}_orientations.sto"
+                    )
+                plate_trials_by_method[method] = resync_traces(plate_trials_for_method, world_traces_by_method[method])
+                min_length = min(min_length, min(len(trial) for trial in plate_trials_by_method[method]))
+                
     except Exception as e:
         print(f"Error loading data for {subject_id}: {e}. Skipping subject.")
         return pd.DataFrame() 
-    
-    # --- Resync Traces ---
-    plate_trials_never_project = resync_traces(plate_trials_never_project, never_project_world_traces)
-    plate_trials_madgwick = resync_traces(plate_trials_madgwick, madgwick_world_traces)
-    plate_trials_mag_free = resync_traces(plate_trials_mag_free, mag_free_world_traces)
-    plate_trials_unprojected = resync_traces(plate_trials_unprojected, unprojected_world_traces)
-    
-    # --- Trim to Minimum Length ---
-    all_trials_lists = [plate_trials_marker, plate_trials_madgwick, plate_trials_mag_free, plate_trials_never_project, plate_trials_unprojected]
-
-    all_lengths = [len(trial) for trials_list in all_trials_lists for trial in trials_list]
-    all_lengths.append(60000)
-
-    if not all_lengths or min(all_lengths) == 0:
-        print(f"No valid trials found for {subject_id} after resync/trim. Skipping subject.")
-        return pd.DataFrame()
-
-    current_min_length = min(all_lengths)
-    
-    all_trials_lists_trimmed = []
-    for trials_list in all_trials_lists:
-        new_list = []
-        for trial in trials_list:
-            if len(trial) >= current_min_length:
-                new_list.append(trial[-current_min_length:])
-            else:
-                print(f"Skipping trial {trial.name} as it is shorter ({len(trial)}) than min_length ({current_min_length}).")
-        all_trials_lists_trimmed.append(new_list)
-        
-    (plate_trials_marker_trimmed, 
-     plate_trials_madgwick_trimmed, 
-     plate_trials_mag_free_trimmed, 
-     plate_trials_never_project_trimmed,
-     plate_trials_unprojected_trimmed) = all_trials_lists_trimmed
+    # --- Trim Trials to Common Length ---
+    for method, trials in plate_trials_by_method.items():
+        for i, trial in enumerate(trials):
+            plate_trials_by_method[method][i] = trial[-min_length:]
 
     # --- Calculate Joint Traces (using new DF function) ---
-    method_data = [
-        ('Marker', plate_trials_marker_trimmed),
-        ('Madgwick', plate_trials_madgwick_trimmed),
-        ('Mag-Free', plate_trials_mag_free_trimmed),
-        ('Never Project', plate_trials_never_project_trimmed),
-        ('Unprojected', plate_trials_unprojected_trimmed)
-    ]
-    
     all_method_dfs = []
-    for method_name, trials_list in method_data:
+    for method_name, trials_list in plate_trials_by_method.items():
         if not trials_list:
             print(f"No valid trimmed trials for method {method_name}. Skipping.")
             continue
@@ -608,14 +578,15 @@ def _perform_statistical_tests(grouped_error,
 if __name__ == "__main__":
     # 1. Define the parameters
     # Change this list to include all your subjects!
-    SUBJECT_IDS: List[str] = ["Subject01", "Subject02", "Subject03", "Subject04",
-                              "Subject05", "Subject06", "Subject07", "Subject08",
-                              "Subject09", "Subject10", "Subject11"]
+    SUBJECT_IDS: List[str] = ["Subject01", "Subject02", "Subject03", "Subject04", "Subject05", "Subject06",
+                              "Subject07", "Subject08", "Subject09", "Subject10", "Subject11"]
+    METHODS: List[str] = ['Marker', 'Cascade', 'Never Project', 'Mag Free', 'Mahony', 'Unprojected', 'Madgwick', 'Madgwick (ODAY)'] # Capitalization is sensitive!
     trial_type = "complexTasks"
     joints = list(JOINT_SEGMENT_DICT.keys()) # Assumes JOINT_SEGMENT_DICT is available
-    show_plots = False
-    save_plots = True
+    show_plots = True
+    save_plots = False
     match_al_borno_dataset = False
+    drop_ankles = False
 
     # Assuming your DataFrame is named 'all_subjects_gait_df'
     file_path = f"data/ODay_Data/all_subject_data_{trial_type}.pkl"
@@ -628,11 +599,16 @@ if __name__ == "__main__":
         all_subject_dfs = []
         for subject_id in SUBJECT_IDS:
             print(f"--- Processing {subject_id} ---")
-            subject_df = load_joint_traces_for_subject_df(
-                subject_id=subject_id,
-                trial_type=trial_type,
-                euler_order='XYZ'
-            )
+            try:
+                subject_df = load_joint_traces_for_subject_df(
+                    subject_id=subject_id,
+                    methods=METHODS,
+                    trial_type=trial_type,
+                    euler_order='XYZ'
+                )
+            except Exception as e:
+                print(f"Error processing {subject_id}: {e}. Skipping subject.")
+                continue
             
             if not subject_df.empty:
                 all_subject_dfs.append(subject_df)
@@ -654,39 +630,62 @@ if __name__ == "__main__":
         all_subjects_results = [{} for _ in range(12)]
     print("Data loading and concatenation complete.")
 
-    if match_al_borno_dataset:
-        # Drop the following: "R_Ankle" for Subject 1 5 6 9 10 and 11, "L_Ankle" for Subject 1 8 9 and 11
-        if trial_type == 'walking':
-            al_borno_joints = [
-                ("R_Ankle", [1, 5, 6, 9, 10, 11]),
-                ("L_Ankle", [1, 5, 8, 9, 11]),
-            ]
-        else:
-            al_borno_joints = [
-                ("R_Ankle", []),
-                ("L_Ankle", [1, 8, 9]),
-            ]
-        for joint_name, subject_nums in al_borno_joints:
-            for subject_num in subject_nums:
-                subject_id = f"Subject{subject_num:02d}"
-                idx_to_drop = all_data_df.index.get_level_values('subject_id') == subject_id
-                idx_to_drop &= all_data_df.index.get_level_values('joint_name') == joint_name
-                all_data_df = all_data_df[~idx_to_drop]
+    # --- Get RMSE by all groups ---
+    by_all_group_rmse = calculate_rmse_and_std(
+        all_data_df,
+        group_by=['joint_name', 'axis', 'subject_id', 'axis']
+    )
+    by_all_group_rmse_file_path = f"data/ODay_Data/rmse_by_all_groups_{trial_type}.pkl"
+    by_all_group_rmse.to_pickle(by_all_group_rmse_file_path)
+
+    # --- Filter Dataset as Needed ---
+    if match_al_borno_dataset or drop_ankles or METHODS != all_data_df.index.get_level_values('method').unique().tolist() or SUBJECT_IDS != all_data_df.index.get_level_values('subject_id').unique().tolist():
+        print("Filtering dataset based on specified criteria...")
+        if match_al_borno_dataset:
+            # Drop the following: "R_Ankle" for Subject 1 5 6 9 10 and 11, "L_Ankle" for Subject 1 8 9 and 11
+            if trial_type == 'walking':
+                al_borno_joints = [
+                    ("R_Ankle", [1, 5, 6, 9, 10, 11]),
+                    ("L_Ankle", [1, 5, 8, 9, 11]),
+                ]
+            else:
+                al_borno_joints = [
+                    ("R_Ankle", []),
+                    ("L_Ankle", [1, 8, 9]),
+                ]
+            for joint_name, subject_nums in al_borno_joints:
+                for subject_num in subject_nums:
+                    subject_id = f"Subject{subject_num:02d}"
+                    idx_to_drop = all_data_df.index.get_level_values('subject_id') == subject_id
+                    idx_to_drop &= all_data_df.index.get_level_values('joint_name') == joint_name
+                    all_data_df = all_data_df[~idx_to_drop]
+
+        if drop_ankles:
+            print("Dropping ankle joints from the dataset...")
+            idx_to_drop = all_data_df.index.get_level_values('joint_name').isin(['L_Ankle', 'R_Ankle'])
+            all_data_df = all_data_df[~idx_to_drop]
+        
+        if METHODS != all_data_df.index.get_level_values('method').unique().tolist():
+            # Drop any methods not in the METHODS list
+            print("Filtering methods to match the specified METHODS list...")
+            idx_to_keep = all_data_df.index.get_level_values('method').isin(METHODS)
+            all_data_df = all_data_df[idx_to_keep]
+
+        if SUBJECT_IDS != all_data_df.index.get_level_values('subject_id').unique().tolist():
+            # Drop any subjects not in the SUBJECT_IDS list
+            print("Filtering subjects to match the specified SUBJECT_IDS list...")
+            idx_to_keep = all_data_df.index.get_level_values('subject_id').isin(SUBJECT_IDS)
+            all_data_df = all_data_df[idx_to_keep]
+        print("Dataset filtering complete.")
 
     # --- PLOT BY JOINT AND AXIS RMSE ---
-    by_joint_rmse_file_path = f"data/ODay_Data/rmse_by_joint_and_axis_{trial_type}_{match_al_borno_dataset}.pkl"
-    if os.path.exists(by_joint_rmse_file_path):
-        print(f"Loading existing RMSE by Joint and Axis DataFrame from {by_joint_rmse_file_path}...")
-        by_joint_rmse = pd.read_pickle(by_joint_rmse_file_path)
-    else:
-        by_joint_rmse = calculate_rmse_and_std(
-            all_data_df,
-            group_by=['joint_name', 'axis']
-        )
-        by_joint_rmse.to_pickle(by_joint_rmse_file_path)
+    by_joint_rmse = calculate_rmse_and_std(
+        all_data_df,
+        group_by=['joint_name', 'axis']
+    )
     plot_rmse_with_std(
         by_joint_rmse,
-        title=f"RMSE by Joint and Axis for {trial_type} {'(AL Borno Matched)' if match_al_borno_dataset else ''}",
+        title=f"RMSE by Joint and Axis for {trial_type}",
         y_label="RMSE (degrees)",
         save_plot=save_plots,
         show_plot=show_plots
@@ -694,19 +693,13 @@ if __name__ == "__main__":
 
     # --- PLOT BY SUBJECT RMSE ---
     print("Calculating and plotting RMSE by Subject...")
-    by_subject_rmse_file_path = f"data/ODay_Data/rmse_by_subject_{trial_type}_{match_al_borno_dataset}.pkl"
-    if os.path.exists(by_subject_rmse_file_path):
-        print(f"Loading existing RMSE by Subject DataFrame from {by_subject_rmse_file_path}...")
-        by_subject_rmse = pd.read_pickle(by_subject_rmse_file_path)
-    else:
-        by_subject_rmse = calculate_rmse_and_std(
-            all_data_df,
-            group_by=['subject_id']
-        )
-        by_subject_rmse.to_pickle(by_subject_rmse_file_path)
+    by_subject_rmse = calculate_rmse_and_std(
+        all_data_df,
+        group_by=['subject_id']
+    )
     plot_rmse_with_std(
         by_subject_rmse,
-        title=f"RMSE by Subject for {trial_type} {'(AL Borno Matched)' if match_al_borno_dataset else ''}",
+        title=f"RMSE by Subject for {trial_type}{' (AL Borno Matched)' if match_al_borno_dataset else ''}",
         y_label="RMSE (degrees)",
         save_plot=save_plots,
         show_plot=show_plots
@@ -715,53 +708,43 @@ if __name__ == "__main__":
     # --- PLOT RMSE ---
     print("Calculating and plotting Overall RMSE...")
     overall_rmse_file_path = f"data/ODay_Data/overall_rmse_{trial_type}_{match_al_borno_dataset}.pkl"
-    if os.path.exists(overall_rmse_file_path):
-        print(f"Loading existing Overall RMSE DataFrame from {overall_rmse_file_path}...")
-        overall_rmse = pd.read_pickle(overall_rmse_file_path)
-    else:
-         overall_rmse = calculate_rmse_and_std(
-            all_data_df,
-            group_by=[]
-        )
-         overall_rmse.to_pickle(overall_rmse_file_path) 
+    # if os.path.exists(overall_rmse_file_path):
+    #     print(f"Loading existing Overall RMSE DataFrame from {overall_rmse_file_path}...")
+    #     overall_rmse = pd.read_pickle(overall_rmse_file_path)
+    # else:
+    overall_rmse = calculate_rmse_and_std(
+    all_data_df,
+    group_by=[]
+    )
+    overall_rmse.to_pickle(overall_rmse_file_path) 
     if not overall_rmse.empty:
         overall_rmse = overall_rmse.stack().to_frame().T
         overall_rmse.index = ['Overall']
         overall_rmse.index.name = 'Group'
     plot_rmse_with_std(
         overall_rmse,
-        title=f"Overall RMSE Across All Subjects and Joints for {trial_type} {'(AL Borno Matched)' if match_al_borno_dataset else ''}",
+        title=f"Overall RMSE Across All Subjects and Joints for {trial_type}{' (AL Borno Matched)' if match_al_borno_dataset else ''}",
         y_label="RMSE (degrees)",
         save_plot=save_plots,
         show_plot=show_plots
     )
 
-    # --- PLOT SUBJECT 5 RMSE ---
-    print("Calculating and plotting RMSE for Subject 5...")
-    all_subject_5_data_df = all_data_df.xs('Subject05', level='subject_id')
-    subject_5_error_df = calculate_rmse_and_std(
-        all_subject_5_data_df,
-        group_by=['joint_name', 'axis']
-    )
-    plot_rmse_with_std(
-        subject_5_error_df,
-        title=f"RMSE for Subject 5 by Joint and Axis for {trial_type}",
-        y_label="RMSE (degrees)",
-        save_plot=save_plots,
-        show_plot=show_plots
-    )
-
-    # --- PLOT SUBJECT 9 RMSE ---
-    print("Calculating and plotting RMSE for Subject 9...")
-    all_subject_9_data_df = all_data_df.xs('Subject09', level='subject_id')
-    subject_9_error_df = calculate_rmse_and_std(
-        all_subject_9_data_df,
-        group_by=['joint_name', 'axis']
-    )
-    plot_rmse_with_std(
-        subject_9_error_df,
-        title=f"RMSE for Subject 9 by Joint and Axis for {trial_type}",
-        y_label="RMSE (degrees)",
-        save_plot=save_plots,
-        show_plot=show_plots
-    )
+    # --- PLOT SINGLE SUBJECT RMSE ---
+    for subject_id in SUBJECT_IDS:
+        try: 
+            print(f"Calculating and plotting RMSE for {subject_id}...")
+            all_subject_data_df = all_data_df.xs(subject_id, level='subject_id')
+            subject_error_df = calculate_rmse_and_std(
+                all_subject_data_df,
+                group_by=['joint_name', 'axis']
+            )
+            plot_rmse_with_std(
+                subject_error_df,
+                title=f"RMSE for {subject_id} by Joint and Axis for {trial_type}",
+                y_label="RMSE (degrees)",
+                save_plot=save_plots,
+                show_plot=show_plots
+            )
+        except KeyError:
+            print(f"No data found for {subject_id}, skipping RMSE plot.")
+            continue

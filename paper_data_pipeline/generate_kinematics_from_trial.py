@@ -51,6 +51,10 @@ def _generate_orientation_sto_file_(output_directory: str,
         for plate in plate_trials:
             print(f'Processing {plate.name} with {condition} filter...')
             ahrs_filter = AHRSFilter(select_filter=condition.capitalize())
+            R_initial = Rotation.from_matrix(plate.world_trace.rotations[0])
+            q_initial = R_initial.as_quat()
+            q_initial = np.roll(q_initial, shift=1)  # Convert to AHRS [w, x, y, z]
+            ahrs_filter.set_last_q(q_initial)
             R_ws = []
             dt = np.mean(np.diff(plate.imu_trace.timestamps))
             for t in range(len(plate)):
@@ -122,6 +126,25 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
         parent_trial.imu_trace = parent_trial.project_imu_trace(parent_joint_center_offset)
         child_trial.imu_trace = child_trial.project_imu_trace(child_joint_center_offset)
 
+        if condition == 'cascade':
+            da_parent = np.diff(parent_trial.imu_trace.acc, axis=0)
+            da_child = np.diff(child_trial.imu_trace.acc, axis=0)
+            o_parent = np.cross(parent_trial.imu_trace.acc[:-1], da_parent) / np.linalg.norm(parent_trial.imu_trace.acc[:-1],
+                                                                                        axis=1)[:, None]
+            o_child = np.cross(child_trial.imu_trace.acc[:-1], da_child) / np.linalg.norm(child_trial.imu_trace.acc[:-1], axis=1)[
+                                                                        :, None]
+
+            observability_metric = np.minimum(np.linalg.norm(o_parent, axis=1),
+                                            np.linalg.norm(o_child, axis=1))
+            observability_metric = np.concatenate(([observability_metric[0]], observability_metric))
+
+            # Set mag to 0 where observability is high
+            threshold = 0.1
+            high_indexes = observability_metric > threshold
+            parent_trial.imu_trace.mag = [np.zeros(3) if high else mag for high, mag in
+                                          zip(high_indexes, parent_trial.imu_trace.mag)]
+            child_trial.imu_trace.mag = [np.zeros(3) if high else mag for high, mag in
+                                         zip(high_indexes, child_trial.imu_trace.mag)]
         if condition == 'mag free':
             parent_trial.imu_trace.mag = [np.zeros(3)] * len(parent_trial)
             child_trial.imu_trace.mag = [np.zeros(3)] * len(child_trial)
@@ -205,8 +228,9 @@ def _export_to_sto_(filename,
 if __name__ == "__main__":
     # GENERATING STO FILES
     num_frames = -1  # Use -1 to indicate all frames
+    skip_feet = True
 
-    for subject_num in ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11']:
+    for subject_num in ['01', '02', '03', '04', '05', '06']:
         for activity in ['walking', 'complexTasks']:
             print(f"-------Processing Subject {subject_num}, Activity {activity}...--------")
             # Load the plate trials for the current subject and activity
@@ -216,9 +240,13 @@ if __name__ == "__main__":
                     align_plate_trials=True
                 )
 
+                if skip_feet:
+                    plate_trials = [plate for plate in plate_trials if
+                                    not (plate.name.__contains__('calcn'))]
+
                 print(f"Loaded {len(plate_trials)} plate trials.")
                 print(f"Identified segments: {[plate.name for plate in plate_trials]}")
-                for condition in ['mahony', 'madgwick', 'ekf']:
+                for condition in ['cascade']:
                     output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/IMU/" + condition
                     if condition == 'marker':
                         output_dir = f"/Users/six/projects/work/MAJIC_mocap/data/ODay_Data/Subject{subject_num}/{activity}/Mocap/"

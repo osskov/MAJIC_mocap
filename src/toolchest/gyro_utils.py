@@ -1,7 +1,7 @@
 import numpy as np
 from typing import List
 from scipy.linalg import logm, expm
-import nimblephysics as nimble
+from scipy.spatial.transform import Rotation
 
 
 def finite_difference_rotations(rotation_matrices: List[np.ndarray], timestamps: np.ndarray) -> List[np.ndarray]:
@@ -70,7 +70,7 @@ def rotation_matrix_to_angular_velocity(R_rel: np.ndarray, dt: float) -> np.ndar
     This doesn't care where R_rel came from, it can be either a left (world frame) or a right (body frame) rotation
     matrix.
     """
-    return nimble.math.logMap(R_rel) / dt
+    return Rotation.from_matrix(R_rel).as_rotvec() / dt
 
 
 def rotation_matrix_to_angular_velocity_python(R_rel: np.ndarray, dt: float) -> np.ndarray:
@@ -109,7 +109,7 @@ def angular_velocity_to_rotation_matrix(omega: np.ndarray, dt: float) -> np.ndar
     This doesn't care where R_rel came from, it can be either a left (world frame) or a right (body frame) rotation
     matrix.
     """
-    return nimble.math.expMapRot(omega * dt)
+    return Rotation.from_rotvec(omega * dt).as_matrix()
 
 
 def angular_velocity_to_rotation_matrix_python(omega: np.ndarray, dt: float) -> np.ndarray:
