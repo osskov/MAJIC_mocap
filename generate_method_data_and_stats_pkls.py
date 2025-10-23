@@ -364,8 +364,6 @@ if __name__ == "__main__":
     METHODS: List[str] = ALL_METHODS
     JOINTS = ALL_JOINTS
     TRIAL_TYPES = ALL_TRIAL_TYPES
-    show_plots = True
-    save_plots = False
 
     # Create directories if they don't exist
     os.makedirs("plots", exist_ok=True)
