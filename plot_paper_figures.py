@@ -1,551 +1,700 @@
-from typing import List, Dict, Union, Optional
+# -*- coding: utf-8 -*-
+"""
+plot_paper_figures.py
+
+This script is designed to generate publication-quality figures and perform
+statistical analysis for comparing the performance of various estimation methods.
+It loads a pre-processed pandas DataFrame containing performance metrics and
+produces three main types of visualizations:
+
+1.  **Overall Performance Plots**: Compares the distribution of key metrics
+    (e.g., RMSE, MAE) across all methods using box, strip, or swarm plots.
+    Includes a robust statistical analysis using the Friedman test, followed
+    by a Wilcoxon signed-rank post-hoc test if significant.
+
+2.  **Performance by Trial Plots**: Creates a faceted plot to compare
+    method performance side-by-side for each experimental trial type. Also
+    supports box, strip, and swarm plots.
+
+3.  **Interaction Heatmaps**: Visualizes the mean performance of each method
+    across different experimental conditions (e.g., by joint or subject).
+
+The script is structured to be easily configurable by modifying the variables
+within the `main()` function.
+
+Dependencies:
+    - pandas
+    - matplotlib
+    - seaborn
+    - scipy
+    - numpy
+"""
+
 import os
-import pandas as pd
+from typing import Dict, List, Optional, Union
+
 import matplotlib.pyplot as plt
-import seaborn as sns
+import pandas as pd
 import scipy.stats as stats
-import scikit_posthocs as sp
+import seaborn as sns
+import numpy as np
 
-# --- Plotting Functions ---
+# --- Helper Functions ---
 
-# --- [UPDATED FUNCTION] ---
-def plot_method_performance(
-    summary_df: pd.DataFrame, 
-    metrics: List[str], 
-    plot_type: str = 'box',
-    method_filter: Optional[List[str]] = None, # <-- This now controls order too
-    palette: Optional[Union[str, Dict[str, str]]] = None,
-    show_plots: bool = False,
-    save_plots: bool = True,
-    run_stats: bool = True, # Default is True as in your last version
-    alpha: float = 0.05,
-    show_labels: bool = True
+def _run_statistical_analysis(
+    df: pd.DataFrame,
+    metric: str,
+    methods_order: List[str],
+    alpha: float = 0.05
 ) -> None:
     """
-    Generates and saves box plots or violin plots for specified metrics
-    to compare overall method performance.
-    
-    [NEW] Statistics are now run using the Friedman test, which
-    accounts for the dependent-sample nature of the data (multiple
-    methods tested on the same subject/joint/axis 'block').
+    Performs statistical analysis using Friedman and Wilcoxon post-hoc tests.
+
+    This is a helper function designed to test for significant differences
+    between multiple methods on dependent samples. It pivots the data to align
+    measurements from the same "block" (e.g., the same subject/joint/axis)
+    and then runs the appropriate non-parametric tests.
+
+    Args:
+        df (pd.DataFrame): The long-format DataFrame containing the data to test.
+            Must contain 'method', the specified metric column, and block columns.
+        metric (str): The name of the performance metric column to analyze.
+        methods_order (List[str]): The list of method names to include in the test.
+        alpha (float): The significance level for the tests.
     """
-    print(f"--- Generating {plot_type} plots for {', '.join(metrics)} ---")
-    
-    # Ensure the plot directory exists
-    if save_plots:
-        os.makedirs("plots", exist_ok=True)
-        
-    # Reset index to make 'method' and other index levels available as columns
-    data_for_plot = summary_df.reset_index()
-    
-    # --- 1. Determine method_order and apply filter ---
-    plot_order_arg = None
-    
-    if method_filter:
-        # Filter the DataFrame to only include methods from the list
-        data_for_plot = data_for_plot[data_for_plot['method'].isin(method_filter)]
-        if data_for_plot.empty:
-            print(f"Warning: Filtering by methods {method_filter} resulted in an empty DataFrame. Skipping plots.")
+    print(f"--- a. Dependent-Sample Test (Friedman Test for '{metric}') ---")
+
+    try:
+        # Define the columns that create a unique "block" for repeated measures.
+        block_cols = [
+            col for col in ['trial_type', 'joint_name', 'subject', 'axis']
+            if col in df.columns
+        ]
+        if not block_cols:
+            print("  > Error: Could not find block columns for Friedman test.")
             return
-            
-        # Set the plot order to be the order of the filter list
-        plot_order_arg = [m for m in method_filter if m in data_for_plot['method'].unique()]
-    else:
-        # Default to alphabetical order if no filter is provided
-        plot_order_arg = sorted(data_for_plot['method'].unique())
-    
-    # Make sure we're only testing data that will be plotted
-    # This is important if method_filter was used
-    stats_data_df_all = data_for_plot[data_for_plot['method'].isin(plot_order_arg)]
 
-    for metric in metrics:
-        if metric not in stats_data_df_all.columns:
-            print(f"Warning: Metric '{metric}' not found in summary DataFrame. Skipping plot.")
-            continue
-            
-        # --- 2. [UPDATED] Run statistical tests (Friedman + Wilcoxon) ---
-        if run_stats:
-            print(f"\n--- Statistical Analysis for {metric} (alpha={alpha}) ---")
-            print("--- a. Dependent-Sample Test (Friedman Test) ---")
-            
-            # Make a copy to avoid SettingWithCopyWarning
-            stats_data_df = stats_data_df_all.copy()
+        # Create a unique block_id for each combination of conditions.
+        df = df.copy()
+        df['block_id'] = df[block_cols].apply(
+            lambda row: '_'.join(row.values.astype(str)), axis=1
+        )
 
-            try:
-                # --- b. Pivot data for repeated-measures test ---
-                block_cols = [
-                    col for col in ['trial_type', 'joint_name', 'subject', 'axis'] 
-                    if col in stats_data_df.columns
-                ]
-                if not block_cols:
-                    print("  > Error: Could not find block columns (subject, joint_name, etc.) to run Friedman test.")
-                    continue
+        # Pivot the data so each row is a block and each column is a method.
+        # This is WIDE-FORMAT data.
+        pivot_df = df.pivot_table(
+            index='block_id', columns='method', values=metric
+        )
 
-                # Create a unique block_id for the post-hoc test
-                stats_data_df['block_id'] = stats_data_df[block_cols].apply(
-                    lambda row: '_'.join(row.values.astype(str)), axis=1
-                )
+        # The Friedman test requires complete blocks (no missing values for any method).
+        pivot_df_clean = pivot_df.dropna()
 
-                pivot_df = stats_data_df.pivot_table(
-                    index='block_id', # Use new unique block_id
-                    columns='method', 
-                    values=metric
-                )
-                
-                # Friedman test requires complete blocks (no NaNs)
-                pivot_df_clean = pivot_df.dropna()
-                
-                # Filter for methods we actually have in the cleaned data
-                valid_methods = [m for m in plot_order_arg if m in pivot_df_clean.columns]
+        # Ensure the methods being tested are present in the cleaned data.
+        valid_methods = [m for m in methods_order if m in pivot_df_clean.columns]
 
-                if pivot_df_clean.shape[0] < 2:
-                    print(f"  > Skipping stats: Insufficient complete blocks (N={pivot_df_clean.shape[0]}) for Friedman test.")
-                    continue
-                if len(valid_methods) < 2:
-                    print(f"  > Skipping stats: Insufficient method groups (N={len(valid_methods)}) for Friedman test.")
-                    continue
+        # Check if we have enough data to run the test.
+        if pivot_df_clean.shape[0] < 2 or len(valid_methods) < 2:
+            print(f"  > Skipping stats: Insufficient data (N_blocks={pivot_df_clean.shape[0]}, N_methods={len(valid_methods)}).")
+            return
 
-                print(f"  > Using {pivot_df_clean.shape[0]} complete blocks (out of {pivot_df.shape[0]} total) for {len(valid_methods)} methods.")
+        print(f"  > Using {pivot_df_clean.shape[0]} complete blocks for {len(valid_methods)} methods.")
 
-                # Get the data columns for the test
-                groups_for_test = [pivot_df_clean[col] for col in valid_methods]
-                
-                f_stat, p_friedman = stats.friedmanchisquare(*groups_for_test)
-                print(f"  Friedman Test (overall): p-value = {p_friedman:.4e}")
+        # Prepare the list of data series for the test.
+        groups_for_test = [pivot_df_clean[col] for col in valid_methods]
 
-                # --- c. Post-hoc testing ---
-                if p_friedman >= alpha:
-                    print("  > No significant difference found between any groups (p >= alpha).")
-                else:
-                    print("  > Significant difference detected. Running post-hoc (Wilcoxon Signed-Rank)...")
-                    
-                    # --- [FIX] Pass the WIDE-FORMAT DataFrame directly ---
-                    # This is compatible with older scikit-posthocs versions
-                    # that do not have the 'block_col' argument.
-                    wilcoxon_results = sp.posthoc_wilcoxon(
-                        pivot_df_clean[valid_methods], 
-                        p_adjust='holm'
-                    )
-                    
-                    # Filter for only the methods we're plotting
-                    wilcoxon_results = wilcoxon_results.loc[valid_methods, valid_methods]
+        # --- b. Run Friedman Test ---
+        _, p_friedman = stats.friedmanchisquare(*groups_for_test)
+        print(f"  Friedman Test (overall comparison): p-value = {p_friedman:.4e}")
 
-                    print("  Significant pairs (p_adj < alpha):")
-                    significant_pairs = 0
-                    # Iterate over the upper triangle of the matrix to avoid repeats
-                    for i in range(len(wilcoxon_results.columns)):
-                        for j in range(i + 1, len(wilcoxon_results.columns)):
-                            method1 = wilcoxon_results.columns[i]
-                            method2 = wilcoxon_results.columns[j]
-                            p_adj = wilcoxon_results.iloc[i, j]
-                            
-                            if p_adj < alpha:
-                                print(f"    - {method1} vs. {method2}: p_adj = {p_adj:.4e}")
-                                significant_pairs += 1
-                                
-                    if significant_pairs == 0:
-                        print("    - None (after p-value correction)")
-            
-            except ValueError as e:
-                print(f"  > Error during statistical test: {e}")
-            except AttributeError as e:
-                 print(f"  > Error during post-hoc test: {e}. This can happen with scikit-posthocs versioning.")
-
-
-        # --- 3. Plotting ---
-        plt.figure(figsize=(14, 8))
-        ax = plt.gca() # Get current axes to add text later
-        
-        if plot_type == 'box':
-            sns.boxplot(
-                data=data_for_plot, 
-                x='method', 
-                y=metric, 
-                order=plot_order_arg, 
-                palette=palette,
-                hue='method',
-                legend=False,
-                ax=ax # Pass the axes
-            )
-        elif plot_type == 'violin':
-            # ... (violin plot code, unchanged) ...
-            sns.violinplot(
-                data=data_for_plot, 
-                x='method', 
-                y=metric, 
-                order=plot_order_arg, 
-                palette=palette,
-                hue='method',
-                legend=False,
-                ax=ax # Pass the axes
-            )
+        # --- c. Run Post-hoc Test if overall difference is significant ---
+        if p_friedman >= alpha:
+            print("  > No significant overall difference found between methods (p >= alpha).")
         else:
-            print(f"Warning: Unknown plot_type '{plot_type}'. Skipping plot for {metric}.")
-            plt.close() # Close the empty figure
-            continue
-            
-        # --- 4. [NEW] Add data labels if requested ---
-        if plot_type == 'box' and show_labels:
-            print("   > Adding data labels to boxplot...")
-            # ... (label code, unchanged) ...
-            stats_df = data_for_plot.groupby('method')[metric].quantile([0.25, 0.5, 0.75]).unstack()
-            stats_df = stats_df.reindex(plot_order_arg)
-            ylim = ax.get_ylim()
-            y_offset = (ylim[1] - ylim[0]) * 0.015
-            for x_pos, method_name in enumerate(plot_order_arg):
-                if method_name not in stats_df.index: continue
-                q1 = stats_df.loc[method_name, 0.25]
-                median = stats_df.loc[method_name, 0.5]
-                q3 = stats_df.loc[method_name, 0.75]
-                if pd.isna(q1) or pd.isna(median) or pd.isna(q3): continue
-                ax.text(x_pos, q3 + y_offset, f'{q3:.1f}', ha='center', va='bottom', fontsize=8, color='black')
-                ax.text(x_pos, median + y_offset, f'{median:.1f}', ha='center', va='bottom', fontsize=8, color='black', fontweight='bold')
-                ax.text(x_pos, q1 - y_offset, f'{q1:.1f}', ha='center', va='top', fontsize=8, color='black')
+            print("  > Significant difference detected. Running post-hoc (Wilcoxon Signed-Rank)...")
 
-        # --- 5. Finalize Plot ---
-        plot_title = f"Overall Method Performance: {metric}"
-        y_label = f"{metric}"
-        if "_deg" in metric: y_label += " (Degrees)"
-        elif "_rad" in metric: y_label += " (Radians)"
+            # Perform pairwise Wilcoxon signed-rank tests for all method pairs.
+            p_uncorrected_list = []
+            method_pairs = []
 
-        ax.set_title(plot_title, fontsize=16)
-        ax.set_ylabel(y_label, fontsize=12)
-        ax.set_xlabel("Method", fontsize=12)
-        ax.tick_params(axis='x', rotation=45)
-        ax.grid(axis='y', linestyle='--', alpha=0.7)
-        plt.tight_layout()
-        
-        if save_plots:
-            filename = f"method_performance_{metric.lower()}_{plot_type}.png"
-            if method_filter:
-                filename = f"filtered_{filename}"
-            save_path = os.path.join("plots", filename)
-            plt.savefig(save_path)
-            print(f"Saved plot to {save_path}")
-        
-        if show_plots:
-            plt.show()
-            
-        plt.close() # Close the figure to free memory
+            # Iterate over unique pairs of methods.
+            for i in range(len(valid_methods)):
+                for j in range(i + 1, len(valid_methods)):
+                    method1, method2 = valid_methods[i], valid_methods[j]
+                    method_pairs.append((method1, method2))
+                    try:
+                        _, p_val = stats.wilcoxon(pivot_df_clean[method1], pivot_df_clean[method2])
+                        p_uncorrected_list.append(p_val)
+                    except ValueError:
+                        p_uncorrected_list.append(1.0)
+
+            # Apply Holm-Bonferroni correction for multiple comparisons.
+            if p_uncorrected_list:
+                sort_indices = np.argsort(p_uncorrected_list)
+                p_sorted = np.array(p_uncorrected_list)[sort_indices]
+                num_comparisons = len(p_sorted)
+                multipliers = np.arange(num_comparisons, 0, -1)
+                p_adjusted_sorted = np.minimum(1.0, np.maximum.accumulate(p_sorted * multipliers))
+                p_adjusted = np.empty_like(p_adjusted_sorted)
+                p_adjusted[sort_indices] = p_adjusted_sorted
+            else:
+                p_adjusted = []
+
+            # Create the final results matrix.
+            p_adj_matrix = pd.DataFrame(
+                np.ones((len(valid_methods), len(valid_methods))),
+                index=valid_methods, columns=valid_methods
+            )
+            for (method1, method2), p_adj in zip(method_pairs, p_adjusted):
+                p_adj_matrix.loc[method1, method2] = p_adj
+                p_adj_matrix.loc[method2, method1] = p_adj
+
+            print("  Significant pairs (p_adj < alpha):")
+            significant_pairs = 0
+            for i in range(len(p_adj_matrix.columns)):
+                for j in range(i + 1, len(p_adj_matrix.columns)):
+                    method1, method2 = p_adj_matrix.columns[i], p_adj_matrix.columns[j]
+                    p_adj = p_adj_matrix.iloc[i, j]
+                    if p_adj < alpha:
+                        print(f"    - {method1} vs. {method2}: p_adj = {p_adj:.4e}")
+                        significant_pairs += 1
+
+            if significant_pairs == 0:
+                print("    - None (after p-value correction).")
+
+    except (ValueError, AttributeError) as e:
+        print(f"  > An error occurred during statistical testing: {e}")
+
+def _finalize_and_save_plot(
+    figure: plt.Figure,
+    plot_title: str,
+    filename: str,
+    show_plots: bool,
+    save_plots: bool
+) -> None:
+    """
+    Applies final touches to a plot and saves it to disk.
+
+    Args:
+        figure (plt.Figure): The figure object to finalize.
+        plot_title (str): The title for the plot.
+        filename (str): The filename for the saved plot image.
+        show_plots (bool): If True, display the plot interactively.
+        save_plots (bool): If True, save the plot to the 'plots' directory.
+    """
+    figure.suptitle(plot_title, fontsize=16, y=1.02)
+    plt.tight_layout()
+
+    if save_plots:
+        plots_dir = "plots"
+        os.makedirs(plots_dir, exist_ok=True)
+        save_path = os.path.join(plots_dir, filename)
+        plt.savefig(save_path, bbox_inches='tight')
+        print(f"Saved plot to {save_path}")
+
+    if show_plots:
+        plt.show()
+
+    plt.close(figure) # Close the figure to free up memory.
 
 
-# --- [UPDATED FUNCTION] ---
-def plot_interaction_heatmap(
+# --- Main Plotting Functions ---
+
+def plot_method_performance(
     summary_df: pd.DataFrame,
     metrics: List[str],
-    interaction_factor: str,
-    method_filter: Optional[List[str]] = None,
-    cmap: str = 'Reds',
-    annot: bool = True,
-    fmt: str = ".2f",
-    run_stats: bool = False, 
-    alpha: float = 0.05,     
+    plot_type: str = 'box',
+    method_order: Optional[List[str]] = None,
+    palette: Optional[Union[str, Dict[str, str]]] = None,
+    run_stats: bool = True,
+    alpha: float = 0.05,
+    show_labels: bool = True,
     show_plots: bool = False,
     save_plots: bool = True
 ) -> None:
     """
-    Generates and saves heatmaps for specified metrics to compare
-    method performance broken down by an interaction factor.
-    
-    [NEW] If run_stats=True, performs a Friedman test for each
-    level of the interaction_factor, comparing all methods.
+    Generates plots to compare the overall performance of different methods.
+
+    Args:
+        ...
+        plot_type (str): Type of plot: 'box', 'violin', 'strip', 'swarm',
+            or 'histogram'.
+        ...
+        show_labels (bool): If True, adds Q1, median, and Q3 labels
+            to 'box' plots, or median/IQR lines to 'strip'/'swarm' plots.
     """
-    print(f"\n--- Generating interaction heatmaps for Method vs. {interaction_factor.title()} ---")
+    print(f"\n--- Generating Overall Performance {plot_type.title()} Plots ---")
+    data = summary_df.reset_index()
 
-    # Ensure the plot directory exists
-    if save_plots:
-        os.makedirs("plots", exist_ok=True)
+    if method_order:
+        data = data[data['method'].isin(method_order)]
+        plot_order = [m for m in method_order if m in data['method'].unique()]
+    else:
+        plot_order = sorted(data['method'].unique())
 
-    # Reset index to make 'method' and other index levels available as columns
-    data_for_plot_full = summary_df.reset_index()
-
-    # Check if interaction_factor exists
-    if interaction_factor not in data_for_plot_full.columns:
-        print(f"Warning: Interaction factor '{interaction_factor}' not found in DataFrame columns.")
-        print(f"Available columns are: {data_for_plot_full.columns.tolist()}")
+    if data.empty or len(plot_order) < 2:
+        print("Warning: Not enough data or methods to generate plots. Skipping.")
         return
 
-    # --- 1. Determine method_order and apply filter ---
-    y_axis_order = None # This is the 'method_filter' or all methods
-    data_for_plot = data_for_plot_full.copy()
-    
-    if method_filter:
-        data_for_plot = data_for_plot[data_for_plot['method'].isin(method_filter)]
-        if data_for_plot.empty:
-            print(f"Warning: Filtering by methods {method_filter} resulted in an empty DataFrame. Skipping heatmaps.")
-            return
-        y_axis_order = [m for m in method_filter if m in data_for_plot['method'].unique()]
-    else:
-        y_axis_order = sorted(data_for_plot['method'].unique())
+    # --- Create a consistent color map ---
+    color_map = {}
+    if isinstance(palette, dict):
+        color_map = palette
+    elif isinstance(palette, str):
+        colors = sns.color_palette(palette, n_colors=len(plot_order))
+        color_map = dict(zip(plot_order, colors))
+    else: # Default palette
+        colors = sns.color_palette(n_colors=len(plot_order))
+        color_map = dict(zip(plot_order, colors))
 
-    # --- 2. Loop through each metric and plot ---
+    # Define the mapping from plot_type string to the Seaborn function
+    plot_funcs = {
+        'box': sns.boxplot,
+        'violin': sns.violinplot,
+        'strip': sns.stripplot,
+        'swarm': sns.swarmplot
+    }
+    if plot_type not in plot_funcs and plot_type != 'histogram':
+        print(f"Error: Unsupported plot_type '{plot_type}'. Choose from {list(plot_funcs.keys()) + ['histogram']}.")
+        return
+
     for metric in metrics:
-        if metric not in data_for_plot.columns:
-            print(f"Warning: Metric '{metric}' not found. Skipping heatmap.")
+        if metric not in data.columns:
+            print(f"Warning: Metric '{metric}' not found. Skipping.")
+            continue
+        print(f"\n--- Processing Metric: {metric} ({plot_type.title()} Plot) ---")
+        if run_stats and plot_type != 'histogram': # Stats are for comparing methods
+            _run_statistical_analysis(data, metric, plot_order, alpha)
+        
+        fig, ax = plt.subplots(figsize=(14, 8))
+        
+        if plot_type in plot_funcs:
+            plot_func = plot_funcs[plot_type]
+            # --- MODIFIED: Added zorder to stripplot/swarmplot ---
+            plot_kwargs = {'data': data, 'x': 'method', 'y': metric, 'order': plot_order, 'palette': color_map, 'hue': 'method', 'legend': False, 'ax': ax}
+            if plot_type in ['strip', 'swarm']:
+                plot_kwargs['zorder'] = 1 # Draw points behind markers
+            
+            plot_func(**plot_kwargs)
+            
+            # --- MODIFIED: Re-structured logic to add labels or markers ---
+            if show_labels:
+                # Calculate stats for all methods
+                stats_df = data.groupby('method')[metric].quantile([0.25, 0.5, 0.75]).unstack().reindex(plot_order)
+                
+                # Add quantile labels, but ONLY for box plots.
+                if plot_type == 'box':
+                    ylim = ax.get_ylim()
+                    y_offset = (ylim[1] - ylim[0]) * 0.015
+                    for i, method in enumerate(plot_order):
+                        if method not in stats_df.index: continue
+                        q1, median, q3 = stats_df.loc[method, 0.25], stats_df.loc[method, 0.5], stats_df.loc[method, 0.75]
+                        if pd.notna(q1) and pd.notna(median) and pd.notna(q3):
+                            ax.text(i, q3 + y_offset, f'{q3:.1f}', ha='center', va='bottom', fontsize=8)
+                            ax.text(i, median, f'{median:.1f}', ha='center', va='center', fontsize=9, color='white', fontweight='bold')
+                            ax.text(i, q1 - y_offset, f'{q1:.1f}', ha='center', va='top', fontsize=8)
+
+                # --- NEW: Add median/IQR lines for strip/swarm plots ---
+                elif plot_type in ['strip', 'swarm']:
+                    line_width = 0.4    # Total width of the median line
+                    whisker_width = 0.2 # Total width of the Q1/Q3 whiskers
+                    
+                    for i, method in enumerate(plot_order):
+                        if method not in stats_df.index: continue
+                        q1, median, q3 = stats_df.loc[method, 0.25], stats_df.loc[method, 0.5], stats_df.loc[method, 0.75]
+                        
+                        if pd.notna(q1) and pd.notna(median) and pd.notna(q3):
+                            # Draw the vertical IQR line
+                            ax.vlines(i, q1, q3, color='black', linestyle='-', linewidth=1, zorder=10)
+                            # Draw the Q1 whisker
+                            ax.hlines(q1, i - whisker_width/2, i + whisker_width/2, color='black', linestyle='-', linewidth=1, zorder=10)
+                            # Draw the Q3 whisker
+                            ax.hlines(q3, i - whisker_width/2, i + whisker_width/2, color='black', linestyle='-', linewidth=1, zorder=10)
+                            # Draw the median line (make it stand out)
+                            ax.hlines(median, i - line_width/2, i + line_width/2, color='red', linestyle='-', linewidth=2, zorder=10)
+                # --- END NEW ---
+
+            ax.set_ylabel(f"{metric} (Degrees)" if "_deg" in metric else metric, fontsize=12)
+            ax.set_xlabel("Method", fontsize=12)
+            ax.tick_params(axis='x', rotation=45)
+
+        elif plot_type == 'histogram':
+            # ... (histogram logic remains unchanged) ...
+            for method in plot_order:
+                method_data = data[data['method'] == method][metric].dropna()
+                if method_data.empty:
+                    continue
+                sns.histplot(
+                    method_data,
+                    label=method,
+                    ax=ax,
+                    kde=True,
+                    stat="density",
+                    element="step",
+                    alpha=0.5,
+                    color=color_map.get(method)
+                )
+            ax.legend(title="Method")
+            ax.set_xlabel(f"{metric} (Degrees)" if "_deg" in metric else metric, fontsize=12)
+            ax.set_ylabel("Density", fontsize=12)
+
+        ax.set_title(f"Overall Method Performance: {metric}", fontsize=16)
+        ax.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        filename = f"overall_performance_{metric.lower()}_{plot_type}.png"
+        _finalize_and_save_plot(fig, "", filename, show_plots, save_plots)
+
+def plot_performance_by_trial(
+    summary_df: pd.DataFrame,
+    metrics: List[str],
+    plot_type: str = 'box',
+    method_order: Optional[List[str]] = None,
+    palette: Optional[Union[str, Dict[str, str]]] = None,
+    run_stats: bool = True,
+    alpha: float = 0.05,
+    show_labels: bool = True,
+    show_plots: bool = False,
+    save_plots: bool = True
+) -> None:
+    """
+    Generates faceted plots to compare method performance for each trial type.
+
+    Args:
+        ...
+        plot_type (str): Type of plot: 'box', 'violin', 'strip', 'swarm',
+            or 'histogram'.
+        ...
+        show_labels (bool): If True, adds Q1, median, and Q3 labels
+            to 'box' plots, or median/IQR lines to 'strip'/'swarm' plots.
+    """
+    print(f"\n--- Generating Performance {plot_type.title()} Plots by Trial Type ---")
+    data = summary_df.reset_index()
+
+    if 'trial_type' not in data.columns:
+        print("Error: 'trial_type' column not found. Skipping trial-specific plots.")
+        return
+
+    if method_order:
+        data = data[data['method'].isin(method_order)]
+        plot_order = [m for m in method_order if m in data['method'].unique()]
+    else:
+        plot_order = sorted(data['method'].unique())
+
+    if data.empty or len(plot_order) < 2:
+        print("Warning: Not enough data or methods to generate plots. Skipping.")
+        return
+        
+    trial_types = sorted(data['trial_type'].unique())
+
+    # --- Create a consistent color map ---
+    color_map = {}
+    if isinstance(palette, dict):
+        color_map = palette
+    elif isinstance(palette, str):
+        colors = sns.color_palette(palette, n_colors=len(plot_order))
+        color_map = dict(zip(plot_order, colors))
+    else: # Default palette
+        colors = sns.color_palette(n_colors=len(plot_order))
+        color_map = dict(zip(plot_order, colors))
+
+    for metric in metrics:
+        if metric not in data.columns:
+            print(f"Warning: Metric '{metric}' not found. Skipping.")
             continue
 
-        print(f"\n  > Plotting {metric}...")
+        print(f"\n--- Processing Metric: {metric} by Trial Type ({plot_type.title()} Plot) ---")
         
-        # --- [NEW] 3. Run Statistical Tests (Friedman + Wilcoxon) ---
         if run_stats:
-            print(f"--- Statistical Analysis for {metric} by {interaction_factor.title()} (alpha={alpha}) ---")
+            for trial in trial_types:
+                print(f"\n--- Testing for Trial Type = {trial} ---")
+                trial_data = data[data['trial_type'] == trial]
+                _run_statistical_analysis(trial_data, metric, plot_order, alpha)
+            print(f"--- End of Statistical Analysis for {metric} ---")
+        
+        catplot_kinds = ['box', 'violin', 'strip', 'swarm', 'boxen', 'point', 'bar', 'count']
+
+        if plot_type in catplot_kinds:
+            # --- MODIFIED: Added zorder to stripplot/swarmplot ---
+            plot_kwargs = {}
+            if plot_type in ['strip', 'swarm']:
+                plot_kwargs['zorder'] = 1 # Draw points behind markers
             
-            # Get all unique levels of the interaction factor
-            factor_levels = sorted(data_for_plot[interaction_factor].unique())
-            
-            if len(y_axis_order) <= 1:
-                print("  > Skipping stats, only one method group to test.")
-            else:
-                # --- Loop over each factor level (e.g., each joint) ---
-                for level in factor_levels:
-                    print(f"\n--- Testing for {interaction_factor.title()} = {level} ---")
-                    print("  > Using Dependent-Sample Test (Friedman Test)...")
-                    
-                    try:
-                        # Filter data for only this level
-                        df_level = data_for_plot[data_for_plot[interaction_factor] == level].copy() # Use .copy()
-                        
-                        # --- b. Pivot data for repeated-measures test ---
-                        all_block_cols = ['trial_type', 'joint_name', 'subject', 'axis']
-                        block_cols = [
-                            col for col in all_block_cols 
-                            if col in df_level.columns and col != interaction_factor
-                        ]
-                        
-                        if not block_cols:
-                            print("  > Error: Could not find block columns to run Friedman test.")
-                            continue
-
-                        # Create a unique block_id for the post-hoc test
-                        df_level['block_id'] = df_level[block_cols].apply(
-                            lambda row: '_'.join(row.values.astype(str)), axis=1
-                        )
-
-                        pivot_df = df_level.pivot_table(
-                            index='block_id', # Use new unique block_id
-                            columns='method', 
-                            values=metric
-                        )
-                        
-                        # Friedman test requires complete blocks (no NaNs)
-                        pivot_df_clean = pivot_df.dropna()
-
-                        # Filter for methods we actually have in the cleaned data
-                        valid_methods = [m for m in y_axis_order if m in pivot_df_clean.columns]
-
-                        if pivot_df_clean.shape[0] < 2:
-                            print(f"  > Skipping stats: Insufficient complete blocks (N={pivot_df_clean.shape[0]}) for Friedman test.")
-                            continue
-                        if len(valid_methods) < 2:
-                            print(f"  > Skipping stats: Insufficient method groups (N={len(valid_methods)}) for Friedman test.")
-                            continue
-
-                        print(f"  > Using {pivot_df_clean.shape[0]} complete blocks (out of {pivot_df.shape[0]} total) for {len(valid_methods)} methods.")
-                        
-                        # Get the data columns for the test
-                        groups_for_test = [pivot_df_clean[col] for col in valid_methods]
-                        
-                        f_stat, p_friedman = stats.friedmanchisquare(*groups_for_test)
-                        print(f"  Friedman Test (overall): p-value = {p_friedman:.4e}")
-
-                        # --- c. Post-hoc testing ---
-                        if p_friedman >= alpha:
-                            print("  > No significant difference found between methods for this level.")
-                        else:
-                            print("  > Significant difference detected. Running post-hoc (Wilcoxon Signed-Rank)...")
-                            
-                            # --- [FIX] Pass the WIDE-FORMAT DataFrame directly ---
-                            # This is compatible with older scikit-posthocs versions
-                            wilcoxon_results = sp.posthoc_wilcoxon(
-                                pivot_df_clean[valid_methods], 
-                                p_adjust='holm'
-                            )
-                            
-                            # Filter for only the methods we're plotting
-                            wilcoxon_results = wilcoxon_results.loc[valid_methods, valid_methods]
-
-                            print("    Significant pairs (p_adj < alpha):")
-                            significant_pairs = 0
-                            # Iterate over the upper triangle of the matrix to avoid repeats
-                            for i in range(len(wilcoxon_results.columns)):
-                                for j in range(i + 1, len(wilcoxon_results.columns)):
-                                    method1 = wilcoxon_results.columns[i]
-                                    method2 = wilcoxon_results.columns[j]
-                                    p_adj = wilcoxon_results.iloc[i, j]
-                                    
-                                    if p_adj < alpha:
-                                        print(f"      - {method1} vs. {method2}: p_adj = {p_adj:.4e}")
-                                        significant_pairs += 1
-                                if significant_pairs == 0:
-                                    print("      - None (after p-value correction)")
-
-                    except ValueError as e:
-                        print(f"  > Error during statistical test: {e}. This can happen if a group has identical values.")
-                    except AttributeError as e:
-                        print(f"  > Error during post-hoc test: {e}. This can happen with scikit-posthocs versioning.")
-            
-            print(f"\n--- End of Statistical Analysis for {metric} ---")
-
-        # --- 4. Aggregate and pivot data for heatmap ---
-        try:
-            # ... (Heatmap aggregation code, unchanged) ...
-            grouped_data = data_for_plot.groupby(['method', interaction_factor])[metric].mean()
-            heatmap_data = grouped_data.unstack(level=interaction_factor)
-
-            # --- 5. Order the axes ---
-            # ... (Heatmap ordering code, unchanged) ...
-            heatmap_data = heatmap_data.reindex(y_axis_order)
-            x_axis_order = sorted(heatmap_data.columns.unique())
-            heatmap_data = heatmap_data[x_axis_order]
-
-            # --- 6. Plotting ---
-            # ... (Heatmap plotting code, unchanged) ...
-            fig_width = max(12, len(x_axis_order) * 1.5)
-            fig_height = max(8, len(y_axis_order) * 0.8)
-            plt.figure(figsize=(fig_width, fig_height))
-            y_label = f"{metric}"
-            if "_deg" in metric: y_label += " (Degrees)"
-            elif "_rad" in metric: y_label += " (Radians)"
-            ax = sns.heatmap(
-                heatmap_data,
-                annot=annot,
-                fmt=fmt,
-                cmap=cmap,
-                linewidths=.5,
-                cbar_kws={'label': f'Mean {y_label}'}
+            g = sns.catplot(
+                data=data,
+                x='method',
+                y=metric,
+                col='trial_type',
+                order=plot_order,
+                kind=plot_type,
+                palette=color_map,
+                height=6,
+                aspect=1.2,
+                sharey=False,
+                hue='method',
+                legend=False,
+                **plot_kwargs
             )
 
-            # --- 7. Finalize Plot ---
-            # ... (Heatmap finalize code, unchanged) ...
-            plot_title = f"Mean {metric} by Method and {interaction_factor.title()}"
-            ax.set_title(plot_title, fontsize=16)
-            ax.set_xlabel(interaction_factor.title(), fontsize=12)
-            ax.set_ylabel("Method", fontsize=12)
-            ax.tick_params(axis='x', rotation=45) 
-            ax.tick_params(axis='y', rotation=0)
-            plt.tight_layout()
+            g.set_axis_labels("Method", f"{metric} (Degrees)" if "_deg" in metric else metric)
+            g.set_xticklabels(rotation=45, ha='right')
+            g.set_titles("Trial: {col_name}")
 
-            if save_plots:
-                filename = f"interaction_heatmap_{metric.lower()}_vs_{interaction_factor.lower()}.png"
-                save_path = os.path.join("plots", filename)
-                plt.savefig(save_path)
-                print(f"    Saved heatmap to {save_path}")
-            if show_plots:
-                plt.show()
-            plt.close()
-        
+            # --- MODIFIED: Re-structured loop to handle all plot types ---
+            for i, ax in enumerate(g.axes.flat):
+                # Stop if we run out of trial types (e.g., 3 trials on a 2x2 grid)
+                if i >= len(trial_types):
+                    break
+                
+                trial_name = trial_types[i]
+                trial_data = data[data['trial_type'] == trial_name]
+
+                if show_labels:
+                    # Calculate stats for this specific facet
+                    stats_df = trial_data.groupby('method')[metric].quantile([0.25, 0.5, 0.75]).unstack().reindex(plot_order)
+                    
+                    if plot_type == 'box':
+                        ylim = ax.get_ylim()
+                        y_offset = (ylim[1] - ylim[0]) * 0.015
+                        
+                        for j, method in enumerate(plot_order):
+                            if method not in stats_df.index: continue
+                            q1, median, q3 = stats_df.loc[method, 0.25], stats_df.loc[method, 0.5], stats_df.loc[method, 0.75]
+                            if pd.notna(q1) and pd.notna(median) and pd.notna(q3):
+                                ax.text(j, q3 + y_offset, f'{q3:.1f}', ha='center', va='bottom', fontsize=8)
+                                ax.text(j, median, f'{median:.1f}', ha='center', va='center', fontsize=9, color='white', fontweight='bold')
+                                ax.text(j, q1 - y_offset, f'{q1:.1f}', ha='center', va='top', fontsize=8)
+                    
+                    # --- NEW: Add median/IQR lines for strip/swarm plots ---
+                    elif plot_type in ['strip', 'swarm']:
+                        line_width = 0.4    # Total width of the median line
+                        whisker_width = 0.2 # Total width of the Q1/Q3 whiskers
+                        
+                        for j, method in enumerate(plot_order): # 'j' is the x-position index
+                            if method not in stats_df.index: continue
+                            q1, median, q3 = stats_df.loc[method, 0.25], stats_df.loc[method, 0.5], stats_df.loc[method, 0.75]
+                            
+                            if pd.notna(q1) and pd.notna(median) and pd.notna(q3):
+                                # Draw the vertical IQR line
+                                ax.vlines(j, q1, q3, color='black', linestyle='-', linewidth=1, zorder=10)
+                                # Draw the Q1 whisker
+                                ax.hlines(q1, j - whisker_width/2, j + whisker_width/2, color='black', linestyle='-', linewidth=1, zorder=10)
+                                # Draw the Q3 whisker
+                                ax.hlines(q3, j - whisker_width/2, j + whisker_width/2, color='black', linestyle='-', linewidth=1, zorder=10)
+                                # Draw the median line (make it stand out)
+                                ax.hlines(median, j - line_width/2, j + line_width/2, color='red', linestyle='-', linewidth=2, zorder=10)
+                    # --- END NEW ---
+
+                # Add grid to all axes
+                ax.grid(axis='y', linestyle='--', alpha=0.7)
+            # --- END MODIFIED BLOCK ---
+            
+            fig = g.fig # Get the figure object from the FacetGrid
+            plot_title = f"Method Performance for {metric} by Trial Type"
+
+        elif plot_type == 'histogram':
+            # ... (histogram logic remains unchanged) ...
+            n_trials = len(trial_types)
+            ncols = min(n_trials, 3)
+            nrows = int(np.ceil(n_trials / ncols))
+            
+            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(ncols * 6, nrows * 5), squeeze=False, sharex=True)
+            axes_flat = axes.flatten()
+            
+            metric_min = data[metric].min()
+            metric_max = data[metric].max()
+            bins = np.linspace(metric_min, metric_max, 50)
+
+            for i, trial in enumerate(trial_types):
+                ax = axes_flat[i]
+                trial_data = data[data['trial_type'] == trial]
+                
+                for method in plot_order:
+                    method_data = trial_data[trial_data['method'] == method][metric].dropna()
+                    if method_data.empty:
+                        continue
+                    sns.histplot(
+                        method_data,
+                        label=method,
+                        ax=ax,
+                        kde=True,
+                        stat="density",
+                        element="step",
+                        alpha=0.5,
+                        color=color_map.get(method),
+                        bins=bins
+                    )
+                
+                ax.set_title(f"Trial: {trial}")
+                ax.set_ylabel("Density")
+                ax.grid(axis='y', linestyle='--', alpha=0.7)
+
+            handles, labels = axes_flat[0].get_legend_handles_labels()
+            fig.legend(handles, labels, title="Method", loc='upper right')
+            fig.text(0.5, 0.01, f"{metric} (Degrees)" if "_deg" in metric else metric, ha='center', va='bottom', fontsize=12)
+            
+            for j in range(i + 1, len(axes_flat)):
+                axes_flat[j].axis('off')
+
+            plot_title = f"Method Performance for {metric} by Trial Type"
+            
+        else:
+            print(f"Error: Unsupported plot_type '{plot_type}'. Choose from {catplot_kinds + ['histogram']}.")
+            continue 
+
+        filename = f"by_trial_performance_{metric.lower()}_{plot_type}.png"
+        _finalize_and_save_plot(fig, plot_title, filename, show_plots, save_plots)
+
+def plot_interaction_heatmap(
+    summary_df: pd.DataFrame,
+    metrics: List[str],
+    interaction_factor: str,
+    method_order: Optional[List[str]] = None,
+    cmap: str = 'Reds',
+    run_stats: bool = True,
+    alpha: float = 0.05,
+    show_plots: bool = False,
+    save_plots: bool = True
+) -> None:
+    """
+    Generates heatmaps to analyze performance by an interaction factor.
+    """
+    print(f"\n--- Generating Interaction Heatmaps for Method vs. {interaction_factor.title()} ---")
+    data = summary_df.reset_index()
+
+    if interaction_factor not in data.columns:
+        print(f"Error: Interaction factor '{interaction_factor}' not found. Skipping.")
+        return
+
+    if method_order:
+        data = data[data['method'].isin(method_order)]
+        y_axis_order = [m for m in method_order if m in data['method'].unique()]
+    else:
+        y_axis_order = sorted(data['method'].unique())
+
+    if data.empty or len(y_axis_order) < 2:
+        print("Warning: Not enough data or methods to generate plots. Skipping.")
+        return
+
+    for metric in metrics:
+        if metric not in data.columns:
+            print(f"Warning: Metric '{metric}' not found. Skipping.")
+            continue
+        print(f"\n--- Processing Metric: {metric} ---")
+
+        if run_stats:
+            factor_levels = sorted(data[interaction_factor].unique())
+            for level in factor_levels:
+                print(f"\n--- Testing for {interaction_factor.title()} = {level} ---")
+                level_data = data[data[interaction_factor] == level]
+                _run_statistical_analysis(level_data, metric, y_axis_order, alpha)
+            print(f"--- End of Statistical Analysis for {metric} ---")
+
+        try:
+            heatmap_data = data.groupby(['method', interaction_factor])[metric].mean().unstack()
+            heatmap_data = heatmap_data.reindex(y_axis_order)
+            heatmap_data = heatmap_data.reindex(sorted(heatmap_data.columns), axis=1)
+
+            fig_width = max(12, len(heatmap_data.columns) * 1.5)
+            fig_height = max(8, len(heatmap_data.index) * 0.8)
+            fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+            
+            y_label_cbar = f"Mean {metric} (Degrees)" if "_deg" in metric else f"Mean {metric}"
+            sns.heatmap(heatmap_data, annot=True, fmt=".2f", cmap=cmap, linewidths=.5, cbar_kws={'label': y_label_cbar}, ax=ax)
+            
+            ax.set_ylabel("Method", fontsize=12)
+            ax.set_xlabel(interaction_factor.title(), fontsize=12)
+
+            plot_title = f"Mean {metric} by Method and {interaction_factor.title()}"
+            filename = f"interaction_heatmap_{metric.lower()}_vs_{interaction_factor.lower()}.png"
+            _finalize_and_save_plot(fig, plot_title, filename, show_plots, save_plots)
         except Exception as e:
             print(f"    Error plotting heatmap for {metric}: {e}")
-            plt.close() # Ensure plot is closed on error
+            plt.close()
 
+# --- Main Execution ---
 
-# --- Main execution ---
-if __name__ == "__main__":
+def main():
+    """
+    Main function to load data and generate all plots and analyses.
+    """
+    # --- 1. Configuration ---
+    DATA_FILE_PATH = os.path.join("data", "data", "all_subject_statistics.pkl")
+    PLOTS_DIRECTORY = "plots"
     
-    # 1. Define the correct path
-    stats_file_path = os.path.join("data", "data", "all_subject_statistics.pkl")
+    # Plotting settings
+    SHOW_PLOTS = True
+    SAVE_PLOTS = True
+    RUN_STATS = True
 
-    # 2. Check if the file exists and load it
-    if not os.path.exists(stats_file_path):
-        print(f"Error: Statistics file not found at {stats_file_path}")
-        print("Please run the data generation script first.")
-        exit()
-        
-    try:
-        print(f"Loading summary statistics from {stats_file_path}...")
-        summary_stats_df = pd.read_pickle(stats_file_path)
-    except Exception as e:
-        print(f"Error loading pickle file: {e}")
-        exit()
-    
-    show_plots = True
-    save_plots = True # Set to True to save images
-
-    print("\nGenerating performance plots...")
-    metrics_to_plot = ['RMSE_deg', 'MAE_deg', 'Mean_deg', 'STD_deg']
-    
-    # --- Find the outlier ---
-    if 'EKF' in summary_stats_df.index.get_level_values('method'):
-        ekf_df = summary_stats_df.xs('EKF', level='method')
-        ekf_sorted = ekf_df.sort_values(by='RMSE_deg', ascending=False)
-        print("\n--- Top 5 Largest 'EKF' Errors ---")
-        print(ekf_sorted.head(5))
-    else:
-        print("\n--- 'EKF' method not found in data, skipping outlier check ---")
-
-
-    # --- Define your methods and their desired order ---
-    my_methods_in_order = [
+    # Define the metrics and methods to analyze.
+    METRICS_TO_PLOT = ['RMSE_deg', 'Mean_deg', 'STD_deg'] # Reduced for quicker demo
+    METHODS_IN_ORDER = [
         'EKF',
-        'Madgwick (Al Borno)', 
+        'Madgwick (Al Borno)',
         'Mag Free',
         'Never Project',
-        'Cascade', 
+        'Cascade',
     ]
     
-    my_palette = "Set2"
-    
-    print("\n--- Generating FILTERED Box Plots (in custom order) ---")
+    # --- 2. Load Data ---
+    if not os.path.exists(DATA_FILE_PATH):
+        print(f"Error: Statistics file not found at {DATA_FILE_PATH}")
+        # Create a dummy dataframe for demonstration purposes if file not found
+        print("Creating a dummy dataframe for demonstration.")
+        num_entries = 200
+        data = {
+            'method': np.random.choice(METHODS_IN_ORDER, num_entries),
+            'trial_type': np.random.choice(['Slow', 'Medium', 'Fast'], num_entries),
+            'joint_name': np.random.choice(['Knee', 'Elbow'], num_entries),
+            'subject': np.random.choice(['S1', 'S2', 'S3'], num_entries),
+            'axis': np.random.choice(['X', 'Y', 'Z'], num_entries),
+            'RMSE_deg': np.random.rand(num_entries) * 10,
+            'MAE_deg': np.random.rand(num_entries) * 8,
+            'Mean_deg': np.random.randn(num_entries) * 5,
+            'STD_deg': np.random.rand(num_entries) * 3
+        }
+        summary_stats_df = pd.DataFrame(data)
+    else:
+        print(f"Loading summary statistics from {DATA_FILE_PATH}...")
+        try:
+            summary_stats_df = pd.read_pickle(DATA_FILE_PATH)
+        except Exception as e:
+            print(f"Error loading pickle file: {e}")
+            return
+
+    # --- 3. Generate Overall Performance Plots (Box and Swarm) ---
+    # plot_method_performance(
+    #     summary_df=summary_stats_df, metrics=METRICS_TO_PLOT, plot_type='box',
+    #     method_order=METHODS_IN_ORDER, palette="Set2", run_stats=RUN_STATS,
+    #     show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
+    # )
     plot_method_performance(
-        summary_df=summary_stats_df,
-        metrics=metrics_to_plot,
-        plot_type='box',
-        method_filter=my_methods_in_order,
-        palette=my_palette,
-        show_plots=show_plots,
-        save_plots=save_plots,
-        run_stats=True,        
-        show_labels=True       
+        summary_df=summary_stats_df, metrics=METRICS_TO_PLOT, plot_type='strip',
+        method_order=METHODS_IN_ORDER, palette="Set2", run_stats=False, # Stats already run
+        show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
     )
     
-    # --- [NEW] Call the interaction heatmap function ---
-    print("\n--- Generating Interaction Heatmaps (in custom order) ---")
-    
-    # 1. Method vs. Joint
-    plot_interaction_heatmap(
-        summary_df=summary_stats_df,
-        metrics=metrics_to_plot, # Using all metrics
-        interaction_factor='joint_name',     
-        method_filter=my_methods_in_order, 
-        cmap='Reds',
-        run_stats=True,                  
-        show_plots=show_plots,
-        save_plots=save_plots
-    )
-    
-    # 2. Method vs. Subject
-    plot_interaction_heatmap(
-        summary_df=summary_stats_df,
-        metrics=metrics_to_plot, # Using all metrics
-        interaction_factor='subject',    
-        method_filter=my_methods_in_order, 
-        cmap='Reds',
-        run_stats=True,                  
-        show_plots=show_plots,
-        save_plots=save_plots
+    # --- 4. Generate Performance Plots Faceted by Trial (Box and Strip) ---
+    # plot_performance_by_trial(
+    #     summary_df=summary_stats_df, metrics=METRICS_TO_PLOT, plot_type='box',
+    #     method_order=METHODS_IN_ORDER, palette="Set2", run_stats=RUN_STATS,
+    #     show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
+    # )
+    plot_performance_by_trial(
+        summary_df=summary_stats_df, metrics=METRICS_TO_PLOT, plot_type='strip',
+        method_order=METHODS_IN_ORDER, palette="Set2", run_stats=False, # Stats already run
+        show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
     )
 
-    # 3. Method vs. Axis
-    plot_interaction_heatmap(
-        summary_df=summary_df,
-        metrics=metrics_to_plot, # Using all metrics
-        interaction_factor='axis',       
-        method_filter=my_methods_in_order, 
-        cmap='Reds',
-        run_stats=True,                  
-        show_plots=show_plots,
-        save_plots=save_plots
-    )
+    # --- 5. Generate Interaction Heatmaps for various factors ---
+    # interaction_factors = ['joint_name', 'subject', 'trial_type', 'axis'] # Reduced for quicker demo
+    # for factor in interaction_factors:
+    #     plot_interaction_heatmap(
+    #         summary_df=summary_stats_df, metrics=METRICS_TO_PLOT,
+    #         interaction_factor=factor, method_order=METHODS_IN_ORDER,
+    #         cmap='Reds', run_stats=RUN_STATS, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
+    #     )
 
-    # 4. Method vs. Trial Type
-    plot_interaction_heatmap(
-        summary_df=summary_stats_df,
-        metrics=metrics_to_plot, # Using all metrics
-        interaction_factor='trial_type', 
-        method_filter=my_methods_in_order,
-        cmap='Reds',
-        run_stats=True,                  
-        show_plots=show_plots,
-        save_plots=save_plots
-    )
     print("\n--- All plotting complete ---")
+
+if __name__ == "__main__":
+    main()
