@@ -8,13 +8,13 @@ It loads a pre-processed pandas DataFrame containing performance metrics and
 produces three main types of visualizations:
 
 1.  **Overall Performance Plots**: Compares the distribution of key metrics
-    (e.g., RMSE, MAE) across all methods using box, strip, or swarm plots.
-    Includes a robust statistical analysis using the Friedman test, followed
-    by a Wilcoxon signed-rank post-hoc test if significant.
+    (e.g., RMSE, MAE) across all methods using a combined strip and
+    box-whisker plot. Includes a robust statistical analysis using the
+    Friedman test, followed by a Wilcoxon signed-rank post-hoc test.
 
-2.  **Performance by Trial Plots**: Creates a faceted plot to compare
-    method performance side-by-side for each experimental trial type. Also
-    supports box, strip, and swarm plots.
+2.  **Performance by Trial Plots**: Creates a faceted strip and box-whisker
+    plot to compare method performance side-by-side for each
+    experimental trial type.
 
 3.  **Interaction Heatmaps**: Visualizes the mean performance of each method
     across different experimental conditions (e.g., by joint or subject).
@@ -196,33 +196,72 @@ def _finalize_and_save_plot(
 
     plt.close(figure) # Close the figure to free up memory.
 
+def _remove_outliers(
+    df: pd.DataFrame,
+    metric: str,
+    group_cols: List[str]
+) -> pd.DataFrame:
+    """
+    Removes outliers from a DataFrame based on the 1.5 IQR rule, applied per group.
+
+    Args:
+        df (pd.DataFrame): The input DataFrame.
+        metric (str): The metric column to check for outliers.
+        group_cols (List[str]): The columns to group by before calculating IQR.
+
+    Returns:
+        pd.DataFrame: A DataFrame with outliers removed.
+    """
+    if not group_cols:
+        # Handle non-grouped data if necessary, though not used in this script
+        q1 = df[metric].quantile(0.25)
+        q3 = df[metric].quantile(0.75)
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        return df[(df[metric] >= lower_bound) & (df[metric] <= upper_bound)]
+    
+    # Calculate Q1, Q3, and bounds *per group*
+    grouped = df.groupby(group_cols)[metric]
+    q1 = grouped.transform('quantile', 0.25)
+    q3 = grouped.transform('quantile', 0.75)
+    iqr = q3 - q1
+    
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+    
+    # Filter the original dataframe
+    filtered_df = df[(df[metric] >= lower_bound) & (df[metric] <= upper_bound)]
+    
+    return filtered_df
 
 # --- Main Plotting Functions ---
 
 def plot_method_performance(
     summary_df: pd.DataFrame,
     metrics: List[str],
-    plot_type: str = 'box',
     method_order: Optional[List[str]] = None,
     palette: Optional[Union[str, Dict[str, str]]] = None,
-    run_stats: bool = True,
-    alpha: float = 0.05,
     show_labels: bool = True,
     show_plots: bool = False,
     save_plots: bool = True
 ) -> None:
     """
-    Generates plots to compare the overall performance of different methods.
+    Generates combined strip and box-whisker plots to compare
+    the overall performance of different methods. Outliers beyond
+    1.5 IQR per method are removed.
 
     Args:
-        ...
-        plot_type (str): Type of plot: 'box', 'violin', 'strip', 'swarm',
-            or 'histogram'.
-        ...
+        summary_df (pd.DataFrame): DataFrame with performance metrics.
+        metrics (List[str]): List of metric columns to plot.
+        method_order (Optional[List[str]]): Fixed order for methods on x-axis.
+        palette (Optional[Union[str, Dict[str, str]]]): Color palette for plots.
         show_labels (bool): If True, adds Q1, median, and Q3 labels
-            to 'box' plots, or median/IQR lines to 'strip'/'swarm' plots.
+            and whisker lines.
+        show_plots (bool): If True, display the plot interactively.
+        save_plots (bool): If True, save the plot to disk.
     """
-    print(f"\n--- Generating Overall Performance {plot_type.title()} Plots ---")
+    print(f"\n--- Generating Overall Performance Strip & Whisker Plots ---")
     data = summary_df.reset_index()
 
     if method_order:
@@ -246,127 +285,105 @@ def plot_method_performance(
         colors = sns.color_palette(n_colors=len(plot_order))
         color_map = dict(zip(plot_order, colors))
 
-    # Define the mapping from plot_type string to the Seaborn function
-    plot_funcs = {
-        'box': sns.boxplot,
-        'violin': sns.violinplot,
-        'strip': sns.stripplot,
-        'swarm': sns.swarmplot
-    }
-    if plot_type not in plot_funcs and plot_type != 'histogram':
-        print(f"Error: Unsupported plot_type '{plot_type}'. Choose from {list(plot_funcs.keys()) + ['histogram']}.")
-        return
-
     for metric in metrics:
         if metric not in data.columns:
             print(f"Warning: Metric '{metric}' not found. Skipping.")
             continue
-        print(f"\n--- Processing Metric: {metric} ({plot_type.title()} Plot) ---")
-        if run_stats and plot_type != 'histogram': # Stats are for comparing methods
-            _run_statistical_analysis(data, metric, plot_order, alpha)
+        
+        print(f"\n--- Processing Metric: {metric} (Strip & Whisker Plot) ---")
+        
+        # --- NEW: Filter outliers per method ---
+        original_count = len(data)
+        filtered_data = _remove_outliers(data, metric, group_cols=['method'])
+        removed_count = original_count - len(filtered_data)
+        if removed_count > 0:
+            print(f"  > Removed {removed_count} outliers (beyond 1.5 IQR) for '{metric}'.")
+        # --- END NEW ---
+
+        # --- Statistics now run unconditionally (on filtered data) ---
+        _run_statistical_analysis(filtered_data, metric, plot_order, alpha=0.05)
         
         fig, ax = plt.subplots(figsize=(14, 8))
         
-        if plot_type in plot_funcs:
-            plot_func = plot_funcs[plot_type]
-            # --- MODIFIED: Added zorder to stripplot/swarmplot ---
-            plot_kwargs = {'data': data, 'x': 'method', 'y': metric, 'order': plot_order, 'palette': color_map, 'hue': 'method', 'legend': False, 'ax': ax}
-            if plot_type in ['strip', 'swarm']:
-                plot_kwargs['zorder'] = 1 # Draw points behind markers
+        # --- 1. Plot the strip plot with low opacity (on filtered data) ---
+        sns.stripplot(
+            data=filtered_data,
+            x='method',
+            y=metric,
+            order=plot_order,
+            palette=color_map,
+            hue='method',
+            legend=False,
+            ax=ax,
+            alpha=0.3, # Low opacity
+            zorder=1
+        )
+        
+        # --- 2. Add whisker lines and labels (from filtered data) ---
+        if show_labels:
+            # Calculate stats for all methods
+            stats_df = filtered_data.groupby('method')[metric].quantile([0.25, 0.5, 0.75]).unstack().reindex(plot_order)
             
-            plot_func(**plot_kwargs)
+            ylim = ax.get_ylim()
+            y_offset = (ylim[1] - ylim[0]) * 0.015
+            line_width = 0.4    # Total width of the median line
+            whisker_width = 0.2 # Total width of the Q1/Q3 whiskers
             
-            # --- MODIFIED: Re-structured logic to add labels or markers ---
-            if show_labels:
-                # Calculate stats for all methods
-                stats_df = data.groupby('method')[metric].quantile([0.25, 0.5, 0.75]).unstack().reindex(plot_order)
-                
-                # Add quantile labels, but ONLY for box plots.
-                if plot_type == 'box':
-                    ylim = ax.get_ylim()
-                    y_offset = (ylim[1] - ylim[0]) * 0.015
-                    for i, method in enumerate(plot_order):
-                        if method not in stats_df.index: continue
-                        q1, median, q3 = stats_df.loc[method, 0.25], stats_df.loc[method, 0.5], stats_df.loc[method, 0.75]
-                        if pd.notna(q1) and pd.notna(median) and pd.notna(q3):
-                            ax.text(i, q3 + y_offset, f'{q3:.1f}', ha='center', va='bottom', fontsize=8)
-                            ax.text(i, median, f'{median:.1f}', ha='center', va='center', fontsize=9, color='white', fontweight='bold')
-                            ax.text(i, q1 - y_offset, f'{q1:.1f}', ha='center', va='top', fontsize=8)
-
-                # --- NEW: Add median/IQR lines for strip/swarm plots ---
-                elif plot_type in ['strip', 'swarm']:
-                    line_width = 0.4    # Total width of the median line
-                    whisker_width = 0.2 # Total width of the Q1/Q3 whiskers
-                    
-                    for i, method in enumerate(plot_order):
-                        if method not in stats_df.index: continue
-                        q1, median, q3 = stats_df.loc[method, 0.25], stats_df.loc[method, 0.5], stats_df.loc[method, 0.75]
-                        
-                        if pd.notna(q1) and pd.notna(median) and pd.notna(q3):
-                            # Draw the vertical IQR line
-                            ax.vlines(i, q1, q3, color='black', linestyle='-', linewidth=1, zorder=10)
-                            # Draw the Q1 whisker
-                            ax.hlines(q1, i - whisker_width/2, i + whisker_width/2, color='black', linestyle='-', linewidth=1, zorder=10)
-                            # Draw the Q3 whisker
-                            ax.hlines(q3, i - whisker_width/2, i + whisker_width/2, color='black', linestyle='-', linewidth=1, zorder=10)
-                            # Draw the median line (make it stand out)
-                            ax.hlines(median, i - line_width/2, i + line_width/2, color='red', linestyle='-', linewidth=2, zorder=10)
-                # --- END NEW ---
-
-            ax.set_ylabel(f"{metric} (Degrees)" if "_deg" in metric else metric, fontsize=12)
-            ax.set_xlabel("Method", fontsize=12)
-            ax.tick_params(axis='x', rotation=45)
-
-        elif plot_type == 'histogram':
-            # ... (histogram logic remains unchanged) ...
-            for method in plot_order:
-                method_data = data[data['method'] == method][metric].dropna()
-                if method_data.empty:
+            for i, method in enumerate(plot_order):
+                if method not in stats_df.index:
                     continue
-                sns.histplot(
-                    method_data,
-                    label=method,
-                    ax=ax,
-                    kde=True,
-                    stat="density",
-                    element="step",
-                    alpha=0.5,
-                    color=color_map.get(method)
-                )
-            ax.legend(title="Method")
-            ax.set_xlabel(f"{metric} (Degrees)" if "_deg" in metric else metric, fontsize=12)
-            ax.set_ylabel("Density", fontsize=12)
+                q1, median, q3 = stats_df.loc[method, 0.25], stats_df.loc[method, 0.5], stats_df.loc[method, 0.75]
+                
+                if pd.notna(q1) and pd.notna(median) and pd.notna(q3):
+                    # --- Draw "box whisker" lines ---
+                    # Draw the vertical IQR line
+                    ax.vlines(i, q1, q3, color='black', linestyle='-', linewidth=1, zorder=10)
+                    # Draw the Q1 whisker
+                    ax.hlines(q1, i - whisker_width/2, i + whisker_width/2, color='black', linestyle='-', linewidth=1, zorder=10)
+                    # Draw the Q3 whisker
+                    ax.hlines(q3, i - whisker_width/2, i + whisker_width/2, color='black', linestyle='-', linewidth=1, zorder=10)
+                    # Draw the median line
+                    ax.hlines(median, i - line_width/2, i + line_width/2, color='red', linestyle='-', linewidth=2, zorder=10)
 
+                    # --- Add text labels ---
+                    ax.text(i, q3 + y_offset, f'{q3:.1f}', ha='center', va='bottom', fontsize=8, zorder=11)
+                    ax.text(i, median, f'{median:.1f}', ha='center', va='center', fontsize=9, color='white', fontweight='bold', zorder=11)
+                    ax.text(i, q1 - y_offset, f'{q1:.1f}', ha='center', va='top', fontsize=8, zorder=11)
+
+        ax.set_ylabel(f"{metric} (Degrees)" if "_deg" in metric else metric, fontsize=12)
+        ax.set_xlabel("Method", fontsize=12)
+        ax.tick_params(axis='x', rotation=45)
         ax.set_title(f"Overall Method Performance: {metric}", fontsize=16)
         ax.grid(axis='y', linestyle='--', alpha=0.7)
         
-        filename = f"overall_performance_{metric.lower()}_{plot_type}.png"
+        filename = f"overall_performance_{metric.lower()}_strip_whisker.png"
         _finalize_and_save_plot(fig, "", filename, show_plots, save_plots)
 
 def plot_performance_by_trial(
     summary_df: pd.DataFrame,
     metrics: List[str],
-    plot_type: str = 'box',
     method_order: Optional[List[str]] = None,
     palette: Optional[Union[str, Dict[str, str]]] = None,
-    run_stats: bool = True,
-    alpha: float = 0.05,
     show_labels: bool = True,
     show_plots: bool = False,
     save_plots: bool = True
 ) -> None:
     """
-    Generates faceted plots to compare method performance for each trial type.
+    Generates faceted strip & whisker plots to compare method performance
+    for each trial type. Outliers beyond 1.5 IQR per (trial_type, method)
+    group are removed.
 
     Args:
-        ...
-        plot_type (str): Type of plot: 'box', 'violin', 'strip', 'swarm',
-            or 'histogram'.
-        ...
+        summary_df (pd.DataFrame): DataFrame with performance metrics.
+        metrics (List[str]): List of metric columns to plot.
+        method_order (Optional[List[str]]): Fixed order for methods on x-axis.
+        palette (Optional[Union[str, Dict[str, str]]]): Color palette for plots.
         show_labels (bool): If True, adds Q1, median, and Q3 labels
-            to 'box' plots, or median/IQR lines to 'strip'/'swarm' plots.
+            and whisker lines.
+        show_plots (bool): If True, display the plot interactively.
+        save_plots (bool): If True, save the plot to disk.
     """
-    print(f"\n--- Generating Performance {plot_type.title()} Plots by Trial Type ---")
+    print(f"\n--- Generating Performance Strip & Whisker Plots by Trial Type ---")
     data = summary_df.reset_index()
 
     if 'trial_type' not in data.columns:
@@ -401,146 +418,93 @@ def plot_performance_by_trial(
             print(f"Warning: Metric '{metric}' not found. Skipping.")
             continue
 
-        print(f"\n--- Processing Metric: {metric} by Trial Type ({plot_type.title()} Plot) ---")
+        print(f"\n--- Processing Metric: {metric} by Trial Type (Strip & Whisker Plot) ---")
         
-        if run_stats:
-            for trial in trial_types:
-                print(f"\n--- Testing for Trial Type = {trial} ---")
-                trial_data = data[data['trial_type'] == trial]
-                _run_statistical_analysis(trial_data, metric, plot_order, alpha)
-            print(f"--- End of Statistical Analysis for {metric} ---")
+        # --- NEW: Filter outliers per trial_type and method ---
+        original_count = len(data)
+        filtered_data = _remove_outliers(data, metric, group_cols=['trial_type', 'method'])
+        removed_count = original_count - len(filtered_data)
+        if removed_count > 0:
+            print(f"  > Removed {removed_count} outliers (beyond 1.5 IQR) for '{metric}'.")
+        # --- END NEW ---
+
+        # --- Statistics now run unconditionally (on filtered data) ---
+        for trial in trial_types:
+            print(f"\n--- Testing for Trial Type = {trial} ---")
+            # Select the filtered data for this trial
+            trial_data = filtered_data[filtered_data['trial_type'] == trial]
+            _run_statistical_analysis(trial_data, metric, plot_order, alpha=0.05)
+        print(f"--- End of Statistical Analysis for {metric} ---")
         
-        catplot_kinds = ['box', 'violin', 'strip', 'swarm', 'boxen', 'point', 'bar', 'count']
+        
+        # --- 1. Plot the faceted strip plots (on filtered data) ---
+        g = sns.catplot(
+            data=filtered_data,
+            x='method',
+            y=metric,
+            col='trial_type',
+            order=plot_order,
+            kind='strip', # Always use strip plot
+            palette=color_map,
+            height=6,
+            aspect=1.2,
+            sharey=False,
+            hue='method',
+            legend=False,
+            alpha=0.3, # Low opacity
+            zorder=1
+        )
 
-        if plot_type in catplot_kinds:
-            # --- MODIFIED: Added zorder to stripplot/swarmplot ---
-            plot_kwargs = {}
-            if plot_type in ['strip', 'swarm']:
-                plot_kwargs['zorder'] = 1 # Draw points behind markers
+        g.set_axis_labels("Method", f"{metric} (Degrees)" if "_deg" in metric else metric)
+        g.set_xticklabels(rotation=45, ha='right')
+        g.set_titles("Trial: {col_name}")
+
+        # --- 2. Add whisker lines and labels to each facet (from filtered data) ---
+        for i, ax in enumerate(g.axes.flat):
+            # Stop if we run out of trial types (e.g., 3 trials on a 2x2 grid)
+            if i >= len(trial_types):
+                break
             
-            g = sns.catplot(
-                data=data,
-                x='method',
-                y=metric,
-                col='trial_type',
-                order=plot_order,
-                kind=plot_type,
-                palette=color_map,
-                height=6,
-                aspect=1.2,
-                sharey=False,
-                hue='method',
-                legend=False,
-                **plot_kwargs
-            )
+            trial_name = trial_types[i]
+            # Select the filtered data for this trial
+            trial_data = filtered_data[filtered_data['trial_type'] == trial_name]
 
-            g.set_axis_labels("Method", f"{metric} (Degrees)" if "_deg" in metric else metric)
-            g.set_xticklabels(rotation=45, ha='right')
-            g.set_titles("Trial: {col_name}")
-
-            # --- MODIFIED: Re-structured loop to handle all plot types ---
-            for i, ax in enumerate(g.axes.flat):
-                # Stop if we run out of trial types (e.g., 3 trials on a 2x2 grid)
-                if i >= len(trial_types):
-                    break
+            if show_labels:
+                # Calculate stats for this specific facet
+                stats_df = trial_data.groupby('method')[metric].quantile([0.25, 0.5, 0.75]).unstack().reindex(plot_order)
                 
-                trial_name = trial_types[i]
-                trial_data = data[data['trial_type'] == trial_name]
-
-                if show_labels:
-                    # Calculate stats for this specific facet
-                    stats_df = trial_data.groupby('method')[metric].quantile([0.25, 0.5, 0.75]).unstack().reindex(plot_order)
-                    
-                    if plot_type == 'box':
-                        ylim = ax.get_ylim()
-                        y_offset = (ylim[1] - ylim[0]) * 0.015
-                        
-                        for j, method in enumerate(plot_order):
-                            if method not in stats_df.index: continue
-                            q1, median, q3 = stats_df.loc[method, 0.25], stats_df.loc[method, 0.5], stats_df.loc[method, 0.75]
-                            if pd.notna(q1) and pd.notna(median) and pd.notna(q3):
-                                ax.text(j, q3 + y_offset, f'{q3:.1f}', ha='center', va='bottom', fontsize=8)
-                                ax.text(j, median, f'{median:.1f}', ha='center', va='center', fontsize=9, color='white', fontweight='bold')
-                                ax.text(j, q1 - y_offset, f'{q1:.1f}', ha='center', va='top', fontsize=8)
-                    
-                    # --- NEW: Add median/IQR lines for strip/swarm plots ---
-                    elif plot_type in ['strip', 'swarm']:
-                        line_width = 0.4    # Total width of the median line
-                        whisker_width = 0.2 # Total width of the Q1/Q3 whiskers
-                        
-                        for j, method in enumerate(plot_order): # 'j' is the x-position index
-                            if method not in stats_df.index: continue
-                            q1, median, q3 = stats_df.loc[method, 0.25], stats_df.loc[method, 0.5], stats_df.loc[method, 0.75]
-                            
-                            if pd.notna(q1) and pd.notna(median) and pd.notna(q3):
-                                # Draw the vertical IQR line
-                                ax.vlines(j, q1, q3, color='black', linestyle='-', linewidth=1, zorder=10)
-                                # Draw the Q1 whisker
-                                ax.hlines(q1, j - whisker_width/2, j + whisker_width/2, color='black', linestyle='-', linewidth=1, zorder=10)
-                                # Draw the Q3 whisker
-                                ax.hlines(q3, j - whisker_width/2, j + whisker_width/2, color='black', linestyle='-', linewidth=1, zorder=10)
-                                # Draw the median line (make it stand out)
-                                ax.hlines(median, j - line_width/2, j + line_width/2, color='red', linestyle='-', linewidth=2, zorder=10)
-                    # --- END NEW ---
-
-                # Add grid to all axes
-                ax.grid(axis='y', linestyle='--', alpha=0.7)
-            # --- END MODIFIED BLOCK ---
-            
-            fig = g.fig # Get the figure object from the FacetGrid
-            plot_title = f"Method Performance for {metric} by Trial Type"
-
-        elif plot_type == 'histogram':
-            # ... (histogram logic remains unchanged) ...
-            n_trials = len(trial_types)
-            ncols = min(n_trials, 3)
-            nrows = int(np.ceil(n_trials / ncols))
-            
-            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(ncols * 6, nrows * 5), squeeze=False, sharex=True)
-            axes_flat = axes.flatten()
-            
-            metric_min = data[metric].min()
-            metric_max = data[metric].max()
-            bins = np.linspace(metric_min, metric_max, 50)
-
-            for i, trial in enumerate(trial_types):
-                ax = axes_flat[i]
-                trial_data = data[data['trial_type'] == trial]
+                ylim = ax.get_ylim()
+                y_offset = (ylim[1] - ylim[0]) * 0.015
+                line_width = 0.4    # Total width of the median line
+                whisker_width = 0.2 # Total width of the Q1/Q3 whiskers
                 
-                for method in plot_order:
-                    method_data = trial_data[trial_data['method'] == method][metric].dropna()
-                    if method_data.empty:
+                for j, method in enumerate(plot_order): # 'j' is the x-position index
+                    if method not in stats_df.index:
                         continue
-                    sns.histplot(
-                        method_data,
-                        label=method,
-                        ax=ax,
-                        kde=True,
-                        stat="density",
-                        element="step",
-                        alpha=0.5,
-                        color=color_map.get(method),
-                        bins=bins
-                    )
-                
-                ax.set_title(f"Trial: {trial}")
-                ax.set_ylabel("Density")
-                ax.grid(axis='y', linestyle='--', alpha=0.7)
+                    q1, median, q3 = stats_df.loc[method, 0.25], stats_df.loc[method, 0.5], stats_df.loc[method, 0.75]
+                    
+                    if pd.notna(q1) and pd.notna(median) and pd.notna(q3):
+                        # --- Draw "box whisker" lines ---
+                        # Draw the vertical IQR line
+                        ax.vlines(j, q1, q3, color='black', linestyle='-', linewidth=1, zorder=10)
+                        # Draw the Q1 whisker
+                        ax.hlines(q1, j - whisker_width/2, j + whisker_width/2, color='black', linestyle='-', linewidth=1, zorder=10)
+                        # Draw the Q3 whisker
+                        ax.hlines(q3, j - whisker_width/2, j + whisker_width/2, color='black', linestyle='-', linewidth=1, zorder=10)
+                        # Draw the median line
+                        ax.hlines(median, j - line_width/2, j + line_width/2, color='red', linestyle='-', linewidth=2, zorder=10)
 
-            handles, labels = axes_flat[0].get_legend_handles_labels()
-            fig.legend(handles, labels, title="Method", loc='upper right')
-            fig.text(0.5, 0.01, f"{metric} (Degrees)" if "_deg" in metric else metric, ha='center', va='bottom', fontsize=12)
-            
-            for j in range(i + 1, len(axes_flat)):
-                axes_flat[j].axis('off')
+                        # --- Add text labels ---
+                        ax.text(j, q3 + y_offset, f'{q3:.1f}', ha='center', va='bottom', fontsize=8, zorder=11)
+                        ax.text(j, median, f'{median:.1f}', ha='center', va='center', fontsize=9, color='white', fontweight='bold', zorder=11)
+                        ax.text(j, q1 - y_offset, f'{q1:.1f}', ha='center', va='top', fontsize=8, zorder=11)
 
-            plot_title = f"Method Performance for {metric} by Trial Type"
-            
-        else:
-            print(f"Error: Unsupported plot_type '{plot_type}'. Choose from {catplot_kinds + ['histogram']}.")
-            continue 
-
-        filename = f"by_trial_performance_{metric.lower()}_{plot_type}.png"
+            # Add grid to all axes
+            ax.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        fig = g.fig # Get the figure object from the FacetGrid
+        plot_title = f"Method Performance for {metric} by Trial Type"
+        filename = f"by_trial_performance_{metric.lower()}_strip_whisker.png"
         _finalize_and_save_plot(fig, plot_title, filename, show_plots, save_plots)
 
 def plot_interaction_heatmap(
@@ -549,13 +513,22 @@ def plot_interaction_heatmap(
     interaction_factor: str,
     method_order: Optional[List[str]] = None,
     cmap: str = 'Reds',
-    run_stats: bool = True,
-    alpha: float = 0.05,
     show_plots: bool = False,
     save_plots: bool = True
 ) -> None:
     """
     Generates heatmaps to analyze performance by an interaction factor.
+    Calculations are based on data with outliers (beyond 1.5 IQR per
+    (factor, method) group) removed.
+    
+    Args:
+        summary_df (pd.DataFrame): DataFrame with performance metrics.
+        metrics (List[str]): List of metric columns to plot.
+        interaction_factor (str): Column name to use for the x-axis.
+        method_order (Optional[List[str]]): Fixed order for methods on y-axis.
+        cmap (str): Colormap for the heatmap.
+        show_plots (bool): If True, display the plot interactively.
+        save_plots (bool): If True, save the plot to disk.
     """
     print(f"\n--- Generating Interaction Heatmaps for Method vs. {interaction_factor.title()} ---")
     data = summary_df.reset_index()
@@ -580,16 +553,25 @@ def plot_interaction_heatmap(
             continue
         print(f"\n--- Processing Metric: {metric} ---")
 
-        if run_stats:
-            factor_levels = sorted(data[interaction_factor].unique())
-            for level in factor_levels:
-                print(f"\n--- Testing for {interaction_factor.title()} = {level} ---")
-                level_data = data[data[interaction_factor] == level]
-                _run_statistical_analysis(level_data, metric, y_axis_order, alpha)
-            print(f"--- End of Statistical Analysis for {metric} ---")
+        # --- NEW: Filter outliers per interaction_factor and method ---
+        original_count = len(data)
+        filtered_data = _remove_outliers(data, metric, group_cols=[interaction_factor, 'method'])
+        removed_count = original_count - len(filtered_data)
+        if removed_count > 0:
+            print(f"  > Removed {removed_count} outliers (beyond 1.5 IQR) for '{metric}'.")
+        # --- END NEW ---
+
+        # --- Statistics now run unconditionally (on filtered data) ---
+        factor_levels = sorted(filtered_data[interaction_factor].unique())
+        for level in factor_levels:
+            print(f"\n--- Testing for {interaction_factor.title()} = {level} ---")
+            level_data = filtered_data[filtered_data[interaction_factor] == level]
+            _run_statistical_analysis(level_data, metric, y_axis_order, alpha=0.05)
+        print(f"--- End of Statistical Analysis for {metric} ---")
 
         try:
-            heatmap_data = data.groupby(['method', interaction_factor])[metric].mean().unstack()
+            # Calculate mean for heatmap from filtered data
+            heatmap_data = filtered_data.groupby(['method', interaction_factor])[metric].mean().unstack()
             heatmap_data = heatmap_data.reindex(y_axis_order)
             heatmap_data = heatmap_data.reindex(sorted(heatmap_data.columns), axis=1)
 
@@ -623,10 +605,9 @@ def main():
     # Plotting settings
     SHOW_PLOTS = True
     SAVE_PLOTS = True
-    RUN_STATS = True
 
     # Define the metrics and methods to analyze.
-    METRICS_TO_PLOT = ['RMSE_deg', 'Mean_deg', 'STD_deg'] # Reduced for quicker demo
+    METRICS_TO_PLOT = ['RMSE_deg'] # Reduced for quicker demo
     METHODS_IN_ORDER = [
         'EKF',
         'Madgwick (Al Borno)',
@@ -661,38 +642,28 @@ def main():
             print(f"Error loading pickle file: {e}")
             return
 
-    # --- 3. Generate Overall Performance Plots (Box and Swarm) ---
-    # plot_method_performance(
-    #     summary_df=summary_stats_df, metrics=METRICS_TO_PLOT, plot_type='box',
-    #     method_order=METHODS_IN_ORDER, palette="Set2", run_stats=RUN_STATS,
-    #     show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
-    # )
+    # --- 3. Generate Overall Performance Plots (Strip + Whisker) ---
     plot_method_performance(
-        summary_df=summary_stats_df, metrics=METRICS_TO_PLOT, plot_type='strip',
-        method_order=METHODS_IN_ORDER, palette="Set2", run_stats=False, # Stats already run
+        summary_df=summary_stats_df, metrics=METRICS_TO_PLOT,
+        method_order=METHODS_IN_ORDER, palette="Set2",
         show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
     )
     
-    # --- 4. Generate Performance Plots Faceted by Trial (Box and Strip) ---
-    # plot_performance_by_trial(
-    #     summary_df=summary_stats_df, metrics=METRICS_TO_PLOT, plot_type='box',
-    #     method_order=METHODS_IN_ORDER, palette="Set2", run_stats=RUN_STATS,
-    #     show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
-    # )
+    # --- 4. Generate Performance Plots Faceted by Trial (Strip + Whisker) ---
     plot_performance_by_trial(
-        summary_df=summary_stats_df, metrics=METRICS_TO_PLOT, plot_type='strip',
-        method_order=METHODS_IN_ORDER, palette="Set2", run_stats=False, # Stats already run
+        summary_df=summary_stats_df, metrics=METRICS_TO_PLOT,
+        method_order=METHODS_IN_ORDER, palette="Set2",
         show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
     )
 
     # --- 5. Generate Interaction Heatmaps for various factors ---
-    # interaction_factors = ['joint_name', 'subject', 'trial_type', 'axis'] # Reduced for quicker demo
-    # for factor in interaction_factors:
-    #     plot_interaction_heatmap(
-    #         summary_df=summary_stats_df, metrics=METRICS_TO_PLOT,
-    #         interaction_factor=factor, method_order=METHODS_IN_ORDER,
-    #         cmap='Reds', run_stats=RUN_STATS, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
-    #     )
+    interaction_factors = ['joint_name', 'subject', 'trial_type', 'axis']
+    for factor in interaction_factors:
+        plot_interaction_heatmap(
+            summary_df=summary_stats_df, metrics=METRICS_TO_PLOT,
+            interaction_factor=factor, method_order=METHODS_IN_ORDER,
+            cmap='Reds', show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
+        )
 
     print("\n--- All plotting complete ---")
 
