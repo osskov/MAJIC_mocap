@@ -11,10 +11,12 @@ produproduces three main types of visualizations:
     (e.g., RMSE, MAE) across all methods using a combined strip and
     box-whisker plot. Includes a robust statistical analysis using the
     Friedman test, followed by a Wilcoxon signed-rank post-hoc test.
+    **Annotations for significant pairs are drawn on the plot.**
 
 2.  **Performance by Factor Plots**: Creates a faceted strip and box-whisker
     plot to compare method performance side-by-side for each level of a
     given experimental factor (e.g., trial type, joint, axis).
+    **Annotations for significant pairs are drawn on each facet.**
 
 3.  **Interaction Heatmaps**: Visualizes the mean performance of each method
     across different experimental conditions (e.g., by joint or subject).
@@ -31,7 +33,7 @@ Dependencies:
 """
 
 import os
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -46,23 +48,19 @@ def _run_statistical_analysis(
     metric: str,
     methods_order: List[str],
     alpha: float = 0.05
-) -> None:
+) -> List[tuple[str, str]]:
     """
     Performs statistical analysis using Friedman and Wilcoxon post-hoc tests.
 
-    This is a helper function designed to test for significant differences
-    between multiple methods on dependent samples. It pivots the data to align
-    measurements from the same "block" (e.g., the same subject/joint/axis)
-    and then runs the appropriate non-parametric tests.
-
     Args:
-        df (pd.DataFrame): The long-format DataFrame containing the data to test.
-            Must contain 'method', the specified metric column, and block columns.
-        metric (str): The name of the performance metric column to analyze.
-        methods_order (List[str]): The list of method names to include in the test.
-        alpha (float): The significance level for the tests.
+        ... (same as before) ...
+
+    Returns:
+        List[tuple[str, str]]: A list of (method1, method2) tuples
+                               for pairs that are significantly different.
     """
     print(f"--- a. Dependent-Sample Test (Friedman Test for '{metric}') ---")
+    significant_pairs_list: List[tuple[str, str]] = []
 
     try:
         # Define the columns that create a unique "block" for repeated measures.
@@ -72,7 +70,7 @@ def _run_statistical_analysis(
         ]
         if not block_cols:
             print("  > Error: Could not find block columns for Friedman test.")
-            return
+            return significant_pairs_list
 
         # Create a unique block_id for each combination of conditions.
         df = df.copy()
@@ -80,26 +78,17 @@ def _run_statistical_analysis(
             lambda row: '_'.join(row.values.astype(str)), axis=1
         )
 
-        # Pivot the data so each row is a block and each column is a method.
-        # This is WIDE-FORMAT data.
         pivot_df = df.pivot_table(
             index='block_id', columns='method', values=metric
         )
-
-        # The Friedman test requires complete blocks (no missing values for any method).
         pivot_df_clean = pivot_df.dropna()
-
-        # Ensure the methods being tested are present in the cleaned data.
         valid_methods = [m for m in methods_order if m in pivot_df_clean.columns]
 
-        # Check if we have enough data to run the test.
         if pivot_df_clean.shape[0] < 2 or len(valid_methods) < 2:
             print(f"  > Skipping stats: Insufficient data (N_blocks={pivot_df_clean.shape[0]}, N_methods={len(valid_methods)}).")
-            return
+            return significant_pairs_list
 
         print(f"  > Using {pivot_df_clean.shape[0]} complete blocks for {len(valid_methods)} methods.")
-
-        # Prepare the list of data series for the test.
         groups_for_test = [pivot_df_clean[col] for col in valid_methods]
 
         # --- b. Run Friedman Test ---
@@ -111,12 +100,9 @@ def _run_statistical_analysis(
             print("  > No significant overall difference found between methods (p >= alpha).")
         else:
             print("  > Significant difference detected. Running post-hoc (Wilcoxon Signed-Rank)...")
-
-            # Perform pairwise Wilcoxon signed-rank tests for all method pairs.
             p_uncorrected_list = []
             method_pairs = []
 
-            # Iterate over unique pairs of methods.
             for i in range(len(valid_methods)):
                 for j in range(i + 1, len(valid_methods)):
                     method1, method2 = valid_methods[i], valid_methods[j]
@@ -127,7 +113,7 @@ def _run_statistical_analysis(
                     except ValueError:
                         p_uncorrected_list.append(1.0)
 
-            # Apply Holm-Bonferroni correction for multiple comparisons.
+            # Apply Holm-Bonferroni correction
             if p_uncorrected_list:
                 sort_indices = np.argsort(p_uncorrected_list)
                 p_sorted = np.array(p_uncorrected_list)[sort_indices]
@@ -139,30 +125,21 @@ def _run_statistical_analysis(
             else:
                 p_adjusted = []
 
-            # Create the final results matrix.
-            p_adj_matrix = pd.DataFrame(
-                np.ones((len(valid_methods), len(valid_methods))),
-                index=valid_methods, columns=valid_methods
-            )
-            for (method1, method2), p_adj in zip(method_pairs, p_adjusted):
-                p_adj_matrix.loc[method1, method2] = p_adj
-                p_adj_matrix.loc[method2, method1] = p_adj
-
             print("  Significant pairs (p_adj < alpha):")
-            significant_pairs = 0
-            for i in range(len(p_adj_matrix.columns)):
-                for j in range(i + 1, len(p_adj_matrix.columns)):
-                    method1, method2 = p_adj_matrix.columns[i], p_adj_matrix.columns[j]
-                    p_adj = p_adj_matrix.iloc[i, j]
-                    if p_adj < alpha:
-                        print(f"    - {method1} vs. {method2}: p_adj = {p_adj:.4e}")
-                        significant_pairs += 1
+            significant_pairs_count = 0
+            for (method1, method2), p_adj in zip(method_pairs, p_adjusted):
+                if p_adj < alpha:
+                    print(f"    - {method1} vs. {method2}: p_adj = {p_adj:.4e}")
+                    significant_pairs_list.append((method1, method2)) # <-- Add to list
+                    significant_pairs_count += 1
 
-            if significant_pairs == 0:
+            if significant_pairs_count == 0:
                 print("    - None (after p-value correction).")
 
     except (ValueError, AttributeError) as e:
         print(f"  > An error occurred during statistical testing: {e}")
+    
+    return significant_pairs_list # <-- RETURN THE LIST
 
 def _finalize_and_save_plot(
     figure: plt.Figure,
@@ -173,13 +150,6 @@ def _finalize_and_save_plot(
 ) -> None:
     """
     Applies final touches to a plot and saves it to disk.
-
-    Args:
-        figure (plt.Figure): The figure object to finalize.
-        plot_title (str): The title for the plot.
-        filename (str): The filename for the saved plot image.
-        show_plots (bool): If True, display the plot interactively.
-        save_plots (bool): If True, save the plot to the 'plots' directory.
     """
     figure.suptitle(plot_title, fontsize=16, y=1.02)
     plt.tight_layout()
@@ -194,7 +164,7 @@ def _finalize_and_save_plot(
     if show_plots:
         plt.show()
 
-    plt.close(figure) # Close the figure to free up memory.
+    plt.close(figure)
 
 def _remove_outliers(
     df: pd.DataFrame,
@@ -203,17 +173,8 @@ def _remove_outliers(
 ) -> pd.DataFrame:
     """
     Removes outliers from a DataFrame based on the 1.5 IQR rule, applied per group.
-
-    Args:
-        df (pd.DataFrame): The input DataFrame.
-        metric (str): The metric column to check for outliers.
-        group_cols (List[str]): The columns to group by before calculating IQR.
-
-    Returns:
-        pd.DataFrame: A DataFrame with outliers removed.
     """
     if not group_cols:
-        # Handle non-grouped data if necessary, though not used in this script
         q1 = df[metric].quantile(0.25)
         q3 = df[metric].quantile(0.75)
         iqr = q3 - q1
@@ -221,7 +182,6 @@ def _remove_outliers(
         upper_bound = q3 + 1.5 * iqr
         return df[(df[metric] >= lower_bound) & (df[metric] <= upper_bound)]
     
-    # Calculate Q1, Q3, and bounds *per group*
     grouped = df.groupby(group_cols)[metric]
     q1 = grouped.transform('quantile', 0.25)
     q3 = grouped.transform('quantile', 0.75)
@@ -230,7 +190,6 @@ def _remove_outliers(
     lower_bound = q1 - 1.5 * iqr
     upper_bound = q3 + 1.5 * iqr
     
-    # Filter the original dataframe
     filtered_df = df[(df[metric] >= lower_bound) & (df[metric] <= upper_bound)]
     
     return filtered_df
@@ -246,17 +205,28 @@ def _add_strip_and_whisker_elements(
     palette: Dict[str, str],
     show_labels: bool = True,
     ax: Optional[plt.Axes] = None,
-    **kwargs # Allows passing other kwargs (like 'color' from map_dataframe)
+    # --- NEW ARGUMENTS ---
+    stats_dict: Optional[Dict] = None,
+    factor_col_name: Optional[str] = None,
+    # ---
+    **kwargs: Any
 ) -> None:
     """
-    Draws a stripplot and custom whisker lines onto a given Axes.
-    
-    This function contains the shared plotting style.
+    Draws a stripplot, custom whisker lines, and significance
+    brackets onto a given Axes.
     """
     if ax is None:
-        ax = plt.gca() # Get current axes if not provided
+        ax = plt.gca()
+    jitter = kwargs.pop('jitter', 0.1)
 
-    # --- 1. Plot the strip plot with low opacity ---
+    # --- 0. Get significance pairs for this specific facet ---
+    significant_pairs = []
+    if stats_dict and factor_col_name and not data.empty:
+        # Get the name of this facet from the data
+        facet_name = data[factor_col_name].iloc[0]
+        significant_pairs = stats_dict.get(facet_name, [])
+
+    # --- 1. Plot the strip plot ---
     sns.stripplot(
         data=data,
         x=x_col,
@@ -267,44 +237,82 @@ def _add_strip_and_whisker_elements(
         legend=False,
         ax=ax,
         alpha=0.5,
-        jitter=0.1, # Make each strip narrower
+        jitter=jitter,
         zorder=1
     )
     
     # --- 2. Add whisker lines and labels ---
+    stats_df = data.groupby(x_col)[y_col].quantile([0.25, 0.5, 0.75]).unstack().reindex(order)
     if show_labels:
-        # Calculate stats for all methods *in the provided data subset*
-        stats_df = data.groupby(x_col)[y_col].quantile([0.25, 0.5, 0.75]).unstack().reindex(order)
+        line_width = kwargs.get('line_width', 0.8)
+        whisker_width = kwargs.get('whisker_width', 0.7)
         
-        ylim = ax.get_ylim()
-        y_offset = (ylim[1] - ylim[0]) * 0.015
-        line_width = 0.8    # Total width of the median line
-        whisker_width = 0.7 # Total width of the Q1/Q3 whiskers
-        
-        for i, method in enumerate(order): # 'i' is the x-position index
+        for i, method in enumerate(order):
             if method not in stats_df.index:
                 continue
             q1, median, q3 = stats_df.loc[method, 0.25], stats_df.loc[method, 0.5], stats_df.loc[method, 0.75]
             
             if pd.notna(q1) and pd.notna(median) and pd.notna(q3):
-                # --- Get the method's base color ---
-                method_color = palette.get(method, 'black') # Default to black if not found
-                # Create a darker version for the quartiles (l=0.1 is 10% lightness)
+                method_color = palette.get(method, 'black')
                 darker_color = sns.set_hls_values(method_color, l=0.4)
-
                 x_offset = 0.1
-                # --- Draw "box whisker" lines (Shared style) ---
+                
                 ax.hlines(q1, i - whisker_width/2, i + whisker_width/2, color=darker_color, linestyle='--', linewidth=1.5, zorder=10)
                 ax.hlines(q3, i - whisker_width/2, i + whisker_width/2, color=darker_color, linestyle='--', linewidth=1.5, zorder=10)
                 ax.hlines(median, i - whisker_width/2, i + line_width/2 + x_offset, color=darker_color, linestyle='-', linewidth=2, zorder=10)
-
-                # --- Add text labels (Shared style) ---
-                # ax.text(i + whisker_width/2, q3, f'{q3:.1f}', ha='center', va='bottom', fontsize=10, zorder=11)
                 ax.text(i + whisker_width/2 + x_offset, median, f'{median:.1f}', ha='center', va='bottom', fontsize=16, color='black', fontweight='bold', zorder=11)
-                # ax.text(i + whisker_width/2, q1, f'{q1:.1f}', ha='center', va='bottom', fontsize=10, zorder=11)
 
-    # Add grid (can be applied here or outside)
-    # ax.grid(axis='y', linestyle='--', alpha=0.7)
+    # --- 3. Add Significance Brackets ---
+    if significant_pairs:
+        # Get the current top of the plot
+        ylim = ax.get_ylim()
+        y_range = ylim[1] - ylim[0]
+        
+        # Find the highest data point (or whisker) to draw above
+        all_q3s = stats_df[0.75]
+        # Filter for methods present in this plot
+        valid_q3s = all_q3s.reindex(order).dropna()
+        if valid_q3s.empty:
+            max_val = ylim[0] # Failsafe
+        else:
+            max_val = valid_q3s.max()
+            
+        # Add a text label, find its height to adjust
+        # This is a bit of a hack to find the text height
+        temp_text = ax.text(0, max_val, f'{max_val:.1f}', ha='center', va='bottom', fontsize=16, fontweight='bold', zorder=11)
+        text_bbox = temp_text.get_window_extent(ax.figure.canvas.get_renderer())
+        text_height_data_coords = (text_bbox.height / ax.figure.dpi) * (y_range / (ax.get_position().height * ax.figure.get_figheight()))
+        temp_text.remove()
+        
+        # Start drawing brackets above the highest point + text
+        y_step = text_height_data_coords * 1.5 # Height for one bracket
+        current_y_level = max_val + text_height_data_coords * 2.0
+        
+        # Sort pairs by span (narrowest first) to draw them neatly
+        sorted_pairs = sorted(
+            significant_pairs, 
+            key=lambda p: abs(order.index(p[0]) - order.index(p[1]))
+        )
+        
+        for method1, method2 in sorted_pairs:
+            if method1 not in order or method2 not in order:
+                continue
+                
+            x1 = order.index(method1)
+            x2 = order.index(method2)
+            
+            bar_y = current_y_level
+            text_y = bar_y + (y_step * 0.1)
+            
+            # Draw the bracket
+            ax.plot([x1, x1, x2, x2], [bar_y, text_y, text_y, bar_y], lw=1.5, c='black')
+            # Draw the star
+            ax.text((x1 + x2) * 0.5, text_y, '*', ha='center', va='bottom', fontsize=20, fontweight='bold', c='black')
+            
+            current_y_level += y_step # Move up for the next bracket
+        
+        # Update the y-limit to make space for the brackets
+        ax.set_ylim(ylim[0], current_y_level + (y_step * 0.5))
 
 
 def plot_method_performance(
@@ -332,14 +340,13 @@ def plot_method_performance(
         print("Warning: Not enough data or methods to generate plots. Skipping.")
         return
 
-    # --- Create a consistent color map ---
     color_map = {}
     if isinstance(palette, dict):
         color_map = palette
     elif isinstance(palette, str):
         colors = sns.color_palette(palette, n_colors=len(plot_order))
         color_map = dict(zip(plot_order, colors))
-    else: # Default palette
+    else: 
         colors = sns.color_palette(n_colors=len(plot_order))
         color_map = dict(zip(plot_order, colors))
 
@@ -350,12 +357,16 @@ def plot_method_performance(
         
         print(f"\n--- Processing Metric: {metric} (Strip & Whisker Plot) ---")
         
-        _run_statistical_analysis(data, metric, plot_order, alpha=0.05)
+        # --- 1. Run stats and GET the pairs ---
+        sig_pairs = _run_statistical_analysis(data, metric, plot_order, alpha=0.05)
         
-        # Make the figure narrower to reduce space between strips
+        # Create a dummy dict and column for the helper function
+        stats_dict = {'_overall_': sig_pairs}
+        data['_overall_'] = '_overall_' # Dummy column
+        
         fig, ax = plt.subplots(figsize=(6, 8))
         
-        # --- Call the shared plotting helper ---
+        # --- 2. Call the shared plotting helper ---
         _add_strip_and_whisker_elements(
             ax=ax,
             data=data,
@@ -365,36 +376,27 @@ def plot_method_performance(
             order=plot_order,
             palette=color_map,
             show_labels=show_labels,
-            jitter=0.27 # Make each strip narrower
+            jitter=0.27,
+            # --- Pass the stats info ---
+            stats_dict=stats_dict,
+            factor_col_name='_overall_'
         )
-        # --- Finalize plot-specific labels ---
-        ax.set_ylabel(f"{metric.replace('_deg', '')} (Degrees)" if "_deg" in metric else metric)
-        ax.set_xlabel("", fontsize=12) # Note: You are setting an empty x-label
 
-        # --- FIX IS HERE ---
-        # 1. Use 'labelsize' instead of 'fontsize'
-        #    'fontweight' is not valid here and has been removed.
+        # --- 3. Finalize plot-specific labels ---
+        ax.set_ylabel(f"{metric.replace('_deg', '')} (Degrees)" if "_deg" in metric else metric)
+        ax.set_xlabel("", fontsize=12) 
         ax.tick_params(axis='x', rotation=25, labelsize=16)
         ax.tick_params(axis='y', labelsize=16)
-        
-        # 2. To set the fontweight for tick labels, you must do it separately:
-        #    (You'll need to 'import matplotlib.pyplot as plt' at the top of your file)
-        # plt.setp(ax.get_xticklabels(), fontweight='bold')
-        # --- END OF FIX ---
-        
         ax.set_title(f"Overall Method Performance\n{metric}")
 
-        # --- POTENTIAL BUG ---
-        # This line will cut off the top 50% of your data.
-        # ax.set_ylim(0, data[metric].max() * 0.5) 
-        
-        # Did you mean to add 5% padding instead?
-        # Also, you should use 'filtered_data' which you created earlier.
-        ax.set_ylim(0, data[metric].max() * .5)
-        # --- END OF BUG FIX ---
+        # --- REMOVED ylim call: The helper function now sets its own ylim ---
         
         filename = f"overall_performance_{metric.lower()}_strip_whisker.png"
         _finalize_and_save_plot(fig, "", filename, show_plots, save_plots)
+        
+    # Drop the dummy column
+    data.drop(columns=['_overall_'], inplace=True, errors='ignore')
+
 
 def plot_performance_by_factor(
     summary_df: pd.DataFrame,
@@ -428,14 +430,13 @@ def plot_performance_by_factor(
         
     factor_levels = sorted(data[factor].unique())
 
-    # --- Create a consistent color map ---
     color_map = {}
     if isinstance(palette, dict):
         color_map = palette
     elif isinstance(palette, str):
         colors = sns.color_palette(palette, n_colors=len(plot_order))
         color_map = dict(zip(plot_order, colors))
-    else: # Default palette
+    else: 
         colors = sns.color_palette(n_colors=len(plot_order))
         color_map = dict(zip(plot_order, colors))
 
@@ -446,33 +447,34 @@ def plot_performance_by_factor(
 
         print(f"\n--- Processing Metric: {metric} by {factor.title()} (Strip & Whisker Plot) ---")
         
-        # --- Filter outliers per factor and method ---
         original_count = len(data)
         filtered_data =  _remove_outliers(data, metric, group_cols=[factor, 'method'])
         removed_count = original_count - len(filtered_data)
         if removed_count > 0:
             print(f"  > Removed {removed_count} outliers (beyond 1.5 IQR) for '{metric}'.")
 
-        # --- Statistics ---
+        # --- 1. Pre-calculate stats for ALL facets ---
+        stats_results = {}
         for level in factor_levels:
             print(f"\n--- Testing for {factor.title()} = {level} ---")
             level_data = filtered_data[filtered_data[factor] == level]
-            _run_statistical_analysis(level_data, metric, plot_order, alpha=0.05)
+            # Run stats and store the list of significant pairs
+            stats_results[level] = _run_statistical_analysis(level_data, metric, plot_order, alpha=0.05)
         print(f"--- End of Statistical Analysis for {metric} ---")
         
         
-        # --- 1. Create the FacetGrid structure ---
-        col_wrap = min(len(factor_levels), 3)
+        # --- 2. Create the FacetGrid structure ---
+        col_wrap = min(len(factor_levels), 7)
         g = sns.FacetGrid(
             filtered_data,
             col=factor,
             col_wrap=col_wrap,
             height=6,
-            aspect=0.8, # Make each facet narrower
-            sharey=False # Keep y-axes independent
+            aspect=0.8,
+            sharey=False # <-- MUST be False for per-facet brackets
         )
 
-        # --- 2. Map the shared plotting helper to each facet ---
+        # --- 3. Map the shared plotting helper to each facet ---
         g.map_dataframe(
             _add_strip_and_whisker_elements,
             x_col='method',
@@ -481,15 +483,22 @@ def plot_performance_by_factor(
             order=plot_order,
             palette=color_map,
             show_labels=show_labels,
+            line_width=1.3,
+            whisker_width=0.9,
+            jitter=0.15,
+            # --- Pass the full stats dict and factor column name ---
+            stats_dict=stats_results,
+            factor_col_name=factor
         )
         
-        # --- 3. Finalize grid-level labels ---
+        # --- 4. Finalize grid-level labels ---
         g.set_axis_labels(x_var="", y_var=f"{metric.replace('_deg', '')} (Degrees)" if "_deg" in metric else metric)
         g.set_xticklabels(rotation=45, ha='right')
-        g.set_titles(f"{factor.title()}: {{col_name}}")
+        g.set_titles(f"{{col_name}}")
         
-        # Make sure all subplots have the same y axis limits if desired
-        g.set(ylim=(0, filtered_data[metric].max() * 1.1))
+        # --- REMOVED g.set(ylim=...) ---
+        # Each facet now controls its own Y-axis to make room for brackets.
+        
         g.fig.subplots_adjust(wspace=0.1, hspace=1)
         
         fig = g.fig 
@@ -539,17 +548,8 @@ def plot_interaction_heatmap(
 ) -> None:
     """
     Generates heatmaps to analyze performance by an interaction factor.
-    Calculations are based on data with outliers (beyond 1.5 IQR per
-    (factor, method) group) removed.
-    
-    Args:
-        summary_df (pd.DataFrame): DataFrame with performance metrics.
-        metrics (List[str]): List of metric columns to plot.
-        interaction_factor (str): Column name to use for the x-axis.
-        method_order (Optional[List[str]]): Fixed order for methods on y-axis.
-        cmap (str): Colormap for the heatmap.
-        show_plots (bool): If True, display the plot interactively.
-        save_plots (bool): If True, save the plot to disk.
+    (This function does not call the strip/whisker plot helper and
+     is not modified to include brackets).
     """
     print(f"\n--- Generating Interaction Heatmaps for Method vs. {interaction_factor.title()} ---")
     data = summary_df.reset_index()
@@ -574,15 +574,13 @@ def plot_interaction_heatmap(
             continue
         print(f"\n--- Processing Metric: {metric} ---")
 
-        # --- NEW: Filter outliers per interaction_factor and method ---
         original_count = len(data)
         filtered_data = _remove_outliers(data, metric, group_cols=[interaction_factor, 'method'])
         removed_count = original_count - len(filtered_data)
         if removed_count > 0:
             print(f"  > Removed {removed_count} outliers (beyond 1.5 IQR) for '{metric}'.")
-        # --- END NEW ---
 
-        # --- Statistics now run unconditionally (on filtered data) ---
+        # --- Statistics are still run and printed to console ---
         factor_levels = sorted(filtered_data[interaction_factor].unique())
         for level in factor_levels:
             print(f"\n--- Testing for {interaction_factor.title()} = {level} ---")
@@ -591,7 +589,6 @@ def plot_interaction_heatmap(
         print(f"--- End of Statistical Analysis for {metric} ---")
 
         try:
-            # Calculate mean for heatmap from filtered data
             heatmap_data = filtered_data.groupby(['method', interaction_factor])[metric].mean().unstack()
             heatmap_data = heatmap_data.reindex(y_axis_order)
             heatmap_data = heatmap_data.reindex(sorted(heatmap_data.columns), axis=1)
@@ -619,16 +616,28 @@ def main():
     """
     Main function to load data and generate all plots and analyses.
     """
+    # --- Set Global Matplotlib Font Settings ---
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial'],
+        'font.weight': 'light',
+        'axes.labelweight': 'black',
+        'axes.titleweight': 'black',
+        'axes.titlesize': 16,
+        'axes.labelsize': 16,
+        'xtick.labelsize': 16,
+        'ytick.labelsize': 16,
+        'legend.fontsize': 14,
+    })
+    
     # --- 1. Configuration ---
     DATA_FILE_PATH = os.path.join("data", "data", "all_subject_statistics.pkl")
     PLOTS_DIRECTORY = "plots"
     
-    # Plotting settings
     SHOW_PLOTS = True
     SAVE_PLOTS = True
 
-    # Define the metrics and methods to analyze.
-    METRICS_TO_PLOT = ['RMSE_deg'] # Reduced for quicker demo
+    METRICS_TO_PLOT = ['STD_deg', 'RMSE_deg'] 
     METHODS_IN_ORDER = [
         'EKF',
         'Madgwick (Al Borno)',
@@ -637,33 +646,9 @@ def main():
         'Cascade',
     ]
 
-    # --- Set Global Matplotlib Font Settings ---
-    # Use a clean, common, bold sans-serif font for all plots
-    plt.rcParams.update({
-        'font.family': 'sans-serif',
-        # ---
-        # NOTE: You can change 'Arial' to your preferred font.
-        # Matplotlib will fall back through the list if 'Arial' isn't found.
-        # ---
-        'font.sans-serif': ['Helvetica'],
-        
-        # Set all font weights to bold
-        'font.weight': 'light',
-        'axes.labelweight': 'heavy',
-        'axes.titleweight': 'heavy',
-        
-        # Set default sizes
-        'axes.titlesize': 16,
-        'axes.labelsize': 16,
-        'xtick.labelsize': 16,
-        'ytick.labelsize': 16,
-        'legend.fontsize': 14,
-    })
-    
     # --- 2. Load Data ---
     if not os.path.exists(DATA_FILE_PATH):
         print(f"Error: Statistics file not found at {DATA_FILE_PATH}")
-        # Create a dummy dataframe for demonstration purposes if file not found
         print("Creating a dummy dataframe for demonstration.")
         num_entries = 200
         data = {
@@ -693,31 +678,13 @@ def main():
         show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
     )
     
-    # # --- 4. Generate Performance Plots Faceted by Various Factors ---
-    # plot_performance_by_factor(
-    #     summary_df=summary_stats_df, factor='trial_type', metrics=METRICS_TO_PLOT,
-    #     method_order=METHODS_IN_ORDER, palette="Set2",
-    #     show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
-    # )
-    
+    # --- 4. Generate Performance Plots Faceted by Various Factors ---
     plot_performance_by_factor(
         summary_df=summary_stats_df, factor='joint_name', metrics=METRICS_TO_PLOT,
         method_order=METHODS_IN_ORDER, palette="Set2",
         show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
     )
-
-    # plot_performance_by_factor(
-    #     summary_df=summary_stats_df, factor='axis', metrics=METRICS_TO_PLOT,
-    #     method_order=METHODS_IN_ORDER, palette="Set2",
-    #     show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
-    # )
     
-    # plot_performance_by_joint_and_axis(
-    #     summary_df=summary_stats_df, metrics=METRICS_TO_PLOT,
-    #     method_order=METHODS_IN_ORDER, palette="Set2",
-    #     show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
-    # )
-
     # --- 5. Generate Interaction Heatmaps for various factors ---
     interaction_factors = ['joint_name', 'trial_type']
     for factor in interaction_factors:
