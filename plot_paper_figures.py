@@ -675,29 +675,147 @@ def plot_interaction_heatmap(
                 valid_factor_order = [f for f in factor_order if f in heatmap_data.columns]
                 heatmap_data = heatmap_data.reindex(valid_factor_order, axis=1)
                 heatmap_data = heatmap_data.reindex(['EKF', 'Cascade'], axis=0)
+                heatmap_data = heatmap_data.T
             else:
                 # Default to alphabetical sorting if no order is given
                 heatmap_data = heatmap_data.reindex(sorted(heatmap_data.columns), axis=1)
             # --- END: MODIFIED LOGIC ---
 
-            fig_width = len(heatmap_data.columns) * 1.0
+            fig_width = len(heatmap_data.columns) * 2
             fig_height = len(heatmap_data.index) * 1.2
             fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
             y_label_cbar = f"Mean {metric.replace('_deg', '')}\n(Degrees)" if "_deg" in metric else f"Mean {metric}"
-            sns.heatmap(heatmap_data, annot=True, fmt=".2f", cmap=cmap, linewidths=.5, cbar_kws={'label': y_label_cbar}, ax=ax)
+            sns.heatmap(heatmap_data, annot=True, fmt=".2f", cmap=cmap, linewidths=.5, cbar=False, ax=ax)
             
-            ax.set_ylabel("", fontsize=12)
-            ax.set_yticklabels(['Traditional', 'Proposed'], rotation=0, fontsize=16)
-            ax.set_xlabel("", fontsize=12)
+            ax.yaxis.tick_right()
+            ax.set_ylabel("", fontsize=16)
+            ax.set_xticklabels(['Traditional', 'Proposed'], rotation=20, fontsize=16)
+            ax.set_xlabel("", fontsize=16)
 
-            ax.set_xticklabels(['Lumbar', 'Right Hip', 'Left Hip', 'Right Knee', 'Left Knee', 'Right Ankle', 'Left Ankle'], rotation=30, ha='right', fontsize=16)
+            ax.set_yticklabels(['Lumbar', 'Right Hip', 'Left Hip', 'Right Knee', 'Left Knee', 'Right Ankle', 'Left Ankle'], rotation=0, ha='left', fontsize=20)
 
             plot_title = f""
             filename = f"interaction_heatmap_{metric.lower()}_vs_{interaction_factor.lower()}.png"
             _finalize_and_save_plot(fig, plot_title, filename, show_plots, save_plots)
         except Exception as e:
             print(f"    Error plotting heatmap for {metric}: {e}")
+            plt.close()
+
+def plot_metric_barchart(
+    summary_df: pd.DataFrame,
+    metric: str,
+    y_factor: str,
+    y_order: Optional[List[str]] = None,
+    palette: str = 'muted',
+    show_plots: bool = False,
+    save_plots: bool = True
+) -> None:
+    """
+    Generates a sideways bar chart showing the mean and 95% CI of a metric
+    broken down by a categorical factor (e.g., 'joint').
+
+    Args:
+        summary_df: DataFrame containing the raw data.
+        metric: The numerical metric to plot on the x-axis.
+        y_factor: The categorical factor to plot on the y-axis (e.g., 'joint').
+        y_order: Optional specific order for the y-axis categories.
+        palette: Seaborn color palette to use.
+        show_plots: If True, display the plot interactively.
+        save_plots: If True, save the plot to a file.
+    """
+    print(f"\n--- Generating Bar Chart for {metric} by {y_factor.title()} ---")
+    data = summary_df.copy()
+    data.reset_index(inplace=True)
+    print(data['joint_name'].unique())
+    # --- Validate Input ---
+    if metric not in data.columns:
+        print(f"Error: Metric '{metric}' not found. Skipping.")
+        return
+    if y_factor not in data.columns:
+        print(f"Error: Factor '{y_factor}' not found. Skipping.")
+        return
+
+    # --- Process Data ---
+    print(f"\n--- Processing Metric: {metric} ---")
+    original_count = len(data)
+    filtered_data = data #_remove_outliers(data, metric, group_cols=[y_factor])
+    removed_count = original_count - len(filtered_data)
+    if removed_count > 0:
+        print(f"  > Removed {removed_count} outliers (beyond 1.5 IQR) for '{metric}'.")
+
+    # Determine y-axis order
+    if y_order:
+        # Filter data to only include items in y_order
+        filtered_data = filtered_data[filtered_data[y_factor].isin(y_order)]
+        # Use the provided order
+        y_axis_order = [f for f in y_order if f in filtered_data[y_factor].unique()]
+        x_axis_order = ['Cascade', 'EKF']
+    else:
+        # Default to sorted unique values
+        y_axis_order = sorted(filtered_data[y_factor].unique())
+    if filtered_data.empty or len(y_axis_order) == 0:
+        print("Warning: No data left to plot after filtering. Skipping.")
+        return
+    
+    # Drop all method columns except 'EKF' and 'Cascade' for clarity
+    filtered_data = filtered_data[filtered_data['method'].isin(['EKF', 'Cascade'])]
+    # Rename EKF to Traditional and Cascade to Proposed
+    filtered_data['method'] = filtered_data['method'].replace({'EKF': 'Traditional', 'Cascade': 'Proposed'})
+    colors = sns.color_palette(palette, n_colors=2)
+    # --- Create Plot ---
+    try:
+        # Set up figure size
+        # Adjust height based on the number of categories
+        fig_height = max(5, len(y_axis_order) * 0.6)
+        fig, ax = plt.subplots(figsize=(3, 5))
+
+        # Create the sideways bar plot
+        sns.barplot(
+            data=filtered_data,
+            x=metric,
+            y=y_factor,
+            # 🚨 KEY CHANGE: Add the 'method' column as the hue variable
+            hue='method',
+            order=y_axis_order,
+            palette=[colors[1], colors[0]], # Proposed first, Traditional second
+            orient='h',
+            errorbar=('ci', 95), # Show 95% Confidence Interval
+            capsize=0.1,
+            errwidth=1.5,
+            ax=ax,
+            legend=False
+        )
+
+        # --- Style Plot ---
+        # Format x-axis label based on metric name
+        x_label = f"Mean {metric.replace('_deg', '')}\n(Degrees)" if "_deg" in metric else f"Mean {metric}"
+        ax.set_xlabel(x_label, fontsize=16)
+        ax.set_ylabel("", fontsize=14)
+        ax.yaxis.tick_right()
+        ax.set_yticklabels(['Lumbar', 'Left Hip', 'Right Hip', 'Left Knee', 'Right Knee', 'Left Ankle', 'Right Ankle'])
+        ax.invert_xaxis()
+
+        # Improve readability
+        # ax.grid(axis='x', linestyle='--', alpha=0.7)
+        ax.tick_params(axis='y', labelsize=16)
+        ax.tick_params(axis='x', labelsize=12)
+        sns.despine(trim=True)
+
+        ax.spines['left'].set_visible(False)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+        # --- Finalize ---
+        plot_title = f"Mean {metric.title()} by {y_factor.title()} (with 95% CI)"
+        filename = f"barchart_{metric.lower()}_by_{y_factor.lower()}.png"
+        _finalize_and_save_plot(fig, plot_title, filename, show_plots, save_plots)
+
+    except Exception as e:
+        print(f"    Error plotting bar chart for {metric}: {e}")
+        if 'fig' in locals():
+            plt.close(fig) # Close the figure if it was created
+        else:
             plt.close()
 
 # --- Main Execution ---
@@ -780,12 +898,12 @@ def main():
 
     # --- 3. Generate Overall Performance Plots (Strip + Whisker) ---
     # --- MODIFIED ---
-    plot_method_performance(
-        summary_df=summary_stats_df, metrics=METRICS_TO_PLOT,
-        plot_type=PLOT_STYLE, # <-- Pass the style
-        method_order=METHODS_IN_ORDER, palette="Set2",
-        show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
-    )
+    # plot_method_performance(
+    #     summary_df=summary_stats_df, metrics=METRICS_TO_PLOT,
+    #     plot_type=PLOT_STYLE, # <-- Pass the style
+    #     method_order=METHODS_IN_ORDER, palette="Set2",
+    #     show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
+    # )
     
     # # --- 4. Generate Performance Plots Faceted by Various Factors ---
     # # --- MODIFIED ---
@@ -796,26 +914,51 @@ def main():
     #     show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
     # )
     
-    # --- 5. Generate Interaction Heatmaps for various factors ---
-    FACTOR_ORDERS = {
-            'joint_name': ['Lumbar', 'R_Hip', 'L_Hip', 'R_Knee', 'L_Knee', 'R_Ankle', 'L_Ankle'], # <-- DEFINE YOUR CUSTOM ORDER HERE
-            # 'trial_type': ['Slow', 'Medium', 'Fast']
-            # Add any other factor orders you might need
-        }
+    # # --- 5. Generate Interaction Heatmaps for various factors ---
+    # FACTOR_ORDERS = {
+    #         'joint_name': ['Lumbar', 'R_Hip', 'L_Hip', 'R_Knee', 'L_Knee', 'R_Ankle', 'L_Ankle'], # <-- DEFINE YOUR CUSTOM ORDER HERE
+    #         # 'trial_type': ['Slow', 'Medium', 'Fast']
+    #         # Add any other factor orders you might need
+    #     }
     
-    interaction_factors = ['joint_name']
-    for factor in interaction_factors:
+    # interaction_factors = ['joint_name']
+    # for factor in interaction_factors:
         
-        # Get the custom order for this factor, or None if not defined
-        custom_factor_order = FACTOR_ORDERS.get(factor)
+    #     # Get the custom order for this factor, or None if not defined
+    #     custom_factor_order = FACTOR_ORDERS.get(factor)
         
-        plot_interaction_heatmap(
-            summary_df=summary_stats_df, metrics=METRICS_TO_PLOT,
-            interaction_factor=factor, 
-            method_order=METHODS_IN_ORDER,
-            factor_order=custom_factor_order, # <-- PASS THE NEW ARGUMENT
-            cmap='Reds', show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
-        )
+    #     plot_interaction_heatmap(
+    #         summary_df=summary_stats_df, metrics=METRICS_TO_PLOT,
+    #         interaction_factor=factor, 
+    #         method_order=METHODS_IN_ORDER,
+    #         factor_order=custom_factor_order, # <-- PASS THE NEW ARGUMENT
+    #         cmap='Reds', show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
+    #     )
+
+        # 2. Define a custom order for joints
+    custom_joint_order = [
+        'Lumbar',
+        'L_Hip',
+        'R_Hip',
+        'L_Knee',
+        'R_Knee',
+        'L_Ankle',
+        'R_Ankle'
+    ]
+
+    # 3. Call the function
+    # This will save 'barchart_rmse_deg_by_joint.png'
+    # and 'barchart_other_metric_by_joint.png' in the script's directory.
+    # Set show_plots=True to see them pop up.
+    plot_metric_barchart(
+        summary_df=summary_stats_df,
+        metric='RMSE_deg',
+        y_factor='joint_name',
+        y_order=custom_joint_order,
+        palette="Set2",
+        show_plots=False, # Set to True to see the plot
+        save_plots=True
+    )
 
     print("\n--- All plotting complete ---")
 
