@@ -3,7 +3,7 @@ from typing import List, Tuple, Dict, Any
 import numpy as np
 from scipy.spatial.transform import Rotation
 from src.toolchest.PlateTrial import PlateTrial
-from src.RelativeFilter import RelativeFilter
+from src.RelativeFilterPlus import RelativeFilter
 from src.toolchest.AHRSFilter import AHRSFilter
 
 JOINT_SEGMENT_DICT = {'R_Hip': ('pelvis_imu', 'femur_r_imu'),
@@ -111,7 +111,9 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
         List[np.ndarray]: A list of joint orientation matrices.
     """
     # Create the filter structure
-    joint_filter = RelativeFilter(gyro_std=np.ones(3) * gyro_std, acc_std=np.ones(3) * acc_std, mag_std=np.ones(3) * mag_std)
+    joint_filter = RelativeFilter(gyro_std_parent=np.ones(3) * gyro_std, gyro_std_child=np.ones(3) * gyro_std,
+                                  sensor_stds_parent=[np.ones(3) * acc_std, np.ones(3) * mag_std],
+                                  sensor_stds_child=[np.ones(3) * acc_std, np.ones(3) * mag_std])
     joint_filter.set_qs(Rotation.from_matrix(parent_trial.world_trace.rotations[0]), Rotation.from_matrix(child_trial.world_trace.rotations[0]))
     dt = parent_trial.imu_trace.timestamps[1] - parent_trial.imu_trace.timestamps[0]
     R_pc = []
@@ -156,8 +158,8 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
         raise ValueError(f"Unknown condition '{condition}' specified for joint orientation estimation.")
     for t in range(len(parent_trial)):
         joint_filter.update(parent_trial.imu_trace.gyro[t], child_trial.imu_trace.gyro[t],
-                            parent_trial.imu_trace.acc[t], child_trial.imu_trace.acc[t],
-                            parent_trial.imu_trace.mag[t], child_trial.imu_trace.mag[t], dt)
+                            [parent_trial.imu_trace.acc[t], child_trial.imu_trace.acc[t]],
+                            [parent_trial.imu_trace.mag[t], child_trial.imu_trace.mag[t]], dt)
 
         # Store the joint orientation
         R_pc.append(joint_filter.get_R_pc())
@@ -245,8 +247,7 @@ if __name__ == "__main__":
                 print(f"Loaded {len(plate_trials)} plate trials.")
                 print(f"Identified segments: {[plate.name for plate in plate_trials]}")
                 
-                
-                for condition in ['marker', 'ekf', 'mahony', 'madgwick', 'mag free', 'unprojected', 'never project', 'cascade']:
+                for condition in ['cascade']:
                     output_dir = subject_activity_folder
                     if not os.path.exists(output_dir):
                         os.makedirs(output_dir)

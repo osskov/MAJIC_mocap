@@ -7,6 +7,7 @@ import matplotlib.patches as mpatches
 import matplotlib.lines as mlines
 import numpy as np
 import sys
+import seaborn as sns
 
 # Set print options for floats to 3 significant figures
 np.set_printoptions(formatter={'float': lambda x: "%.3g" % x})
@@ -39,11 +40,17 @@ def load_and_process_imu_data(subject_num: str, trial_type: str, max_frames: int
         
         for trial_name, imu_trace in imu_traces_in_global_frame.items():
             acc = np.array(imu_trace.acc)
+            acc_magnitude = np.linalg.norm(acc, axis=1)
             mag = np.array(imu_trace.mag)
+            mag_magnitude = np.linalg.norm(mag, axis=1)
             mean_acc = np.mean(acc, axis=0)
             mean_mag = np.mean(mag, axis=0)
             std_acc = np.std(acc, axis=0)  # <-- Intra-trial std
             std_mag = np.std(mag, axis=0)  # <-- Intra-trial std
+            acc_magnitude_mean = np.mean(acc_magnitude)
+            mag_magnitude_mean = np.mean(mag_magnitude)
+            acc_magnitude_std = np.std(acc_magnitude)
+            mag_magnitude_std = np.std(mag_magnitude)
             
             # Print the data as before
             print(f"Trial: {trial_name} | Acceleration: {mean_acc} ± {std_acc} m/s² | Magnetometer: {mean_mag} ± {std_mag} µT")
@@ -67,6 +74,11 @@ def load_and_process_imu_data(subject_num: str, trial_type: str, max_frames: int
                 "mag_x_std": std_mag[0],
                 "mag_y_std": std_mag[1],
                 "mag_z_std": std_mag[2],
+                # --- Store the vector magnitudes ---
+                "acc_magnitude": acc_magnitude_mean,
+                "acc_magnitude_std": acc_magnitude_std,
+                "mag_magnitude": mag_magnitude_mean,
+                "mag_magnitude_std": mag_magnitude_std,
             })
         
         return results
@@ -362,8 +374,8 @@ def plot_pooled_data(df: pd.DataFrame):
         trial_fills[trial_types[1]] = 'full' # e.g., 'walking' = solid
 
     # 3. Create the 6 subplots (3 rows, 2 columns)
-    fig, axes = plt.subplots(3, 2, figsize=(18, 24), sharex=True)
-    fig.suptitle('Pooled IMU Measurements by Segment\n(Dot = Pooled Mean, Whisker = Pooled Total Std Dev)', fontsize=16)
+    fig, axes = plt.subplots(3, 2, figsize=(6, 12), sharex=True)
+    fig.suptitle('Mean and Standard Deviation of Sensor Measurements', fontsize=16)
     
     ax_list = axes.flatten()
     
@@ -476,11 +488,188 @@ def plot_pooled_data(df: pd.DataFrame):
 
     # 6. Create Custom Legends
     
-    # Color (Segment) legend
-    segment_patches = [mpatches.Patch(color=color, label=segment) 
-                       for segment, color in segment_colors.items()]
-    fig.legend(handles=segment_patches, title='Body Segment (Color)', 
-               bbox_to_anchor=(0.15, 0.75), loc='upper right', frameon=True)
+    # # Color (Segment) legend
+    # segment_patches = [mpatches.Patch(color=color, label=segment) 
+    #                    for segment, color in segment_colors.items()]
+    # fig.legend(handles=segment_patches, title='Body Segment (Color)', 
+    #            bbox_to_anchor=(0.15, 0.75), loc='upper right', frameon=True)
+    
+    # Trial Type (Fill) Legend (Only if we have trials)
+    # if n_trials > 1:
+    #     trial_lines = [mlines.Line2D([], [], color='gray', marker='o', linestyle='None',
+    #                                 markersize=10, label=trial, fillstyle=fill,
+    #                                 markeredgecolor='gray')
+    #                    for trial, fill in trial_fills.items()]
+    #     fig.legend(handles=trial_lines, title='Trial Type (Fill)',
+    #                bbox_to_anchor=(0.15, 0.45), loc='upper right', frameon=True)
+    
+    plt.tight_layout(rect=[0.15, 0, 1.0, 0.95])
+
+def plot_pooled_magnitudes(df: pd.DataFrame):
+    """
+    Generates 2 dot-and-whisker plots (one for each magnitude of acc/mag)
+    from a POOLED DataFrame. All dots are the same color.
+    
+    In each plot:
+    - X-axis: Body Segment (in a specific order)
+    - Y-axis: Measurement
+    - Dot: Pooled Mean value
+    - Whisker: Pooled Total Std Dev.
+    - Color: Constant (e.g., 'C0')
+    - Fill (Marker Fill): Determined by Trial Type (if 'trial_type' is a column)
+    """
+    
+    print("Plotting pooled magnitude data...")
+
+    # 1. Setup and Detect Groupings
+    
+    # CRITICAL: Reset index to turn 'segment' and 'trial_type' into columns
+    df_plot = df.reset_index()
+
+    segment_order = [
+        'torso_imu', 'pelvis_imu', 
+        'femur_r_imu', 'femur_l_imu', 
+        'tibia_r_imu', 'tibia_l_imu', 
+        'calcn_r_imu', 'calcn_l_imu'
+    ]
+    
+    # Filter dataframe to only include segments in our desired list
+    df_plot = df_plot[df_plot['segment'].isin(segment_order)].copy()
+    
+    # Automatically detect if we are plotting by trial_type
+    if 'trial_type' in df_plot.columns:
+        trial_types = sorted(df_plot['trial_type'].unique())
+    else:
+        trial_types = []
+    
+    n_segments = len(segment_order)
+    n_trials = len(trial_types)
+    
+    print(f"Generating plots for {n_segments} segments.")
+    if n_trials > 0:
+        print(f"Plot will be dodged by {n_trials} trial types.")
+
+    # 2. Create Mappings
+    
+    # Fill map for Trial Types
+    trial_fills = {trial: 'full' for trial in trial_types}
+    if n_trials > 1:
+        trial_fills[trial_types[0]] = 'none' # e.g., 'complexTasks' = hollow
+        trial_fills[trial_types[1]] = 'full' # e.g., 'walking' = solid
+
+    # 3. Create the 2 subplots (2 rows, 1 column)
+    fig, axes = plt.subplots(1, 2, figsize=(8, 3), sharex=True)
+    fig.suptitle('Mean and Standard Deviation of Sensor Magnitudes', fontsize=16)
+    
+    ax_list = axes.flatten()
+    
+    # Define what to plot in each subplot
+    plot_specs = [
+        {'col_mean': 'acc_magnitude_mean', 'col_std': 'acc_magnitude_std', 'title': 'Acceleration Magnitude', 'ylabel': 'm/s²'},
+        {'col_mean': 'mag_magnitude_mean', 'col_std': 'mag_magnitude_std', 'title': 'Magnetometer Magnitude', 'ylabel': 'µT'},
+    ]
+
+    # 4. Main Plotting Loop
+    
+    # Calculate horizontal dodge positions
+    if n_trials > 1:
+        dodge = np.linspace(-0.2, 0.2, n_trials)
+    else:
+        dodge = [0]
+
+    colors_list = sns.color_palette(n_colors=6)
+    colors = colors_list[4:]
+    
+    for ax, spec in zip(ax_list, plot_specs):
+        color = colors[0]  # Constant color for all dots
+        for i_seg, segment in enumerate(segment_order):
+            
+            # Get all data for this segment
+            segment_data = df_plot[df_plot['segment'] == segment]
+            
+            if segment_data.empty:
+                continue
+
+            # Case 1: No trial types, plot one dot
+            if n_trials <= 1:
+                x_pos = i_seg
+                data = segment_data.iloc[0] # Should only be one row
+                fillstyle = 'full'
+                
+                ax.errorbar(
+                    x=x_pos,
+                    y=data[spec['col_mean']],
+                    yerr=data[spec['col_std']],
+                    marker='o',
+                    color=colors[0],
+                    fillstyle=fillstyle,
+                    linestyle='none',
+                    capsize=5,
+                    markersize=10,
+                    alpha=0.8,
+                )
+            
+            # Case 2: Plot dodged dots for each trial type
+            else:
+                for i_trial, trial_type in enumerate(trial_types):
+                    x_pos = i_seg + dodge[i_trial]
+                    
+                    # Find the single row for this segment/trial
+                    data_row = segment_data[segment_data['trial_type'] == trial_type]
+                    
+                    if data_row.empty:
+                        continue
+                        
+                    data = data_row.iloc[0] # Get the series
+                    mean_val = data[spec['col_mean']]
+                    std_val = data[spec['col_std']]
+                    
+                    color = 'C0' # Use constant color
+                    fillstyle = trial_fills[trial_type]
+                    
+                    ax.errorbar(
+                        x=x_pos,
+                        y=mean_val,
+                        yerr=std_val,
+                        marker='o',
+                        color=colors[1],
+                        fillstyle=fillstyle,
+                        linestyle='none',
+                        capsize=5,
+                        markersize=10,
+                        alpha=0.8,
+                        markeredgecolor=color,
+                    )
+        color = colors[1]  # Switch color for next dot (if any)
+        
+        # 5. Configure Axes
+        ax.set_title(spec['title'])
+        ax.set_ylabel(spec['ylabel'])
+        
+        # Set x-ticks only for the bottom plot
+        if ax == axes[1]: # If in the last row
+            ax.set_xticks(range(n_segments))
+            ax.set_xticklabels(segment_order, rotation=45, ha='right')
+        
+        ax.grid(axis='y', linestyle='--', alpha=0.6)
+        ax.set_xlim(-0.5, n_segments - 0.5)
+
+        # Auto-adjust Y-axis for all plots
+        data_means = df_plot[spec['col_mean']]
+        data_stds = df_plot[spec['col_std']]
+        
+        valid_data = ~data_means.isna() & ~data_stds.isna()
+        if valid_data.any():
+            plot_min = (data_means[valid_data] - data_stds[valid_data]).min()
+            plot_max = (data_means[valid_data] + data_stds[valid_data]).max()
+            
+            padding = (plot_max - plot_min) * 0.1
+            if padding == 0: padding = 0.1 
+            
+            # Magnitudes can't be negative, so set min to 0 or 
+            ax.set_ylim(max(0, plot_min - padding), plot_max + padding)
+
+    # 6. Create Custom Legends
     
     # Trial Type (Fill) Legend (Only if we have trials)
     if n_trials > 1:
@@ -493,9 +682,188 @@ def plot_pooled_data(df: pd.DataFrame):
     
     plt.tight_layout(rect=[0.15, 0, 1.0, 0.95])
 
+def plot_pooled_magnitudes_twin_ax(df: pd.DataFrame):
+    """
+    Generates 1 dot-and-whisker plot with two y-axes for
+    acc and mag magnitudes from a POOLED DataFrame.
+    
+    - ax1 (Left): Acceleration (5th sns color)
+    - ax2 (Right): Magnetometer (6th sns color)
+    - Dots are smaller.
+    - Top spines are hidden.
+    """
+    
+    print("Plotting pooled magnitude data on twin axes...")
+
+    plt.rcParams['font.family'] = 'sans-serif'
+    plt.rcParams['font.sans-serif'] = ['Arial']
+    # 1. Setup and Detect Groupings
+    df_plot = df.reset_index()
+
+    segment_order = [
+        'torso_imu', 'pelvis_imu', 
+        'femur_r_imu', 'femur_l_imu', 
+        'tibia_r_imu', 'tibia_l_imu', 
+        'calcn_r_imu', 'calcn_l_imu'
+    ]
+    
+    df_plot = df_plot[df_plot['segment'].isin(segment_order)].copy()
+    
+    if 'trial_type' in df_plot.columns:
+        trial_types = sorted(df_plot['trial_type'].unique())
+    else:
+        trial_types = []
+    
+    n_segments = len(segment_order)
+    n_trials = len(trial_types)
+
+    # 2. Create Mappings
+    
+    # Get 5th and 6th colors
+    colors_list = sns.color_palette(n_colors=10)
+    acc_color = colors_list[4]  # 5th color
+    mag_color = colors_list[8]  # 6th color
+    
+    # Fill map for Trial Types
+    trial_fills = {trial: 'full' for trial in trial_types}
+    if n_trials > 1:
+        trial_fills[trial_types[0]] = 'none' 
+        trial_fills[trial_types[1]] = 'full' 
+
+    # 3. Create the 1 subplot and twin axis
+    fig, ax1 = plt.subplots(1, 1, figsize=(7, 3.5))
+    # fig.suptitle('Mean and Standard Deviation of Sensor Magnitudes', fontsize=16)
+    
+    # Create the second y-axis sharing the same x-axis
+    ax2 = ax1.twinx()
+    
+    # Define specs for clarity
+    acc_spec = {'col_mean': 'acc_magnitude_mean', 'col_std': 'acc_magnitude_std', 'ylabel': 'Acceleration\nm/s²'}
+    mag_spec = {'col_mean': 'mag_magnitude_mean', 'col_std': 'mag_magnitude_std', 'ylabel': 'µT\nMagnetometer'}
+
+    # 4. Main Plotting Loop
+    
+    if n_trials > 1:
+        dodge = np.linspace(-0.2, 0.2, n_trials)
+    else:
+        dodge = [0]
+    
+    # Loop by segment, then plot on both axes
+    for i_seg, segment in enumerate(segment_order):
+        segment_data = df_plot[df_plot['segment'] == segment]
+        if segment_data.empty:
+            continue
+
+        # Case 1: No trial types, plot one dot
+        if n_trials <= 1:
+            x_pos = i_seg - 0.15
+            data = segment_data.iloc[0]
+            fillstyle = 'full'
+            
+            # --- Plot on ax1 (ACC) ---
+            ax1.errorbar(
+                x=x_pos, y=data[acc_spec['col_mean']], yerr=data[acc_spec['col_std']],
+                marker='o', color=acc_color, fillstyle=fillstyle, linestyle='none',
+                capsize=5, markersize=8, alpha=0.8, markeredgecolor=acc_color
+            )
+            
+            x_pos += 0.3
+            # --- Plot on ax2 (MAG) ---
+            ax2.errorbar(
+                x=x_pos, y=data[mag_spec['col_mean']], yerr=data[mag_spec['col_std']],
+                marker='o', color=mag_color, fillstyle=fillstyle, linestyle='none',
+                capsize=5, markersize=8, alpha=0.8, markeredgecolor=mag_color
+            )
+        
+        # Case 2: Plot dodged dots for each trial type
+        else:
+            for i_trial, trial_type in enumerate(trial_types):
+                x_pos = i_seg + dodge[i_trial]
+                data_row = segment_data[segment_data['trial_type'] == trial_type]
+                
+                if data_row.empty:
+                    continue
+                    
+                data = data_row.iloc[0]
+                fillstyle = trial_fills[trial_type]
+                
+                # --- Plot on ax1 (ACC) ---
+                ax1.errorbar(
+                    x=x_pos, y=data[acc_spec['col_mean']], yerr=data[acc_spec['col_std']],
+                    marker='o', color=acc_color, fillstyle=fillstyle, linestyle='none',
+                    capsize=5, markersize=8, alpha=0.8, markeredgecolor=acc_color
+                )
+                
+                # --- Plot on ax2 (MAG) ---
+                ax2.errorbar(
+                    x=x_pos, y=data[mag_spec['col_mean']], yerr=data[mag_spec['col_std']],
+                    marker='o', color=mag_color, fillstyle=fillstyle, linestyle='none',
+                    capsize=5, markersize=8, alpha=0.8, markeredgecolor=mag_color
+                )
+
+    # 5. Configure Axes
+    segment_order = ["Torso", "Pelvis", "R Femur", "L Femur", 
+                     "R Tibia", "L Tibia", "R Foot", "L Foot"]
+    # X-Axis (configure on ax1, it's shared)
+    ax1.set_xlim(-0.5, n_segments - 0.5)
+    ax1.set_xticks(range(n_segments))
+    ax1.set_xticklabels(segment_order, rotation=30, ha='left', fontsize=16)
+    # ax1.set_xlabel('Body Segment')
+
+    # Y-Axes (configure separately)
+    ax1.set_ylabel(acc_spec['ylabel'], fontweight='bold', fontsize=16)
+    ax2.set_ylabel(mag_spec['ylabel'], fontweight='bold', fontsize=16)
+
+    # Set y-tick colors
+    ax1.tick_params(axis='y', labelcolor=acc_color, labelsize=10)
+    ax2.tick_params(axis='y', labelcolor=mag_color, labelsize=10)
+    ax1.xaxis.set_label_position('top')
+    ax1.xaxis.tick_top()
+    # Spines
+    ax1.spines['top'].set_visible(False)
+    ax2.spines['top'].set_visible(False)
+    ax1.spines['right'].set_visible(False) # Hide original right spine
+    ax2.spines['left'].set_visible(False)  # Hide original left spine
+    ax1.spines['left'].set_visible(False)  # Hide left spine of ax1 for cleaner look
+    ax2.spines['right'].set_visible(False) # Hide right spine of ax2 for cleaner look
+    ax1.spines['bottom'].set_visible(False) # Hide bottom spine for cleaner look
+    ax2.spines['bottom'].set_visible(False) # Hide bottom spine for cleaner look
+
+    # Grid (only for ax1 to avoid clutter)
+    # ax1.grid(axis='y', linestyle='--', alpha=0.6)
+
+    # Auto-adjust Y-axis limits for BOTH axes
+    for ax, spec in [(ax1, acc_spec), (ax2, mag_spec)]:
+        data_means = df_plot[spec['col_mean']]
+        data_stds = df_plot[spec['col_std']]
+        
+        valid_data = ~data_means.isna() & ~data_stds.isna()
+        if valid_data.any():
+            plot_min = (data_means[valid_data] - data_stds[valid_data]).min()
+            plot_max = (data_means[valid_data] + data_stds[valid_data]).max()
+            
+            padding = (plot_max - plot_min) * 0.1
+            if padding == 0: padding = 0.1 
+            
+            ax.set_ylim(max(0, plot_min - padding), plot_max + padding)
+
+    # 6. Create Custom Legends
+    if n_trials > 1:
+        trial_lines = [mlines.Line2D([], [], color='gray', marker='o', linestyle='None',
+                                    markersize=8, label=trial, fillstyle=fill,
+                                    markeredgecolor='gray')
+                       for trial, fill in trial_fills.items()]
+        # Place legend outside the plot
+        fig.legend(handles=trial_lines, title='Trial Type (Fill)',
+                   bbox_to_anchor=(0.98, 0.4), loc='center left', frameon=False)
+    
+    # Adjust layout
+    plt.tight_layout(rect=[0.05, 0.1, 0.85, 0.9])
+    plt.savefig('pooled_magnitudes_twin_ax.png', dpi=300)
+
 
 if __name__ == "__main__":
-    pkl_file = "imu_data_summary.pkl"
+    pkl_file = "imu_data_summary_.pkl"
     
     # Check for cached data
     if os.path.exists(pkl_file):
@@ -523,18 +891,31 @@ if __name__ == "__main__":
         df = pd.DataFrame(all_results)
         df.to_pickle(pkl_file)  # Save the *new* data with std dev
 
-    # Create the new visualization
+    # Create the original visualization (optional, you can comment this out)
     # plot_subject_segment_dots(df)
     # plt.show()
-
     
-    # --- Generate Grouped Summary DataFrames ---
-    print("\nGenerating pooled summary DataFrames...")
-    pooled_by_segment = get_pooled_summary(
+    # # --- Generate Grouped Summary DataFrames ---
+    # print("\nGenerating pooled summary for (X, Y, Z) components...")
+    # pooled_by_segment = get_pooled_summary(
+    #     df,
+    #     group_by_cols=['segment'],
+    #     data_cols=['acc_x', 'acc_y', 'acc_z', 'mag_x', 'mag_y', 'mag_z']
+    # )
+
+    # plot_pooled_data(pooled_by_segment)
+    # plt.show()
+
+    # --- NEW: Generate and plot pooled summary for magnitudes ---
+    print("\nGenerating pooled summary for magnitudes...")
+    pooled_magnitudes_by_segment = get_pooled_summary(
         df,
-        group_by_cols=['segment', 'trial_type'],
-        data_cols=['acc_x', 'acc_y', 'acc_z', 'mag_x', 'mag_y', 'mag_z']
+        group_by_cols=['segment'],
+        # IMPORTANT: Include the magnitude columns here
+        data_cols=['acc_magnitude', 'mag_magnitude'] 
     )
 
-    plot_pooled_data(pooled_by_segment)
+    # Call the new plotting function
+    # plot_pooled_magnitudes(pooled_magnitudes_by_segment)
+    plot_pooled_magnitudes_twin_ax(pooled_magnitudes_by_segment)
     plt.show()

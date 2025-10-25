@@ -7,18 +7,23 @@ statistical analysis for comparing the performance of various estimation methods
 It loads a pre-processed pandas DataFrame containing performance metrics and
 produproduces three main types of visualizations:
 
-1.  **Overall Performance Plots**: Compares the distribution of key metrics
+1.  **Overall Performance Plots (Whisker)**: Compares the distribution of key metrics
     (e.g., RMSE, MAE) across all methods using a combined strip and
-    box-whisker plot. Includes a robust statistical analysis using the
-    Friedman test, followed by a Wilcoxon signed-rank post-hoc test.
+    box-whisker plot (median, quartiles). Includes a robust statistical 
+    analysis using the Friedman test, followed by a Wilcoxon signed-rank 
+    post-hoc test.
     **Annotations for significant pairs are drawn on the plot.**
 
-2.  **Performance by Factor Plots**: Creates a faceted strip and box-whisker
-    plot to compare method performance side-by-side for each level of a
-    given experimental factor (e.g., trial type, joint, axis).
-    **Annotations for significant pairs are drawn on each facet.**
+2.  **Overall Performance Plots (Bar)**: Compares the mean and standard 
+    deviation of key metrics across all methods using a bar plot.
 
-3.  **Interaction Heatmaps**: Visualizes the mean performance of each method
+3.  **Performance by Factor Plots**: Creates faceted plots (either whisker
+    or bar) to compare method performance side-by-side for each level of a
+    given experimental factor (e.g., trial type, joint, axis).
+    **Annotations for significant pairs are drawn on each facet for 
+    whisker plots.**
+
+4.  **Interaction Heatmaps**: Visualizes the mean performance of each method
     across different experimental conditions (e.g., by joint or subject).
 
 The script is structured to be easily configurable by modifying the variables
@@ -212,7 +217,7 @@ def _add_strip_and_whisker_elements(
     **kwargs: Any
 ) -> None:
     """
-    Draws a stripplot, custom whisker lines, and significance
+    Draws a stripplot, custom whisker lines (median/quartiles), and significance
     brackets onto a given Axes.
     """
     if ax is None:
@@ -241,7 +246,7 @@ def _add_strip_and_whisker_elements(
         zorder=1
     )
     
-    # --- 2. Add whisker lines and labels ---
+    # --- 2. Add whisker lines and labels (Median/Quartiles) ---
     stats_df = data.groupby(x_col)[y_col].quantile([0.25, 0.5, 0.75]).unstack().reindex(order)
     if show_labels:
         line_width = kwargs.get('line_width', 0.8)
@@ -315,9 +320,80 @@ def _add_strip_and_whisker_elements(
         ax.set_ylim(ylim[0], current_y_level + (y_step * 0.5))
 
 
+# --- NEW ---
+def _add_bar_and_std_elements(
+    data: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    hue_col: str,
+    order: List[str],
+    palette: Dict[str, str],
+    show_labels: bool = True,
+    ax: Optional[plt.Axes] = None,
+    **kwargs: Any
+) -> None:
+    """
+    Draws a barplot with mean and std error bars onto a given Axes.
+    """
+    if ax is None:
+        ax = plt.gca()
+
+    # --- 1. Plot the bar plot with std error bars ---
+    sns.barplot(
+        data=data,
+        x=x_col,
+        y=y_col,
+        order=order,
+        palette=palette,
+        hue=hue_col,
+        legend=False,
+        ax=ax,
+        errorbar='ci',  # Use confidence interval for error bars
+        capsize=0.1,
+        zorder=2
+    )
+    ax.set_xticklabels(['Traditional', 'Proposed'], rotation=0, fontsize=16)
+    sns.despine(left=True, bottom=True, top=True, right=True, ax=ax)
+
+    # --- 2. Add text labels for the mean ---
+    if show_labels:
+        # Calculate stats needed for labels
+        stats_df = data.groupby(x_col)[y_col].agg(['mean', 'std']).reindex(order)
+
+        for i, method in enumerate(order):
+            if method not in stats_df.index:
+                continue
+            
+            mean_val = stats_df.loc[method, 'mean']
+            std_val = stats_df.loc[method, 'std']
+            
+            if pd.notna(mean_val):
+                # Position text above the std error bar
+                y_pos = mean_val + (std_val / 8 if pd.notna(std_val) else 0)
+                
+                ax.text(
+                    i,  # x-coordinate for a barplot is its index
+                    y_pos,
+                    f'{mean_val:.1f}',
+                    ha='center',
+                    va='bottom',
+                    fontsize=16,
+                    color='black',
+                    fontweight='bold',
+                    zorder=11
+                )
+        
+        # Adjust Y-limit slightly to make room for text
+        max_y_with_err = (stats_df['mean'] + stats_df['std'].fillna(0)).max() * 0.6
+        current_ylim = ax.get_ylim()
+        if pd.notna(max_y_with_err):
+            ax.set_ylim(current_ylim[0], max(current_ylim[1], max_y_with_err * 1.0))
+
+# --- MODIFIED ---
 def plot_method_performance(
     summary_df: pd.DataFrame,
     metrics: List[str],
+    plot_type: str = 'whisker', # --- NEW ---
     method_order: Optional[List[str]] = None,
     palette: Optional[Union[str, Dict[str, str]]] = None,
     show_labels: bool = True,
@@ -327,12 +403,16 @@ def plot_method_performance(
     """
     Generates combined strip and box-whisker plots (overall performance).
     """
-    print(f"\n--- Generating Overall Performance Strip & Whisker Plots ---")
+    if plot_type not in ['whisker', 'bar']:
+        print(f"Error: Unknown plot_type '{plot_type}'. Defaulting to 'whisker'.")
+        plot_type = 'whisker'
+        
+    print(f"\n--- Generating Overall Performance ({plot_type}) Plots ---")
     data = summary_df.reset_index()
 
     if method_order:
         data = data[data['method'].isin(method_order)]
-        plot_order = [m for m in method_order if m in data['method'].unique()]
+        plot_order = ['EKF', 'Cascade']
     else:
         plot_order = sorted(data['method'].unique())
 
@@ -355,53 +435,67 @@ def plot_method_performance(
             print(f"Warning: Metric '{metric}' not found. Skipping.")
             continue
         
-        print(f"\n--- Processing Metric: {metric} (Strip & Whisker Plot) ---")
+        print(f"\n--- Processing Metric: {metric} ({plot_type} Plot) ---")
         
-        # --- 1. Run stats and GET the pairs ---
+        # --- 1. Run stats (always run, just print to console) ---
         sig_pairs = _run_statistical_analysis(data, metric, plot_order, alpha=0.05)
         
-        # Create a dummy dict and column for the helper function
-        stats_dict = {'_overall_': sig_pairs}
-        data['_overall_'] = '_overall_' # Dummy column
+        fig, ax = plt.subplots(figsize=(4, 7))
         
-        fig, ax = plt.subplots(figsize=(6, 8))
-        
-        # --- 2. Call the shared plotting helper ---
-        _add_strip_and_whisker_elements(
-            ax=ax,
-            data=data,
-            x_col='method',
-            y_col=metric,
-            hue_col='method',
-            order=plot_order,
-            palette=color_map,
-            show_labels=show_labels,
-            jitter=0.27,
-            # --- Pass the stats info ---
-            stats_dict=stats_dict,
-            factor_col_name='_overall_'
-        )
+        # --- 2. Call the correct plotting helper based on plot_type ---
+        if plot_type == 'whisker':
+            # Create a dummy dict and column for the helper function
+            stats_dict = {'_overall_': sig_pairs}
+            data['_overall_'] = '_overall_' # Dummy column
+            
+            _add_strip_and_whisker_elements(
+                ax=ax,
+                data=data,
+                x_col='method',
+                y_col=metric,
+                hue_col='method',
+                order=plot_order,
+                palette=color_map,
+                show_labels=show_labels,
+                jitter=0.27,
+                # Pass the stats info
+                stats_dict=stats_dict,
+                factor_col_name='_overall_'
+            )
+            data.drop(columns=['_overall_'], inplace=True, errors='ignore')
+            ax.set_title(f"Overall Method Performance\n{metric} (Median/Quartiles)")
+
+        elif plot_type == 'bar':
+            _add_bar_and_std_elements(
+                ax=ax,
+                data=data,
+                x_col='method',
+                y_col=metric,
+                hue_col='method',
+                order=plot_order,
+                palette=color_map,
+                show_labels=show_labels
+            )
+            ax.set_title(f"Joint Angle Estimate \n{metric.replace('_deg', '')} by Method\n(Mean ± CI)")
+
 
         # --- 3. Finalize plot-specific labels ---
-        ax.set_ylabel(f"{metric.replace('_deg', '')} (Degrees)" if "_deg" in metric else metric)
+        ax.set_ylabel(f"Root Mean Squared Error\n(Degrees)" if "_deg" in metric else metric)
         ax.set_xlabel("", fontsize=12) 
         ax.tick_params(axis='x', rotation=25, labelsize=16)
         ax.tick_params(axis='y', labelsize=16)
-        ax.set_title(f"Overall Method Performance\n{metric}")
 
-        # --- REMOVED ylim call: The helper function now sets its own ylim ---
-        
-        filename = f"overall_performance_{metric.lower()}_strip_whisker.png"
+        # --- MODIFIED ---
+        filename = f"overall_performance_{metric.lower()}_{plot_type}.png"
         _finalize_and_save_plot(fig, "", filename, show_plots, save_plots)
-        
-    # Drop the dummy column
-    data.drop(columns=['_overall_'], inplace=True, errors='ignore')
 
 
+# --- MODIFIED ---
 def plot_performance_by_factor(
     summary_df: pd.DataFrame,
     factor: str,
     metrics: List[str],
+    plot_type: str = 'whisker', # --- NEW ---
     method_order: Optional[List[str]] = None,
     palette: Optional[Union[str, Dict[str, str]]] = None,
     show_labels: bool = True,
@@ -409,9 +503,13 @@ def plot_performance_by_factor(
     save_plots: bool = True
 ) -> None:
     """
-    Generates faceted strip & whisker plots by a given factor.
+    Generates faceted plots (whisker or bar) by a given factor.
     """
-    print(f"\n--- Generating Performance Strip & Whisker Plots by {factor.title()} ---")
+    if plot_type not in ['whisker', 'bar']:
+        print(f"Error: Unknown plot_type '{plot_type}'. Defaulting to 'whisker'.")
+        plot_type = 'whisker'
+
+    print(f"\n--- Generating Performance ({plot_type}) Plots by {factor.title()} ---")
     data = summary_df.reset_index()
 
     if factor not in data.columns:
@@ -445,7 +543,7 @@ def plot_performance_by_factor(
             print(f"Warning: Metric '{metric}' not found. Skipping.")
             continue
 
-        print(f"\n--- Processing Metric: {metric} by {factor.title()} (Strip & Whisker Plot) ---")
+        print(f"\n--- Processing Metric: {metric} by {factor.title()} ({plot_type} Plot) ---")
         
         original_count = len(data)
         filtered_data =  _remove_outliers(data, metric, group_cols=[factor, 'method'])
@@ -453,7 +551,7 @@ def plot_performance_by_factor(
         if removed_count > 0:
             print(f"  > Removed {removed_count} outliers (beyond 1.5 IQR) for '{metric}'.")
 
-        # --- 1. Pre-calculate stats for ALL facets ---
+        # --- 1. Pre-calculate stats for ALL facets (always run) ---
         stats_results = {}
         for level in factor_levels:
             print(f"\n--- Testing for {factor.title()} = {level} ---")
@@ -471,77 +569,56 @@ def plot_performance_by_factor(
             col_wrap=col_wrap,
             height=6,
             aspect=0.8,
-            sharey=False # <-- MUST be False for per-facet brackets
+            sharey=True # Must be False for per-facet brackets OR different bar heights
         )
 
-        # --- 3. Map the shared plotting helper to each facet ---
-        g.map_dataframe(
-            _add_strip_and_whisker_elements,
-            x_col='method',
-            y_col=metric,
-            hue_col='method',
-            order=plot_order,
-            palette=color_map,
-            show_labels=show_labels,
-            line_width=1.3,
-            whisker_width=0.9,
-            jitter=0.15,
-            # --- Pass the full stats dict and factor column name ---
-            stats_dict=stats_results,
-            factor_col_name=factor
-        )
+        # --- 3. Map the correct plotting helper to each facet ---
+        if plot_type == 'whisker':
+            g.map_dataframe(
+                _add_strip_and_whisker_elements,
+                x_col='method',
+                y_col=metric,
+                hue_col='method',
+                order=plot_order,
+                palette=color_map,
+                show_labels=show_labels,
+                line_width=1.3,
+                whisker_width=0.9,
+                jitter=0.15,
+                # Pass the full stats dict and factor column name
+                stats_dict=stats_results,
+                factor_col_name=factor
+            )
+        elif plot_type == 'bar':
+            g.map_dataframe(
+                _add_bar_and_std_elements,
+                x_col='method',
+                y_col=metric,
+                hue_col='method',
+                order=plot_order,
+                palette=color_map,
+                show_labels=show_labels
+            )
         
         # --- 4. Finalize grid-level labels ---
         g.set_axis_labels(x_var="", y_var=f"{metric.replace('_deg', '')} (Degrees)" if "_deg" in metric else metric)
         g.set_xticklabels(rotation=45, ha='right')
         g.set_titles(f"{{col_name}}")
         
-        # --- REMOVED g.set(ylim=...) ---
-        # Each facet now controls its own Y-axis to make room for brackets.
-        
         g.fig.subplots_adjust(wspace=0.1, hspace=1)
         
         fig = g.fig 
-        plot_title = f"Method Performance for {metric} by {factor.title()}"
-        filename = f"by_{factor}_performance_{metric.lower()}_strip_whisker.png"
+        plot_title = f"Method Performance for {metric} by {factor.title()} ({plot_type})"
+        # --- MODIFIED ---
+        filename = f"by_{factor}_performance_{metric.lower()}_{plot_type}.png"
         _finalize_and_save_plot(fig, plot_title, filename, show_plots, save_plots)
-
-
-def plot_performance_by_joint_and_axis(
-    summary_df: pd.DataFrame,
-    metrics: List[str],
-    method_order: Optional[List[str]] = None,
-    palette: Optional[Union[str, Dict[str, str]]] = None,
-    show_labels: bool = True,
-    show_plots: bool = False,
-    save_plots: bool = True
-) -> None:
-    """
-    Generates faceted strip & whisker plots by joint and axis.
-    """
-    data = summary_df.copy()
-    if 'joint_name' in data.columns and 'axis' in data.columns:
-        # Create a combined factor for plotting
-        data['joint_and_axis'] = data['joint_name'] + '_' + data['axis']
-        plot_performance_by_factor(
-            summary_df=data,
-            factor='joint_and_axis',
-            metrics=metrics,
-            method_order=method_order,
-            palette=palette,
-            show_labels=show_labels,
-            show_plots=show_plots,
-            save_plots=save_plots
-        )
-    else:
-        print("Error: 'joint_name' and/or 'axis' columns not found. Skipping.")
-
 
 def plot_interaction_heatmap(
     summary_df: pd.DataFrame,
     metrics: List[str],
     interaction_factor: str,
     method_order: Optional[List[str]] = None,
+    factor_order: Optional[List[str]] = None,  # <-- ADD THIS
     cmap: str = 'Reds',
     show_plots: bool = False,
     save_plots: bool = True
@@ -591,19 +668,32 @@ def plot_interaction_heatmap(
         try:
             heatmap_data = filtered_data.groupby(['method', interaction_factor])[metric].mean().unstack()
             heatmap_data = heatmap_data.reindex(y_axis_order)
-            heatmap_data = heatmap_data.reindex(sorted(heatmap_data.columns), axis=1)
 
-            fig_width = max(12, len(heatmap_data.columns) * 1.5)
-            fig_height = max(8, len(heatmap_data.index) * 0.8)
+            # --- START: MODIFIED LOGIC ---
+            if factor_order:
+                # Use the provided order, but only for columns that exist in the data
+                valid_factor_order = [f for f in factor_order if f in heatmap_data.columns]
+                heatmap_data = heatmap_data.reindex(valid_factor_order, axis=1)
+                heatmap_data = heatmap_data.reindex(['EKF', 'Cascade'], axis=0)
+            else:
+                # Default to alphabetical sorting if no order is given
+                heatmap_data = heatmap_data.reindex(sorted(heatmap_data.columns), axis=1)
+            # --- END: MODIFIED LOGIC ---
+
+            fig_width = len(heatmap_data.columns) * 1.0
+            fig_height = len(heatmap_data.index) * 1.2
             fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-            
-            y_label_cbar = f"Mean {metric} (Degrees)" if "_deg" in metric else f"Mean {metric}"
+
+            y_label_cbar = f"Mean {metric.replace('_deg', '')}\n(Degrees)" if "_deg" in metric else f"Mean {metric}"
             sns.heatmap(heatmap_data, annot=True, fmt=".2f", cmap=cmap, linewidths=.5, cbar_kws={'label': y_label_cbar}, ax=ax)
             
-            ax.set_ylabel("Method", fontsize=12)
-            ax.set_xlabel(interaction_factor.title(), fontsize=12)
+            ax.set_ylabel("", fontsize=12)
+            ax.set_yticklabels(['Traditional', 'Proposed'], rotation=0, fontsize=16)
+            ax.set_xlabel("", fontsize=12)
 
-            plot_title = f"Mean {metric} by Method and {interaction_factor.title()}"
+            ax.set_xticklabels(['Lumbar', 'Right Hip', 'Left Hip', 'Right Knee', 'Left Knee', 'Right Ankle', 'Left Ankle'], rotation=30, ha='right', fontsize=16)
+
+            plot_title = f""
             filename = f"interaction_heatmap_{metric.lower()}_vs_{interaction_factor.lower()}.png"
             _finalize_and_save_plot(fig, plot_title, filename, show_plots, save_plots)
         except Exception as e:
@@ -623,7 +713,7 @@ def main():
         'font.weight': 'light',
         'axes.labelweight': 'black',
         'axes.titleweight': 'black',
-        'axes.titlesize': 16,
+        'axes.titlesize': 26,
         'axes.labelsize': 16,
         'xtick.labelsize': 16,
         'ytick.labelsize': 16,
@@ -637,12 +727,19 @@ def main():
     SHOW_PLOTS = True
     SAVE_PLOTS = True
 
-    METRICS_TO_PLOT = ['STD_deg', 'RMSE_deg'] 
+    # --- NEW ---
+    # Set the desired plot style:
+    # 'whisker' = strip plot with median/quartile whiskers and sig. brackets
+    # 'bar'     = bar plot with mean and standard deviation error bars
+    PLOT_STYLE = 'bar' # <-- CHANGE THIS to 'whisker' to get the old plots
+    # ---
+
+    METRICS_TO_PLOT = ['RMSE_deg'] 
     METHODS_IN_ORDER = [
         'EKF',
-        'Madgwick (Al Borno)',
-        'Mag Free',
-        'Never Project',
+        # 'Madgwick (Al Borno)',
+        # 'Mag Free',
+        # 'Never Project',
         'Cascade',
     ]
 
@@ -662,7 +759,17 @@ def main():
             'Mean_deg': np.random.randn(num_entries) * 5,
             'STD_deg': np.random.rand(num_entries) * 3
         }
+        # Add some offsets to make dummy stats more interesting
+        method_offsets = {m: np.random.rand() * 5 for m in METHODS_IN_ORDER}
+        joint_offsets = {'Knee': 2, 'Elbow': -2}
+        
         summary_stats_df = pd.DataFrame(data)
+        summary_stats_df['RMSE_deg'] += summary_stats_df['method'].map(method_offsets)
+        summary_stats_df['RMSE_deg'] += summary_stats_df['joint_name'].map(joint_offsets)
+        summary_stats_df['STD_deg'] += summary_stats_df['method'].map(method_offsets) / 2.0
+        summary_stats_df['RMSE_deg'] = summary_stats_df['RMSE_deg'].clip(lower=0.5)
+        summary_stats_df['STD_deg'] = summary_stats_df['STD_deg'].clip(lower=0.1)
+
     else:
         print(f"Loading summary statistics from {DATA_FILE_PATH}...")
         try:
@@ -672,25 +779,41 @@ def main():
             return
 
     # --- 3. Generate Overall Performance Plots (Strip + Whisker) ---
+    # --- MODIFIED ---
     plot_method_performance(
         summary_df=summary_stats_df, metrics=METRICS_TO_PLOT,
+        plot_type=PLOT_STYLE, # <-- Pass the style
         method_order=METHODS_IN_ORDER, palette="Set2",
         show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
     )
     
-    # --- 4. Generate Performance Plots Faceted by Various Factors ---
-    plot_performance_by_factor(
-        summary_df=summary_stats_df, factor='joint_name', metrics=METRICS_TO_PLOT,
-        method_order=METHODS_IN_ORDER, palette="Set2",
-        show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
-    )
+    # # --- 4. Generate Performance Plots Faceted by Various Factors ---
+    # # --- MODIFIED ---
+    # plot_performance_by_factor(
+    #     summary_df=summary_stats_df, factor='joint_name', metrics=METRICS_TO_PLOT,
+    #     plot_type=PLOT_STYLE, # <-- Pass the style
+    #     method_order=METHODS_IN_ORDER, palette="Set2",
+    #     show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
+    # )
     
     # --- 5. Generate Interaction Heatmaps for various factors ---
-    interaction_factors = ['joint_name', 'trial_type']
+    FACTOR_ORDERS = {
+            'joint_name': ['Lumbar', 'R_Hip', 'L_Hip', 'R_Knee', 'L_Knee', 'R_Ankle', 'L_Ankle'], # <-- DEFINE YOUR CUSTOM ORDER HERE
+            # 'trial_type': ['Slow', 'Medium', 'Fast']
+            # Add any other factor orders you might need
+        }
+    
+    interaction_factors = ['joint_name']
     for factor in interaction_factors:
+        
+        # Get the custom order for this factor, or None if not defined
+        custom_factor_order = FACTOR_ORDERS.get(factor)
+        
         plot_interaction_heatmap(
             summary_df=summary_stats_df, metrics=METRICS_TO_PLOT,
-            interaction_factor=factor, method_order=METHODS_IN_ORDER,
+            interaction_factor=factor, 
+            method_order=METHODS_IN_ORDER,
+            factor_order=custom_factor_order, # <-- PASS THE NEW ARGUMENT
             cmap='Reds', show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
         )
 
