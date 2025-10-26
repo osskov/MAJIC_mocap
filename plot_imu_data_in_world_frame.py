@@ -3,43 +3,29 @@ from typing import Dict, List, Any
 import pandas as pd
 # from src.toolchest.PlateTrial import PlateTrial # Assuming this is handled outside for execution
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import matplotlib.lines as mlines
+import matplotlib.colors as mcolors
 import numpy as np
 import sys
 import seaborn as sns
+from src.toolchest.PlateTrial import PlateTrial
 
-# Dummy PlateTrial class and a few helper functions for a runnable example
-# In a real execution environment, the user's imports would handle this
-class PlateTrial:
-    @staticmethod
-    def load_trial_from_folder(path):
-        # Dummy data for demonstration. In the real system, this would load real files.
-        class DummyTrace:
-            def __init__(self):
-                self.acc = np.random.uniform(-10, 10, (1000, 3))
-                self.mag = np.random.uniform(20, 70, (1000, 3))
-
-        class DummyTrial:
-            def __init__(self, name):
-                self.name = name
-            def __len__(self): return 1000
-            def get_imu_trace_in_global_frame(self): return DummyTrace()
-
-        # Create dummy trials for all 8 segments
-        segments = [
-            'torso_imu', 'pelvis_imu', 'femur_r_imu', 'femur_l_imu', 
-            'tibia_r_imu', 'tibia_l_imu', 'calcn_r_imu', 'calcn_l_imu'
-        ]
-        return [DummyTrial(f"{seg}_T{i}") for seg in segments for i in range(2)]
-
-# Define load_and_process_imu_data and get_pooled_summary here if PlateTrial is defined/mocked, 
-# but since the prompt only asks for modification of the plotting function, 
-# I will proceed to define the final plotting function and an example main block 
-# to show how it's used.
-
-# Set print options for floats to 3 significant figures
-np.set_printoptions(formatter={'float': lambda x: "%.3g" % x})
+PKL_FILE = "imu_data_summary.pkl"
+RENAME_SEGMENTS = {
+    'torso_imu': 'Torso',
+    'pelvis_imu': 'Pelvis',
+    'femur_r_imu': 'Right\nFemur',
+    'femur_l_imu': 'Left\nFemur',
+    'tibia_r_imu': 'Right\nTibia',
+    'tibia_l_imu': 'Left\nTibia',
+    'calcn_r_imu': 'Right\nFoot',
+    'calcn_l_imu': 'Left\nFoot',
+}
+SUBJECTS_TO_LOAD = [f"{i:02d}" for i in range(1, 12)]
+TRIAL_TYPES_TO_LOAD = ['walking', 'complexTasks']
+SHOW_PLOTS = True
+SAVE_PLOTS = False
+ACC_PALETTE = 'Reds'
+MAG_PALETTE = 'Blues'
 
 def load_and_process_imu_data(subject_num: str, trial_type: str, max_frames: int = 60000) -> List[Dict[str, Any]]:
     # This is left as-is from the user's prompt, but relies on a mock PlateTrial to run
@@ -50,15 +36,14 @@ def load_and_process_imu_data(subject_num: str, trial_type: str, max_frames: int
     results = [] 
     
     try:
-        # data_folder_path = os.path.join("data", "data", subject_id, trial_type)
-        # data_folder_path = os.path.abspath(data_folder_path)
+        data_folder_path = os.path.join("data", "data", subject_id, trial_type)
+        data_folder_path = os.path.abspath(data_folder_path)
         
-        plate_trials = PlateTrial.load_trial_from_folder("dummy_path") # Use dummy loader
-        # print(f"Successfully loaded {len(plate_trials)} trials.")
+        plate_trials = PlateTrial.load_trial_from_folder(data_folder_path)
 
-        # if len(plate_trials[0]) > max_frames:
-        #     print(f"Trimming trials to {max_frames} frames for manageability.")
-        #     plate_trials = [trial[-max_frames:] for trial in plate_trials]
+        if len(plate_trials[0]) > max_frames:
+            print(f"Trimming trials to {max_frames} frames for manageability.")
+            plate_trials = [trial[-max_frames:] for trial in plate_trials]
 
         imu_traces_in_global_frame = {trial.name: trial.get_imu_trace_in_global_frame() for trial in plate_trials}
         
@@ -113,6 +98,10 @@ def load_and_process_imu_data(subject_num: str, trial_type: str, max_frames: int
 def get_pooled_summary(df: pd.DataFrame, group_by_cols: List[str], data_cols: List[str]) -> pd.DataFrame:
     """
     Pools data using the Law of Total Variance.
+    Parameters:
+    - df: DataFrame containing the data.
+    - group_by_cols: Columns to group by (e.g., ['segment', 'trial_type', 'subject']).
+    - data_cols: Columns for which to calculate pooled mean and std dev (e.g., ['acc_magnitude', 'mag_magnitude', 'acc_x', 'acc_y', 'acc_z', 'mag_x', 'mag_y', 'mag_z']).
     """
     
     # First, calculate variance (std^2) for each trial
@@ -152,267 +141,353 @@ def get_pooled_summary(df: pd.DataFrame, group_by_cols: List[str], data_cols: Li
     
     return summary_df.join(summary_std_df)
 
-# The original function is commented out to avoid conflict during execution
-# def plot_pooled_magnitudes_twin_ax(df: pd.DataFrame):
-#     ...
-
-def plot_pooled_magnitudes_twin_ax_flipped_std_alpha(df: pd.DataFrame):
+def plot_pooled_imu_distributions(df: pd.DataFrame):
     """
-    Generates 1 dot-and-whisker plot with two y-axes for
-    acc and mag magnitudes from a POOLED DataFrame.
-
-    MODIFICATIONS:
-    1. Axes are Flipped (Segments on Y-axis).
-    2. Segment order is Torso (Top) to Foot (Bottom).
-    3. Dot Darkness (Alpha) corresponds to Total Standard Deviation.
+    Plots the distribution of per-trial IMU data (pooled mean as dot, pooled std as whisker)
+    using a dot-and-whisker plot with dual Y-axes for ACC and MAG data.
+    
+    Parameters:
+    - df: DataFrame containing the pooled summary data ({col}_mean and {col}_std).
     """
     
-    print("Plotting pooled magnitude data on twin axes with flipped axes and STD-alpha mapping...")
+    # 1. Infer/Validate columns and Prepare DataFrame
+    group_by_cols = df.index.names if df.index.names != [None] else []
+    
+    plot_df = df.copy().reset_index(names=group_by_cols, drop=(df.index.names == [None]))
+    
+    mean_cols = [col for col in plot_df.columns if col.endswith('_mean')]
+    std_cols = [col for col in plot_df.columns if col.endswith('_std')]
+    
+    acc_data_map = {col.replace('_mean', ''): (col, col.replace('_mean', '_std')) for col in mean_cols if col.startswith('acc_')}
+    mag_data_map = {col.replace('_mean', ''): (col, col.replace('_mean', '_std')) for col in mean_cols if col.startswith('mag_')}
 
-    # Set font for better look
-    plt.rcParams['font.family'] = 'sans-serif'
-    plt.rcParams['font.sans-serif'] = ['Arial']
-    
-    # 1. Setup and Detect Groupings
-    df_plot = df.reset_index()
+    if not acc_data_map and not mag_data_map:
+        print("Error: No 'acc_' or 'mag_' mean/std columns found for plotting.")
+        return
 
-    segment_order = [
-        'torso_imu', 'pelvis_imu',  
-        'femur_r_imu', 'femur_l_imu',  
-        'tibia_r_imu', 'tibia_l_imu',  
-        'calcn_r_imu', 'calcn_l_imu'
-    ]
-    # Filter dataframe and REVERSE the order for Y-axis plotting (Top-to-Bottom)
-    df_plot = df_plot[df_plot['segment'].isin(segment_order)].copy()
-    segment_order_y = segment_order[::-1] # Flipped order for y-ticks
-
-    if 'trial_type' in df_plot.columns:
-        trial_types = sorted(df_plot['trial_type'].unique())
-    else:
-        trial_types = []
+    # 2. Determine X-axis and HUE columns (MODIFIED)
+    n_groups = len(group_by_cols)
     
-    n_segments = len(segment_order)
-    n_trials = len(trial_types)
-
-    # 2. Create Mappings
-    
-    # Get 5th and 6th colors
-    colors_list = sns.color_palette(n_colors=10)
-    acc_color = colors_list[2]  # 5th color (muted green)
-    mag_color = colors_list[4]  # 6th color (teal/cyan)
-    
-    # Fill map for Trial Types
-    trial_fills = {trial: 'full' for trial in trial_types}
-    if n_trials > 1:
-        # hollow for the first trial type, solid for the second
-        trial_fills[trial_types[0]] = 'none' 
-        trial_fills[trial_types[1]] = 'full' 
-
-    # 3. Calculate Max STD for Alpha Mapping
-    acc_std_max = df_plot['acc_magnitude_std'].max()
-    mag_std_max = df_plot['mag_magnitude_std'].max()
-    # Find the global max std dev across all segments/magnitudes
-    global_std_max = max(acc_std_max, mag_std_max)
-    # Define the alpha range. Max std = 1.0 alpha (opaque). Min std = 0.2 alpha (light)
-    ALPHA_MIN = 0.2
-    ALPHA_MAX = 1.0
-    
-    def get_alpha(std_val, max_std):
-        """Maps standard deviation to an alpha value (darkness)."""
-        if max_std == 0: return ALPHA_MAX # Handle zero std case
-        # Normalize the std dev to the range [0, 1]
-        normalized_std = std_val / max_std
-        # Linear map from [0, 1] to [ALPHA_MIN, ALPHA_MAX]
-        return ALPHA_MIN + normalized_std * (ALPHA_MAX - ALPHA_MIN)
-    
-    # 4. Create the 1 subplot and twin axis
-    # Flipped axes: figsize=(Vertical, Horizontal)
-    fig, ax1 = plt.subplots(1, 1, figsize=(4.5, 7)) 
-    
-    # Create the second x-axis sharing the same y-axis
-    ax2 = ax1.twiny() # Use twinY for vertical segments
-    
-    # Define specs for clarity
-    acc_spec = {'col_mean': 'acc_magnitude_mean', 'col_std': 'acc_magnitude_std', 'xlabel': 'Acceleration ($m/s^2$)'}
-    mag_spec = {'col_mean': 'mag_magnitude_mean', 'col_std': 'mag_magnitude_std', 'xlabel': 'Magnetometer ($\mu T$)'}
-
-    # 5. Main Plotting Loop
-    
-    # Calculate vertical dodge positions (for trial types)
-    if n_trials > 1:
-        # We need a small dodge to separate trial types vertically
-        dodge = np.linspace(-0.15, 0.15, n_trials)
-    else:
-        dodge = [0]
-    
-    # Loop by segment
-    for i_seg, segment in enumerate(segment_order_y):
-        # The index (0 is torso, 7 is foot) is reversed in order_y.
-        # The segment's Y position should be its index in segment_order_y
-        y_pos_base = i_seg
+    if n_groups == 0:
+        # No grouping: X-axis is 'All Data', and HUE is a dummy for a single color
+        x_col = 'X_Group'
+        hue_col = 'HUE_Group'
+        plot_df[x_col] = 'All Data'
+        plot_df[hue_col] = '__single_hue__'
+        print("Using dummy columns for X-axis and HUE.")
         
-        segment_data = df_plot[df_plot['segment'] == segment]
-        if segment_data.empty:
-            continue
+    elif n_groups == 1:
+        # One grouping column: Use it for X-axis, and HUE is a dummy for a single color per X-group
+        x_col = group_by_cols[0]
+        hue_col = 'HUE_Group'
+        plot_df[hue_col] = '__single_hue__'
+        print(f"Using single group by column '{x_col}' for X-axis. Using dummy hue.")
+        
+    else: 
+        # Two or more grouping columns: Use all but the last for X-axis (combined), last for HUE
+        combined_group_name = 'X_Group'
+        plot_df[combined_group_name] = plot_df[group_by_cols[:-1]].apply(
+            lambda row: ' | '.join(row.values.astype(str)), axis=1
+        )
+        x_col = combined_group_name
+        hue_col = group_by_cols[-1]
+        print(f"Using combined groups for X-axis ('{x_col}') and '{hue_col}' for HUE.")
 
-        # Plot dodged dots for each trial type
-        for i_trial, trial_type in enumerate(trial_types if n_trials > 0 else ['_single']):
-            
-            y_pos = y_pos_base + dodge[i_trial]
-
-            if n_trials <= 1:
-                data = segment_data.iloc[0] # Should only be one row
-                fillstyle = 'full'
-            else:
-                data_row = segment_data[segment_data['trial_type'] == trial_type]
-                if data_row.empty: continue
-                data = data_row.iloc[0]
-                fillstyle = trial_fills[trial_type]
-            
-            # --- Get the values ---
-            acc_mean = data[acc_spec['col_mean']]
-            acc_std = data[acc_spec['col_std']]
-            mag_mean = data[mag_spec['col_mean']]
-            mag_std = data[mag_spec['col_std']]
-
-            # Calculate Alpha (Darkness)
-            # acc_alpha = get_alpha(acc_std, global_std_max)
-            # mag_alpha = get_alpha(mag_std, global_std_max)
-
-            # --- Plot on ax1 (ACC) ---
-            ax1.errorbar(
-                x=acc_mean, y=y_pos - 0.1, xerr=acc_std, # x and y are flipped
-                marker='o', color=acc_color, fillstyle=fillstyle, linestyle='none',
-                capsize=5, markersize=7, markeredgecolor=acc_color
-            )
-            
-            # --- Plot on ax2 (MAG) ---
-            ax2.errorbar(
-                x=mag_mean, y=y_pos + 0.2, xerr=mag_std, # x and y are flipped
-                marker='o', color=mag_color, fillstyle=fillstyle, linestyle='none',
-                capsize=5, markersize=7, markeredgecolor=mag_color
-            )
-
-    # 6. Configure Axes
-    # Use clean labels for the Y-axis (Segments)
-    segment_labels = ["Torso", "Pelvis", "R Femur", "L Femur", "R Tibia", "L Tibia", "R Foot", "L Foot"]
-    segment_labels_y = segment_labels[::-1] # Flipped to match the segment_order_y list
-
-    # Y-Axis (Segments - configure on ax1, it's shared)
-    ax1.set_ylim(-0.5, n_segments - 0.5)
-    ax1.set_yticks(range(n_segments))
-    ax1.set_yticklabels(segment_labels_y, fontsize=16)
-    # ax1.set_ylabel('Body Segment', fontweight='bold', fontsize=14)
-
-    # X-Axes (Measurements - configure separately)
-    # ax1 (Bottom) - Acceleration
-    ax1.set_xlabel(acc_spec['xlabel'], color=acc_color, fontweight='bold', fontsize=18)
-    ax1.tick_params(axis='x', labelcolor=acc_color, labelsize=10)
-    ax1.spines['left'].set_color('black')
-    ax1.spines['bottom'].set_color(acc_color)
-
-    # ax2 (Top) - Magnetometer
-    ax2.set_xlabel(mag_spec['xlabel'], color=mag_color, fontweight='bold', fontsize=18)
-    ax2.tick_params(axis='x', labelcolor=mag_color, labelsize=10)
-    ax2.spines['top'].set_color(mag_color)
-    ax2.spines['right'].set_color('black') 
+    # 3. Data Wrangling (Melting) for Errorbars
     
-    # Hide unnecessary spines
+    # 3a. Prepare Long DataFrame for ACC
+    acc_long_df = pd.DataFrame()
+    for base_col, (mean_col, std_col) in acc_data_map.items():
+        # Ensure we are using the resolved x_col and hue_col
+        temp_df = plot_df[[x_col, hue_col, mean_col, std_col]].copy()
+        temp_df.rename(columns={mean_col: 'Mean', std_col: 'StdDev'}, inplace=True)
+        temp_df['Variable'] = base_col
+        temp_df['Core_Variable'] = base_col.replace('acc_', '') 
+        acc_long_df = pd.concat([acc_long_df, temp_df])
+    acc_long_df['Sensor'] = 'ACC'
+
+    # 3b. Prepare Long DataFrame for MAG
+    mag_long_df = pd.DataFrame()
+    for base_col, (mean_col, std_col) in mag_data_map.items():
+        # Ensure we are using the resolved x_col and hue_col
+        temp_df = plot_df[[x_col, hue_col, mean_col, std_col]].copy()
+        temp_df.rename(columns={mean_col: 'Mean', std_col: 'StdDev'}, inplace=True)
+        temp_df['Variable'] = base_col
+        temp_df['Core_Variable'] = base_col.replace('mag_', '') 
+        mag_long_df = pd.concat([mag_long_df, temp_df])
+    mag_long_df['Sensor'] = 'MAG'
+
+    all_long_df = pd.concat([acc_long_df, mag_long_df])
+
+    # 4. Plotting Setup
+    
+    fig, ax1 = plt.subplots(figsize=(12, 5))
+    ax2 = ax1.twinx() 
+    
+    # Get hue levels
+    hue_levels = plot_df[hue_col].unique()
+    n_hues = len(hue_levels)
+
+    if hue_levels[0] == '__single_hue__':
+        # Use single colors if only a dummy hue exists
+        acc_hue_colors = {'__single_hue__': sns.color_palette(ACC_PALETTE, 1)[0]}
+        mag_hue_colors = {'__single_hue__': sns.color_palette(MAG_PALETTE, 1)[0]}
+        
+        # Adjust hue_col for the legend title
+        hue_legend_title = 'Sensor Color'
+    else:
+        # Create separate color palettes for ACC and MAG
+        acc_palette = sns.color_palette(ACC_PALETTE, n_hues+1)
+        mag_palette = sns.color_palette(MAG_PALETTE, n_hues+1)
+
+        acc_hue_colors = dict(zip(hue_levels, acc_palette))
+        mag_hue_colors = dict(zip(hue_levels, mag_palette))
+        hue_legend_title = f'Group Color ({hue_col})'
+    
+    # Map shapes based on Core_Variable
+    core_variables = all_long_df['Core_Variable'].unique() 
+    available_markers = ['o', 's', 'D', '^'] 
+    
+    variable_shapes = {core_var: available_markers[i % len(available_markers)] 
+                       for i, core_var in enumerate(core_variables)}
+
+    # Setup for positioning (first level: X-axis categories)
+    x_tick_labels = plot_df[x_col].unique()
+    n_x_groups = len(x_tick_labels)
+    x_pos_map = dict(zip(x_tick_labels, np.arange(n_x_groups)))
+
+    # SECOND LEVEL DODGING SETUP (Sensor x Core_Variable x Hue)
+    sensors = all_long_df['Sensor'].unique()
+    n_dodged_elements = n_hues * len(core_variables) * len(sensors) # <-- MODIFIED: Include sensor
+
+    total_dodge_width = 0.8 
+    
+    dot_spacing = total_dodge_width / n_dodged_elements
+    
+    base_offsets = np.linspace(
+        -total_dodge_width / 2 + dot_spacing / 2, 
+        total_dodge_width / 2 - dot_spacing / 2, 
+        n_dodged_elements
+    )
+
+    combined_offset_map = {}
+    i = 0
+    
+    # Loop over sensors first
+    for s_level in sensors: 
+        for h_level in hue_levels:
+            for v_level in core_variables: 
+                # Key now includes the Sensor
+                combined_offset_map[(s_level, h_level, v_level)] = base_offsets[i] 
+                i += 1
+            
+    # Store legend handles (for both color and shape)
+    legend_proxies_color = {} 
+    legend_proxies_shape = {} 
+
+    # 5. Plot Errorbars (Dot-and-Whisker)
+    for index, row in all_long_df.iterrows():
+        
+        sensor = row['Sensor'] # <-- Now used in offset calculation
+        
+        x_group = str(row[x_col])
+        hue_level = str(row[hue_col])
+        variable_level = row['Variable']
+        core_variable = row['Core_Variable']
+
+        # Calculate X position
+        x_base = x_pos_map[x_group] 
+        # MODIFIED: Use the new key including sensor
+        x_offset = combined_offset_map[(sensor, hue_level, core_variable)] 
+        x_pos = x_base + x_offset
+        
+        mean_val = row['Mean']
+        std_dev = row['StdDev']
+        
+        # Determine color based on sensor and hue_level
+        color = acc_hue_colors[hue_level] if sensor == 'ACC' else mag_hue_colors[hue_level]
+
+        # Calculate the darker color for the edge and whisker
+        try:
+            rgb = mcolors.to_rgb(color)
+            darker_color = tuple(c * 0.6 for c in rgb)
+        except ValueError:
+            darker_color = 'black' # Fallback
+    
+        # Determine marker based on Core_Variable
+        marker = variable_shapes[core_variable]
+        
+        target_ax = ax1 if sensor == 'ACC' else ax2
+        
+        # Plot the error bar
+        target_ax.errorbar(
+            x=x_pos, 
+            y=mean_val, 
+            yerr=std_dev, 
+            fmt=marker,        
+            capsize=5,         
+            elinewidth=1.5,    
+            markerfacecolor=color,
+            markeredgecolor=darker_color,
+            markersize=7,
+            color=darker_color,      
+            zorder=10           
+        )
+        
+        # Create legend proxies for colors (by hue_level and sensor) (MODIFIED)
+        # Use the actual hue level unless it's the dummy one, then just use Sensor
+        if hue_level == '__single_hue__':
+             color_key = sensor
+             label = f'Sensor: {sensor.replace("ACC", "Accelerometer").replace("MAG", "Magnetometer")}'
+        else:
+             color_key = (hue_level, sensor)
+             label = f'{hue_level} ({sensor.replace("ACC", "Accelerometer").replace("MAG", "Magnetometer")} Color)'
+             
+        if color_key not in legend_proxies_color:
+            proxy = plt.Line2D(
+                [0], [0], 
+                marker='s', 
+                color='w',
+                markeredgecolor=darker_color, 
+                markerfacecolor=color, 
+                markersize=8, 
+                linestyle='',
+                label=label
+            )
+            legend_proxies_color[color_key] = proxy
+            
+        # Create legend proxies for shapes (by core_variable)
+        shape_key = core_variable
+        if shape_key not in legend_proxies_shape:
+            proxy = plt.Line2D(
+                [0], [0], 
+                marker=marker, 
+                color='w',
+                markeredgecolor='black', 
+                markerfacecolor='black', 
+                markersize=8, 
+                linestyle='',
+                label=f'{core_variable}' 
+            )
+            legend_proxies_shape[shape_key] = proxy
+            
+    # 6. Final Plot Customization and Legend 
+
+    # Turn off the spines between the two y-axes
     ax1.spines['right'].set_visible(False)
     ax2.spines['left'].set_visible(False)
     ax1.spines['top'].set_visible(False)
+    ax2.spines['top'].set_visible(False)
+    ax1.spines['bottom'].set_visible(False)
     ax2.spines['bottom'].set_visible(False)
-    ax1.spines['left'].set_visible(False)
-    ax2.spines['right'].set_visible(False)
+
+    # Set X-axis ticks and labels
+    ax1.set_xticks(np.arange(n_x_groups))
+    ax1.set_xticklabels(x_tick_labels, rotation=0, ha='center')
+    ax1.set_xlabel("", fontsize=0)
     
-    # Set X-axis limits (Auto-adjust)
-    for ax, spec in [(ax1, acc_spec), (ax2, mag_spec)]:
-        data_means = df_plot[spec['col_mean']]
-        data_stds = df_plot[spec['col_std']]
-        
-        valid_data = ~data_means.isna() & ~data_stds.isna()
-        if valid_data.any():
-            plot_min = (data_means[valid_data] - data_stds[valid_data]).min()
-            plot_max = (data_means[valid_data] + data_stds[valid_data]).max()
-            
-            padding = (plot_max - plot_min) * 0.1
-            if padding == 0: padding = 0.1 
-            
-            ax.set_xlim(max(0, plot_min - padding), plot_max + padding)
+    # Set Y-axis 1 (ACC) style
+    acc_color = sns.color_palette(ACC_PALETTE, 1)[0]
+    ax1.set_ylabel(r'Acceleration Mean ($\text{m/s}^2$)', color=acc_color, fontsize=12,)
+    ax1.tick_params(axis='y', labelcolor=acc_color)
+    # Calculate the darker color for the edge and whisker
+    try:
+        rgb = mcolors.to_rgb(acc_color)
+        darker_color = tuple(c * 0.6 for c in rgb)
+    except ValueError:
+        darker_color = 'black' # Fallback
+    ax1.spines['left'].set_color(darker_color)
+    # ax1.grid(True, axis='y', linestyle='--', alpha=0.7) 
 
-    # Grid (only horizontal)
-    # ax1.grid(axis='y', linestyle='--', alpha=0.6)
-
-    # 7. Create Custom Legends
-    legend_handles = []
+    # Set Y-axis 2 (MAG) style
+    mag_color = sns.color_palette(MAG_PALETTE, 1)[0]
+    ax2.set_ylabel(r'Magnetometer Mean ($\mu\text{T}$)', color=mag_color, fontsize=12)
+    ax2.tick_params(axis='y', labelcolor=mag_color)
+        # Calculate the darker color for the edge and whisker
+    try:
+        rgb = mcolors.to_rgb(mag_color)
+        darker_color = tuple(c * 0.6 for c in rgb)
+    except ValueError:
+        darker_color = 'black' # Fallback
+    ax2.spines['right'].set_color(darker_color)
+    ax2.grid(False) 
     
-    # Trial Type (Fill) Legend
-    if n_trials > 1:
-        for trial, fill in trial_fills.items():
-            # Use black edge color for legend to contrast with the plot colors
-            legend_handles.append(mlines.Line2D([], [], color='black', marker='o', linestyle='None',
-                                            markersize=7, label=trial, fillstyle=fill,
-                                            markeredgecolor='black'))
-
-    # Std Dev (Darkness) Legend
-    # Create a gradient legend to explain alpha mapping
-    darkness_handles = []
-    std_values = np.linspace(0, global_std_max, 5)
-    for std_val in std_values:
-        alpha = get_alpha(std_val, global_std_max)
-        label = f"$\pm {std_val:.2g}$" # Use LaTeX for std symbol
-        darkness_handles.append(mlines.Line2D([], [], color='gray', marker='o', linestyle='None',
-                                            markersize=7, alpha=alpha, label=label, 
-                                            fillstyle='full', markeredgecolor='gray'))
-
-    # Combine all legends
-    if legend_handles:
-        trial_legend = fig.legend(handles=legend_handles, title='Trial Type',
-                                bbox_to_anchor=(0.99, 0.95), loc='upper left', frameon=False, 
-                                fontsize=10, title_fontsize=12)
-
-        # Add darkness legend next to it
-        fig.legend(handles=darkness_handles, title='Total STD Dev (Darkness)',
-                    bbox_to_anchor=(0.99, 0.7), loc='upper left', frameon=False, 
-                    fontsize=10, title_fontsize=12)
-        fig.add_artist(trial_legend) # Re-add the first legend
-
+    ax1.set_title(f'Pooled IMU Distribution (Mean $\pm$ STD) by {x_col} and {hue_col}', fontsize=14)
     
-    plt.tight_layout(rect=[0, 0.1, 0.85, 0.9])
-    plt.savefig('pooled_magnitudes_twin_ax_flipped_std_alpha.png', dpi=300)
+    # Combine and place the legend
+    color_handles = sorted(legend_proxies_color.values(), key=lambda x: x.get_label())
+    shape_handles = sorted(legend_proxies_shape.values(), key=lambda x: x.get_label())
 
+    # Create the first legend for colors (Hue levels per sensor)
+    legend1 = ax1.legend(
+        handles=color_handles, 
+        labels=[h.get_label() for h in color_handles], 
+        title=hue_legend_title, # Use the derived title
+        loc='upper left', 
+        bbox_to_anchor=(1.1, 1) 
+    )
+    ax1.add_artist(legend1) 
+
+    # 2. Get the bounding box of the legend in pixel coordinates (display coordinates).
+    legend_bbox_display = legend1.get_window_extent()
+
+    # 3. Convert the bounding box from pixel (display) coordinates to Figure coordinates (0 to 1).
+    # We invert the figure's transform to map display pixels back to the figure's fractional space.
+    legend_bbox_fig_coords = legend_bbox_display.transformed(fig.transFigure.inverted())
+
+    # 4. Extract the bottom edge (ymin)
+    legend_bottom_y_fig_coords = legend_bbox_fig_coords.ymin
+
+    # Create the second legend for shapes (Core Variables)
+    legend2 = ax1.legend(
+        handles=shape_handles, 
+        labels=[h.get_label() for h in shape_handles], 
+        title='Sensor Axis', 
+        loc='upper left', 
+        bbox_to_anchor=(1.1, legend_bottom_y_fig_coords + 0.08) 
+    )
+
+    fig.tight_layout() 
+    fig.subplots_adjust(right=0.7) 
+
+    plt.show()
 
 if __name__ == "__main__":
-    pkl_file = "imu_data_summary_.pkl"
-    
     # Mocking data loading since the file is not available
-    if os.path.exists(pkl_file):
-        df = pd.read_pickle(pkl_file)
+    if os.path.exists(PKL_FILE):
+        df = pd.read_pickle(PKL_FILE)
     else:
-        print(f"No '{pkl_file}' found. Generating mock data for demonstration...")
+        print(f"No '{PKL_FILE}' found. Generating mock data for demonstration...")
         all_results = []
-        for subject_num in range(1, 4): # Reduced subjects for mock data speed
-            SUBJECT_TO_LOAD = f"{subject_num:02d}"
-            for TRIAL_TYPE_TO_LOAD in ['walking', 'complexTasks']:
+        for subject_num in SUBJECTS_TO_LOAD:
+            for trial_type in TRIAL_TYPES_TO_LOAD:
                 # Call the processing function and get the data
-                processed_data = load_and_process_imu_data(SUBJECT_TO_LOAD, TRIAL_TYPE_TO_LOAD)
+                processed_data = load_and_process_imu_data(subject_num, trial_type)
                 all_results.extend(processed_data)
         
         if not all_results:
-            print("Mock data generation failed. Exiting.")
+            print("Data generation failed. Exiting.")
             sys.exit()
             
         df = pd.DataFrame(all_results)
-        # df.to_pickle(pkl_file) # Do not save mock data over real data
+        df.to_pickle(PKL_FILE)
+
+    # Order columns according to RENAME_SEGMENTS, then rename columns
+    df['segment'] = df['segment'].replace(RENAME_SEGMENTS)
+    segment_order = list(RENAME_SEGMENTS.values())
+    df['segment'] = pd.Categorical(df['segment'], categories=segment_order, ordered=True)
+    df = df.sort_values('segment')
+
+    # Filter down to only subjects and trial types of interest
+    df = df[df['subject'].isin([f"Subject{num}" for num in SUBJECTS_TO_LOAD])]
+    df = df[df['trial_type'].isin(TRIAL_TYPES_TO_LOAD)]
 
     # --- Generate Grouped Summary DataFrames ---
     print("\nGenerating pooled summary for magnitudes...")
     pooled_magnitudes_by_segment = get_pooled_summary(
         df,
-        group_by_cols=['segment'], # Group by both for dodged plot
+        group_by_cols=['segment'],
         data_cols=['acc_magnitude', 'mag_magnitude'] 
     )
-
     # Call the NEW plotting function
-    plot_pooled_magnitudes_twin_ax_flipped_std_alpha(pooled_magnitudes_by_segment)
-    plt.show()
+    plot_pooled_imu_distributions(pooled_magnitudes_by_segment)
