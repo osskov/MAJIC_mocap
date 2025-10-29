@@ -15,6 +15,10 @@ JOINT_SEGMENT_DICT = {'R_Hip': ('pelvis_imu', 'femur_r_imu'),
                       'Lumbar': ('pelvis_imu', 'torso_imu'),
                       }
 
+SUBJECTS = ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11']
+METHODS = ['Marker', 'Madgwick', 'Mahony', 'EKF', 'Mag On', 'Mag Adapt', 'Mag Off', 'Unprojected']
+TRIALS = ['walking', 'complexTasks']
+
 def _generate_orientation_sto_file_(output_directory: str,
                                     plate_trials: List[PlateTrial],
                                     num_frames: int,
@@ -92,10 +96,9 @@ def _generate_orientation_sto_file_(output_directory: str,
     _export_to_sto_(output_path, timestamps, segment_orientations)
     return timestamps[-1], list(segment_orientations.keys())
 
-
 def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
                                                child_trial: PlateTrial,
-                                               condition: str = 'never project',
+                                               condition: str = 'mag on',
                                                gyro_std: float = 0.01,
                                                acc_std: float = 0.05,
                                                mag_std: float = 0.05) -> List[np.ndarray]:
@@ -130,28 +133,32 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
         parent_trial.imu_trace = parent_trial.project_imu_trace(parent_joint_center_offset)
         child_trial.imu_trace = child_trial.project_imu_trace(child_joint_center_offset)
 
-        if condition == 'cascade':
-            da_parent = np.diff(parent_trial.imu_trace.acc, axis=0)
-            da_child = np.diff(child_trial.imu_trace.acc, axis=0)
-            o_parent = np.cross(parent_trial.imu_trace.acc[:-1], da_parent) / np.linalg.norm(parent_trial.imu_trace.acc[:-1],
-                                                                                        axis=1)[:, None]
-            o_child = np.cross(child_trial.imu_trace.acc[:-1], da_child) / np.linalg.norm(child_trial.imu_trace.acc[:-1], axis=1)[
-                                                                        :, None]
+        if condition == 'mag adapt':
+            parent_trial.imu_trace = parent_trial.project_imu_trace(parent_joint_center_offset)
+            child_trial.imu_trace = child_trial.project_imu_trace(child_joint_center_offset)
 
+            da_parent = np.diff(parent_trial.imu_trace.acc, axis=0) + np.cross(parent_trial.imu_trace.gyro[1:], parent_trial.imu_trace.acc[1:])
+            da_child = np.diff(child_trial.imu_trace.acc, axis=0) + np.cross(child_trial.imu_trace.gyro[1:], child_trial.imu_trace.acc[1:])
+            o_parent = np.cross(parent_trial.imu_trace.acc[1:], da_parent)
+            o_child = np.cross(child_trial.imu_trace.acc[1:], da_child)
             observability_metric = np.minimum(np.linalg.norm(o_parent, axis=1),
                                             np.linalg.norm(o_child, axis=1))
-            observability_metric = np.concatenate(([observability_metric[0]], observability_metric))
+            observability_metric = np.concatenate(([0.0], observability_metric))
 
             # Set mag to 0 where observability is high
-            threshold = 0.1
+            threshold = 150.0
             high_indexes = observability_metric > threshold
             parent_trial.imu_trace.mag = [np.zeros(3) if high else mag for high, mag in
                                           zip(high_indexes, parent_trial.imu_trace.mag)]
             child_trial.imu_trace.mag = [np.zeros(3) if high else mag for high, mag in
                                          zip(high_indexes, child_trial.imu_trace.mag)]
-        if condition == 'mag free':
+        elif condition == 'mag off':
             parent_trial.imu_trace.mag = [np.zeros(3)] * len(parent_trial)
             child_trial.imu_trace.mag = [np.zeros(3)] * len(child_trial)
+        elif condition == 'mag on':
+            pass  # Use mag as is
+        else:
+            raise ValueError(f"Unknown condition '{condition}' specified for joint orientation estimation.")
     elif condition == 'unprojected':
         pass  # Use raw IMU data without projection
     else:
@@ -165,7 +172,6 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
         R_pc.append(joint_filter.get_R_pc())
 
     return R_pc
-
 
 def _export_to_sto_(filename,
                     timestamps,
@@ -233,8 +239,8 @@ if __name__ == "__main__":
     # GENERATING STO FILES
     num_frames = -1  # Use -1 to indicate all frames
 
-    for subject_num in ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11']:
-        for activity in ['walking', 'complexTasks']:
+    for subject_num in SUBJECTS:
+        for activity in TRIALS:
             print(f"-------Processing Subject {subject_num}, Activity {activity}...--------")
             # Load the plate trials for the current subject and activity
             try:
@@ -246,8 +252,9 @@ if __name__ == "__main__":
 
                 print(f"Loaded {len(plate_trials)} plate trials.")
                 print(f"Identified segments: {[plate.name for plate in plate_trials]}")
-                
-                for condition in ['cascade']:
+
+                for condition in METHODS:
+                    condition = condition.lower()
                     output_dir = subject_activity_folder
                     if not os.path.exists(output_dir):
                         os.makedirs(output_dir)

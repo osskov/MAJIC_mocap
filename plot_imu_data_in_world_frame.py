@@ -1,24 +1,23 @@
 import os
 from typing import Dict, List, Any
 import pandas as pd
-# from src.toolchest.PlateTrial import PlateTrial # Assuming this is handled outside for execution
+from src.toolchest.PlateTrial import PlateTrial 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
 import sys
 import seaborn as sns
-from src.toolchest.PlateTrial import PlateTrial
 
 PKL_FILE = "imu_data_summary.pkl"
 RENAME_SEGMENTS = {
     'torso_imu': 'Torso',
     'pelvis_imu': 'Pelvis',
-    'femur_r_imu': 'Right\nFemur',
-    'femur_l_imu': 'Left\nFemur',
-    'tibia_r_imu': 'Right\nTibia',
-    'tibia_l_imu': 'Left\nTibia',
-    'calcn_r_imu': 'Right\nFoot',
-    'calcn_l_imu': 'Left\nFoot',
+    'femur_r_imu': 'Femur',
+    'femur_l_imu': 'Femur',
+    'tibia_r_imu': 'Tibia',
+    'tibia_l_imu': 'Tibia',
+    'calcn_r_imu': 'Foot',
+    'calcn_l_imu': 'Foot',
 }
 SUBJECTS_TO_LOAD = [f"{i:02d}" for i in range(1, 12)]
 TRIAL_TYPES_TO_LOAD = ['walking', 'complexTasks']
@@ -444,7 +443,8 @@ def plot_pooled_imu_distributions(df: pd.DataFrame):
         labels=[h.get_label() for h in shape_handles], 
         title='Sensor Axis', 
         loc='upper left', 
-        bbox_to_anchor=(1.1, legend_bottom_y_fig_coords + 0.08) 
+        # MODIFIED: Position based on the bottom of the first legend
+        bbox_to_anchor=(1.1, legend_bottom_y_fig_coords - 0.05) # <-- Slightly adjusted y_pos
     )
 
     fig.tight_layout() 
@@ -474,7 +474,10 @@ if __name__ == "__main__":
 
     # Order columns according to RENAME_SEGMENTS, then rename columns
     df['segment'] = df['segment'].replace(RENAME_SEGMENTS)
-    segment_order = list(RENAME_SEGMENTS.values())
+    
+    # Get unique values while preserving order (Python 3.7+)
+    segment_order = list(dict.fromkeys(RENAME_SEGMENTS.values()))
+    
     df['segment'] = pd.Categorical(df['segment'], categories=segment_order, ordered=True)
     df = df.sort_values('segment')
 

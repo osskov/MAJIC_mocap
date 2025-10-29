@@ -421,6 +421,76 @@ class WorldTrace:
         error = error.reshape(-1, 3)
         return parent_offset, child_offset, error
 
+    def get_joint_axes_and_eigenvalues(self, other_world_trace: 'WorldTrace') -> Tuple[List[np.ndarray], List[float]]:
+        """
+        Calculates the principal axes of relative rotation between two world traces.
+
+        (Docstring contents are the same as your original)
+        
+        Args:
+            other_world_trace (WorldTrace): The 'child' segment's world trace.
+                                          'self' is assumed to be the 'parent'.
+
+        Returns:
+            Tuple[List[float], List[np.ndarray]]:
+            - sorted_eigenvalues (list of 3 floats): The eigenvalues, sorted in increasing order.
+            - sorted_eigenvectors (list of 3 np.ndarray): The corresponding (3,) eigenvectors,
+                                                          sorted by eigenvalue.
+                                                          (e.g., sorted_eigenvectors[0]
+                                                          is the primary axis of rotation).
+        """
+        assert isinstance(other_world_trace, WorldTrace), "Must pass a WorldTrace instance."
+        assert len(self) == len(other_world_trace), "WorldTraces must have the same length."
+
+        # --- Step 1: Get Relative Rotations (Simplified) ---
+        
+        # Stack the lists of (3, 3) matrices into (n, 3, 3) arrays
+        R_wp_matrices = np.stack(self.rotations)
+        R_wc_matrices = np.stack(other_world_trace.rotations)
+
+        # Create stacked Rotation objects from the (n, 3, 3) arrays
+        R_wp_stack = Rotation.from_matrix(R_wp_matrices)
+        R_wc_stack = Rotation.from_matrix(R_wc_matrices)
+
+        # Calculate all relative rotations in one vectorized operation
+        # R_pc = R_wp.inv() * R_wc
+        R_pc_stack = R_wp_stack.inv() * R_wc_stack
+
+        # --- Step 2: Build the A matrix ---
+        
+        # Get the (n, 3, 3) stack of relative rotation matrices
+        all_rel_matrices = R_pc_stack.as_matrix()
+        
+        # Use broadcasting to subtract Identity from each matrix in the stack
+        A_stack = all_rel_matrices - np.identity(3) 
+        
+        # Reshape from (n, 3, 3) to (n*3, 3)
+        A = A_stack.reshape(-1, 3) 
+        
+        # --- Step 3: Solve via Eigendecomposition ---
+        
+        # Compute the (3, 3) matrix ATA
+        ATA = A.T @ A
+        
+        # Find its eigenvalues and eigenvectors
+        eigenvalues, eigenvectors = np.linalg.eig(ATA)
+
+        # --- Step 4: Sort and convert to lists ---
+        
+        sort_indices = np.argsort(eigenvalues)
+        
+        # Get the sorted (3,) array and (3, 3) matrix
+        sorted_eigenvalues_array = eigenvalues[sort_indices]
+        sorted_eigenvectors_matrix = eigenvectors[:, sort_indices]
+        
+        # Convert the (3,) array to a Python list of floats
+        final_eigenvalues_list = sorted_eigenvalues_array.tolist()
+        
+        # Create a list of (3,) arrays, one for each eigenvector (column)
+        final_eigenvectors_list = [sorted_eigenvectors_matrix[:, i] for i in range(3)]
+        
+        return final_eigenvectors_list, final_eigenvalues_list
+    
     @staticmethod
     def load_from_sto_file(sto_file: str) -> 'Dict[str, WorldTrace]':
         """
