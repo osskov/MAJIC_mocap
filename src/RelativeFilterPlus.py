@@ -109,7 +109,7 @@ class RelativeFilter:
         K = self.P @ H.T @ np.linalg.inv(S)
         
         # State and covariance update
-        P_tilde = self.P - K @ S @ K.T
+        P_tilde = (np.eye(len(self.P)) - K @ H) @ self.P
         n = -K @ e
         
         # Apply correction to orientation

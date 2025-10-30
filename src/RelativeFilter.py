@@ -108,7 +108,7 @@ class RelativeFilter:
         S = H @ self.P @ H.T + M @ R @ M.T
         K = self.P @ H.T @ np.linalg.inv(S)
 
-        P_tilde = self.P - K @ S @ K.T
+        P_tilde = (np.eye(len(self.P)) - K @ H) @ self.P
 
         # Calculate the innovation
         n = -K @ e
