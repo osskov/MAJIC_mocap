@@ -125,11 +125,15 @@ python generate_method_data_and_stats_pkls.py
 This will produce three key files in the data/data/ directory:
 
 -   **`all_subject_data.pkl`: A large file containing the full time-series data for all joints, methods, and subjects.
+
 -   **`all_subject_statistics.pkl` and `all_subject_statistics.csv`: A summary file with aggregated statistics (RMSE, MAE, etc.) used for plotting.
+
 -   **`all_subject_pearson_correlation.pkl` and `all_subject_pearson_correlation.csv`: A file containing Pearson correlation results.
+
+
 Note: You can set REGENERATE_FILES = False in this script to load existing .pkl files and avoid reprocessing all the data.
 
-Step 3: Generate the Paper Figures
+### Step 3: Generate the Paper Figures
 This is the final step to generate the plots shown in the paper.
 ```bash
 python plot_paper_figures.py
@@ -140,10 +144,15 @@ The output plots will be saved in the plots/ directory by default.
 The main plotting script, plot_paper_figures.py, contains a global configuration section at the top of the file where you can easily modify the analysis and plotting parameters:
 
 -   **`SUBJECTS_TO_PLOT`: A list of subject IDs to include in the analysis.
+
 -   **`METHODS_TO_PLOT`: A list of the estimation methods to compare.
+
 -   **`METRICS_TO_PLOT`: The performance metrics to be plotted (e.g., RMSE_deg).
+
 -   **`PLOT_STYLE`: Choose between 'strip' (strip plot with median/IQR) or 'bar' (bar plot with mean/CI).
+
 -   **`SAVE_PLOTS` and `SHOW_PLOTS`: Control whether plots are saved to disk and/or displayed on screen.
+
 # Citation
 If you use this code or the Relative Filter in your research, please cite our publication:
 
