@@ -8,7 +8,7 @@ import numpy as np
 import sys
 import seaborn as sns
 
-PKL_FILE = "imu_data_summary.pkl"
+PKL_FILE = os.path.abspath(os.path.join("data", "data", "all_subject_imu_data_summary.pkl"))
 RENAME_SEGMENTS = {
     'torso_imu': 'Torso',
     'pelvis_imu': 'Pelvis',

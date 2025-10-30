@@ -583,7 +583,6 @@ def main():
 
     # Rename joints for clarity
     summary_stats_df = summary_stats_df.rename(index=RENAME_JOINTS, level='joint_name')
-    # print(summary_stats_df.head())
 
     # Drop subjects and methods not in the analysis
     summary_stats_df = summary_stats_df[summary_stats_df.index.get_level_values('method').isin(METHODS_TO_PLOT)]
@@ -593,12 +592,39 @@ def main():
     
     plot_summary_data(
         summary_df=summary_stats_df,
+        group_cols=[],  # You can add more grouping columns as needed
+        plot_type=PLOT_STYLE,  # 'bar' or 'strip'
+        metric=METRICS_TO_PLOT[0],  # e.g., 'rmse_deg'
+        method_order=METHODS_TO_PLOT,
+        show_labels=True,
+    )
+
+    plot_summary_data(
+        summary_df=summary_stats_df,
         group_cols=['axis'],  # You can add more grouping columns as needed
         plot_type=PLOT_STYLE,  # 'bar' or 'strip'
         metric=METRICS_TO_PLOT[0],  # e.g., 'rmse_deg'
         method_order=METHODS_TO_PLOT,
         show_labels=True,
     )
+
+    # plot_summary_data(
+    #     summary_df=summary_stats_df,
+    #     group_cols=['joint_name'],  # You can add more grouping columns as needed
+    #     plot_type=PLOT_STYLE,  # 'bar' or 'strip'
+    #     metric=METRICS_TO_PLOT[0],  # e.g., 'rmse_deg'
+    #     method_order=METHODS_TO_PLOT,
+    #     show_labels=True,
+    # )
+
+    # plot_summary_data(
+    #     summary_df=summary_stats_df,
+    #     group_cols=['subject'],  # You can add more grouping columns as needed
+    #     plot_type=PLOT_STYLE,  # 'bar' or 'strip'
+    #     metric=METRICS_TO_PLOT[0],  # e.g., 'rmse_deg'
+    #     method_order=METHODS_TO_PLOT,
+    #     show_labels=True,
+    # )
 
     print("\n--- All plotting complete ---")
 
