@@ -8,8 +8,8 @@ import os
 from generate_method_orientation_sto_files import JOINT_SEGMENT_DICT
 
 
-ALL_SUBJECTS = ["Subject01", "Subject02", "Subject03", "Subject04", "Subject05", "Subject06",
-                "Subject07", "Subject08", "Subject09", "Subject10", "Subject11"]
+ALL_SUBJECTS = ["Subject01"]#, "Subject02", "Subject03", "Subject04", "Subject05", "Subject06",
+                #"Subject07", "Subject08", "Subject09", "Subject10", "Subject11"]
 
 ALL_METHODS = ['Marker', 
                'Madgwick (Al Borno)', 'EKF', 'Mahony', 'Madgwick',
@@ -19,25 +19,24 @@ ALL_JOINTS = ['R_Ankle', 'L_Ankle', 'R_Knee', 'L_Knee', 'R_Hip', 'L_Hip', 'Lumba
 
 ALL_TRIAL_TYPES = ['walking', 'complexTasks']
 
+BASE_DATA_PATH = os.path.abspath(os.path.join("data", "data"))
+REGENERATE_DATA_PKLS = True
+
 # ------------------------------------------------
 
 # --- Data Loading Functions (Copied from your prompt) ---
 
-def get_joint_traces_df(plate_trials: List['PlateTrial'], euler_order: str = 'ZYX') -> pd.DataFrame:
+def get_joint_traces_df(plate_trials: List['PlateTrial']) -> pd.DataFrame:
     """
     Calculates joint rotations (child relative to parent) from PlateTrials
-    and returns them in a long-form pandas DataFrame using Euler angles.
+    and returns them in a long-form pandas DataFrame, storing the
+    scipy.spatial.transform.Rotation object directly.
     
     Args:
         plate_trials (List['PlateTrial']): Assumes all trials in this list 
                                           have been resynced and trimmed.
-        euler_order (str): The order of intrinsic Euler angle rotations 
-                           (e.g., 'ZYX', 'YXZ').
-                           Angles are in RADIANS.
-
     Returns:
-        pd.DataFrame: A DataFrame with columns for metadata and Euler angles
-                      (e.g., 'euler_Z_rad', 'euler_Y_rad', 'euler_X_rad').
+        pd.DataFrame: A DataFrame with columns for metadata and 'rotation'.
     """
     all_joint_data = [] # List of dictionaries for DataFrame creation
     
@@ -57,22 +56,23 @@ def get_joint_traces_df(plate_trials: List['PlateTrial'], euler_order: str = 'ZY
                 print(f"Warning: No rotations calculated for {joint_name}. Skipping.")
                 continue
 
-            joint_rotations_euler = Rotation.from_matrix(joint_rotations_mat).as_euler(euler_order) # (N, 3)
-            joint_rotations_rotvec = Rotation.from_matrix(joint_rotations_mat).as_rotvec() # (N, 3)
+            # --- SIMPLIFIED LOGIC ---
+            # 1. Create the Rotation objects
+            joint_rotations = Rotation.from_matrix(joint_rotations_mat)
         
         except (ValueError, TypeError, AttributeError) as e:
             print(f"Error processing rotations for {joint_name} ({parent_name}/{child_name}): {e}. Skipping.")
             continue
-        print(f"   > Calculated {len(joint_rotations_euler)} joint rotations for {joint_name}.")
+            
+        print(f"   > Calculated {len(joint_rotations)} joint rotations for {joint_name}.")
+        
+        # 2. Store the objects directly in the DataFrame
+        # Note: The column will have dtype='object'
         joint_df_data = {
             'timestamp': timestamps,
-            f'euler_{euler_order[0]}_rad': joint_rotations_euler[:, 0],
-            f'euler_{euler_order[1]}_rad': joint_rotations_euler[:, 1],
-            f'euler_{euler_order[2]}_rad': joint_rotations_euler[:, 2],
-            f'angle_axis_x_rad': joint_rotations_rotvec[:, 0],
-            f'angle_axis_y_rad': joint_rotations_rotvec[:, 1],
-            f'angle_axis_z_rad': joint_rotations_rotvec[:, 2],
+            'rotation': joint_rotations, # This is an array of Rotation objects
         }
+        
         print(f"   > Prepared data for DataFrame for joint {joint_name}.")
         joint_df = pd.DataFrame(joint_df_data)
         joint_df['joint_name'] = joint_name
@@ -88,13 +88,13 @@ def get_joint_traces_df(plate_trials: List['PlateTrial'], euler_order: str = 'ZY
 
 def load_joint_traces_for_subject_df(subject_id: str, 
                                      trial_type: str,
-                                     methods: List[str] = ['Marker', 'Madgwick', 'Mag Free', 'Never Project'],
-                                     euler_order: str = 'ZYX') -> pd.DataFrame:
+                                     methods: List[str] = ['Marker', 'Madgwick', 'Mag Free', 'Never Project']) -> pd.DataFrame:
     """
     Loads, resyncs, and processes joint traces for a specific subject and
-    trial type, returning a consolidated pandas DataFrame with Euler angles.
+    trial type, returning a consolidated pandas DataFrame with Rotation objects.
     """
     try:
+        # ... [Unchanged loading logic] ...
         plate_trials_by_method: Dict[str, List['PlateTrial']] = {}
         plate_trials_by_method['Marker'] = PlateTrial.load_trial_from_folder(
                         os.path.join("data", "data", subject_id, trial_type)
@@ -131,7 +131,9 @@ def load_joint_traces_for_subject_df(subject_id: str,
             print(f"No valid trimmed trials for method {method_name}. Skipping.")
             continue
         print(f"Processing joint traces for method {method_name}...")
-        joint_df = get_joint_traces_df(trials_list, euler_order=euler_order)
+        
+        # --- MODIFIED CALL (no euler_order) ---
+        joint_df = get_joint_traces_df(trials_list)
         
         if not joint_df.empty:
             joint_df['method'] = method_name
@@ -147,10 +149,12 @@ def load_joint_traces_for_subject_df(subject_id: str,
     final_df['subject_id'] = subject_id
     final_df['trial_type'] = trial_type
     
+    # --- SIMPLIFIED COLUMNS ---
     meta_cols = ['subject_id', 'trial_type', 'method', 'joint_name', 'timestamp']
-    data_cols = [f'euler_{c}_rad' for c in euler_order] + ['angle_axis_x_rad', 'angle_axis_y_rad', 'angle_axis_z_rad']
+    data_cols = ['rotation'] # The only data column
     
-    columns_order = meta_cols + data_cols
+    # Ensure all columns exist, especially 'rotation' in case of empty data
+    columns_order = [c for c in (meta_cols + data_cols) if c in final_df.columns]
     final_df = final_df[columns_order]
 
     final_df = final_df.set_index(
@@ -160,12 +164,18 @@ def load_joint_traces_for_subject_df(subject_id: str,
     return final_df
 
 # --- RMSE Calculation Function ---
-def get_summary_statistics(all_data_df: pd.DataFrame, group_by: List[str]) -> pd.DataFrame:
+def get_summary_statistics(all_data_df: pd.DataFrame, 
+                           group_by: List[str], 
+                           euler_order: str = 'XYZ') -> pd.DataFrame:
     """
     Calculates a comprehensive set of error statistics 
-    between all methods and the 'Marker' method, including:
-    1. Statistics for individual Euler angle errors (X, Y, Z).
-    2. Statistics for the 3D angle-axis error magnitude (MAG).
+    between all methods and the 'Marker' method using the 'rotation' object column.
+    
+    Args:
+        all_data_df (pd.DataFrame): Must contain a 'rotation' column.
+        group_by (List[str]): List of index levels to group by.
+        euler_order (str): The euler order (e.g., 'XYZ') to use
+                           for decomposing the error rotation.
     """
     print("--- [get_summary_statistics] Starting error statistics calculation... ---")
     
@@ -189,15 +199,7 @@ def get_summary_statistics(all_data_df: pd.DataFrame, group_by: List[str]) -> pd
         print("Error: No IMU methods found to compare against 'Marker'.")
         return pd.DataFrame()
 
-    # --- 3. Calculate Error via Merge ---
-    
-    euler_cols = [col for col in df.columns if col.startswith('euler_')]
-    angle_axis_cols = [col for col in df.columns if col.startswith('angle_axis_')]
-        
-    if not euler_cols:
-        print("Error: No Euler angle columns (e.g., 'euler_X_rad') found.")
-        return pd.DataFrame()
-        
+    # --- 3. Merge Data ---
     join_levels = marker_df.index.names
     marker_reset = marker_df.reset_index()
     imu_reset = imu_df.reset_index()
@@ -215,36 +217,55 @@ def get_summary_statistics(all_data_df: pd.DataFrame, group_by: List[str]) -> pd
         return pd.DataFrame()
     
     print(f"   > Merge complete. Result has {len(merged_df)} rows.")
+    
+    if 'rotation_imu' not in merged_df.columns:
+        print("Error: 'rotation_imu' column not found after merge. Check data loading.")
+        return pd.DataFrame()
 
-    # Calculate error for each euler angle component
+    # --- 4. Calculate Rotational Error (R_err = R_marker.inv() * R_imu) ---
+    print("   > Accessing rotation objects from DataFrame columns...")
+    try:
+        # --- MODIFIED LOGIC ---
+        # 1. Access the Rotation objects directly from the 'object' columns
+        #    and stack them into a single (N,) Rotation object for batch processing.
+        R_imu = Rotation(list(merged_df['rotation_imu'].values))
+        R_marker = Rotation(list(merged_df['rotation_marker'].values))
+        
+        # 2. Calculate the error rotation
+        print("   > Calculating error rotation (R_err = R_marker.inv() * R_imu)...")
+        R_err = R_marker.inv() * R_imu
+        
+    except Exception as e:
+        print(f"   > CRITICAL Error: Failed to calculate rotational error: {e}.")
+        return pd.DataFrame()
+
     error_cols_dict = {}
-    for col in euler_cols:
-        error_col_name = "error_" + col 
-        merged_df[error_col_name] = merged_df[f'{col}_imu'] - merged_df[f'{col}_marker']
-        error_cols_dict[error_col_name] = col.split('_')[1] # 'X', 'Y', 'Z'
-    
-    # --- Calculate 3D Angle-Axis Error Magnitude ---
-    angle_axis_vector_imu = merged_df[[f'{c}_imu' for c in angle_axis_cols]].values
-    angle_axis_vector_marker = merged_df[[f'{c}_marker' for c in angle_axis_cols]].values
-    
-    # Error Vector: Delta = Theta_IMU - Theta_Marker
-    error_vector = angle_axis_vector_imu - angle_axis_vector_marker
-    
-    # Magnitude of the Error Vector: ||Delta||
-    error_magnitude = np.linalg.norm(error_vector, axis=1) 
-    
+
+    # --- 5. Decompose R_err into 3D Error Magnitude (MAG) ---
+    print("   > Decomposing R_err into 3D magnitude ('MAG')...")
+    error_magnitude = R_err.magnitude()
     MAGNITUDE_COL_NAME = 'angle_axis_error_magnitude_rad'
     merged_df[MAGNITUDE_COL_NAME] = error_magnitude
+    error_cols_dict[MAGNITUDE_COL_NAME] = 'MAG'
+
+    # --- 6. Decompose R_err into Euler Angle Components (X, Y, Z) ---
+    print(f"   > Decomposing R_err into Euler angles (order: {euler_order})...")
     
-    error_cols_dict[MAGNITUDE_COL_NAME] = 'MAG' # Key for the summary index
+    # Get the (N, 3) array of Euler angle errors
+    error_euler_angles = R_err.as_euler(euler_order)
+    
+    for i, char in enumerate(euler_order): # e.g., 'X', 'Y', 'Z'
+        error_col_name = f'error_euler_{char}_rad' # e.g., 'error_euler_X_rad'
+        merged_df[error_col_name] = error_euler_angles[:, i]
+        error_cols_dict[error_col_name] = char # e.g., 'X'
     
     print(f"   > Calculated error columns: {list(error_cols_dict.keys())}.")
     
-    # --- Correlation steps (3.5) are removed ---
-
-    # --- 4. Reshape to Long Format (Melt) ---
-    
+    # --- 7. Reshape to Long Format (Melt) ---
+    # ... [Unchanged] ...
     meta_cols = [lvl for lvl in join_levels if lvl != 'timestamp'] # subject, trial_type, method, joint_name
+    if 'method' not in meta_cols:
+        meta_cols.append('method') # Ensure 'method' is included
     error_columns_to_melt = list(error_cols_dict.keys())
     
     print("   > Reshaping DataFrame (melting) from wide to long format...")
@@ -256,23 +277,23 @@ def get_summary_statistics(all_data_df: pd.DataFrame, group_by: List[str]) -> pd
         value_name='error_rad'
     ).set_index(meta_cols + ['timestamp'])
     
-    # --- 5. Clean up 'axis' Names ---
+    # --- 8. Clean up 'axis' Names ---
+    # ... [Unchanged] ...
     error_long['axis'] = error_long['error_metric_name'].map(error_cols_dict)
     
     all_levels = meta_cols + ['timestamp', 'axis']
     error_long = error_long.reset_index().set_index(all_levels).drop(columns=['error_metric_name'])
     
-    # --- 6. Group and Calculate Statistics ---
-    
+    # --- 9. Group and Calculate Statistics ---
+    # ... [Unchanged logic] ...
     valid_group_by = [lvl for lvl in group_by if lvl in error_long.index.names]
     if not valid_group_by:
         print("Error: No valid group_by keys. Returning empty DataFrame.")
         return pd.DataFrame()
 
-    print(f"   > Grouping data by {valid_group_by}...")
-    grouped = error_long['error_rad'].groupby(level=valid_group_by)
+    print(f"   > Grouping data by {valid_group_by} for columns {error_long.columns.tolist()}...")
+    grouped = error_long['error_rad'].dropna().groupby(level=valid_group_by)
     
-    # Define the aggregation functions
     def q25(x): return x.quantile(0.25)
     def q75(x): return x.quantile(0.75)
     def rmse(x): return np.sqrt(np.mean(x**2))
@@ -293,9 +314,8 @@ def get_summary_statistics(all_data_df: pd.DataFrame, group_by: List[str]) -> pd
         Q75 = q75,
     ).sort_index()
     
-    # --- Correlation Merge is Removed ---
-
-    # Convert radian-based stats to degrees
+    # --- 10. Final Formatting ---
+    # ... [Unchanged] ...
     rad_cols = ['RMSE', 'MAE', 'Mean', 'STD', 'MAD', 'Q25', 'Median', 'Q75']
     deg_cols = [f'{col}_deg' for col in rad_cols]
     
@@ -305,7 +325,6 @@ def get_summary_statistics(all_data_df: pd.DataFrame, group_by: List[str]) -> pd
     summary_df = summary_df.rename(columns=rad_rename_dict)
     print("   > Converted statistics to degrees and renamed columns.")
     
-    # Reorder columns
     final_cols = []
     for col in rad_cols:
         final_cols.append(f'{col}_rad')
@@ -319,14 +338,19 @@ def get_summary_statistics(all_data_df: pd.DataFrame, group_by: List[str]) -> pd
     print("--- [get_summary_statistics] Finished. Returning error summary DataFrame. ---")
     return summary_df
 
-def get_pearson_correlation_summary(all_data_df: pd.DataFrame, group_by: List[str]) -> pd.DataFrame:
+def get_pearson_correlation_summary(all_data_df: pd.DataFrame, 
+                                    group_by: List[str], 
+                                    euler_order: str = 'XYZ') -> pd.DataFrame:
     """
     Calculates the Pearson correlation (R) between the time series of each method 
-    and the 'Marker' method for all Euler and Angle-Axis components.
+    and the 'Marker' method. It first decomposes the 'rotation' object column
+    into Euler and Angle-Axis components.
     
-    Returns:
-        pd.DataFrame: A DataFrame indexed by the specified groups and 'axis' 
-                      (X, Y, Z, AA_X, AA_Y, AA_Z) with a 'PearsonR' column.
+    Args:
+        all_data_df (pd.DataFrame): Must contain a 'rotation' column.
+        group_by (List[str]): List of index levels to group by.
+        euler_order (str): The euler order (e.g., 'XYZ') to use
+                           for decomposing the rotation.
     """
     print("--- [get_pearson_correlation_summary] Starting correlation calculation... ---")
 
@@ -336,7 +360,39 @@ def get_pearson_correlation_summary(all_data_df: pd.DataFrame, group_by: List[st
     else:
         df = all_data_df.copy()
 
+    if 'rotation' not in df.columns:
+        print("Error: 'rotation' column not found. Cannot decompose for correlation.")
+        return pd.DataFrame()
+
+    # --- NEW STEP: Decompose Rotation Objects (Vectorized) ---
+    print("   > Vectorized decomposition of 'rotation' objects for correlation...")
+    
+    # 1. Reset index to get a flat DataFrame and access the 'rotation' column
+    original_index_names = df.index.names
+    df_reset = df.reset_index()
+    
+    # 2. Stack all rotation objects into one for batch processing
+    all_rotations = Rotation(list(df_reset['rotation'].values))
+    
+    # 3. Decompose to Euler
+    print(f"   > Decomposing to Euler (order: {euler_order})...")
+    euler_angles = all_rotations.as_euler(euler_order)
+    for i, char in enumerate(euler_order):
+        df_reset[f'euler_{char}_rad'] = euler_angles[:, i]
+        
+    # 4. Decompose to Angle-Axis
+    print("   > Decomposing to Angle-Axis...")
+    rotvecs = all_rotations.as_rotvec()
+    df_reset['angle_axis_x_rad'] = rotvecs[:, 0]
+    df_reset['angle_axis_y_rad'] = rotvecs[:, 1]
+    df_reset['angle_axis_z_rad'] = rotvecs[:, 2]
+    
+    # 5. Restore the original index
+    df = df_reset.set_index(original_index_names)
+    
     # --- 2. Separate Data and Get Columns ---
+    # The rest of the function now proceeds exactly as before,
+    # as the required columns (euler_... and angle_axis_...) now exist.
     try:
         marker_df = df.xs('Marker', level='method')
         imu_df = df.drop('Marker', level='method')
@@ -353,13 +409,14 @@ def get_pearson_correlation_summary(all_data_df: pd.DataFrame, group_by: List[st
         return pd.DataFrame()
 
     # --- 3. Merge Data ---
+    # ... [Unchanged] ...
     join_levels = marker_df.index.names
-    corr_group_levels = [lvl for lvl in join_levels if lvl != 'timestamp'] # e.g., [subject, trial_type, method, joint_name]
+    corr_group_levels = [lvl for lvl in join_levels if lvl != 'timestamp']
+    corr_group_levels.append('method') 
 
     marker_reset = marker_df.reset_index()
     imu_reset = imu_df.reset_index()
     
-    # Merge IMU and Marker data
     merged_df = pd.merge(
         imu_reset, 
         marker_reset, 
@@ -371,7 +428,7 @@ def get_pearson_correlation_summary(all_data_df: pd.DataFrame, group_by: List[st
         return pd.DataFrame()
     
     # --- 4. Calculate Correlation ---
-    
+    # ... [Unchanged] ...
     corr_cols = {
         col: (f'{col}_imu', f'{col}_marker') 
         for col in all_correlation_cols
@@ -382,29 +439,25 @@ def get_pearson_correlation_summary(all_data_df: pd.DataFrame, group_by: List[st
     def calculate_pair_correlation(group, col_pairs):
         results = {}
         for original_col, (imu_col, marker_col) in col_pairs.items():
-            # Determine axis name for the correlation index
             if original_col.startswith('euler_'):
-                axis_name = original_col.split('_')[1]      # 'X', 'Y', 'Z'
-            else: # angle_axis_x/y/z_rad
+                axis_name = original_col.split('_')[1]
+            else: 
                 axis_name = 'AA_' + original_col.split('_')[2].upper()
                 
             results[axis_name] = group[imu_col].corr(group[marker_col], method='pearson')
         return pd.Series(results, name='PearsonR')
 
-    # Apply the function to the correctly grouped data
     corr_grouped = merged_df.groupby(corr_group_levels).apply(lambda x: calculate_pair_correlation(x, corr_cols))
     
     correlation_df = corr_grouped.stack().rename('PearsonR').to_frame()
-    # The index names must match the levels used for grouping + the new 'axis' level
     correlation_df.index.names = corr_group_levels + ['axis'] 
 
     # --- 5. Final Grouping (if necessary) ---
+    # ... [Unchanged] ...
     valid_group_by = [lvl for lvl in group_by if lvl in correlation_df.index.names]
     
     if len(valid_group_by) < len(correlation_df.index.names):
-        # This handles cases where the user groups by a subset (e.g., only by method and axis)
         print(f"   > Re-grouping correlation data by requested levels: {valid_group_by}...")
-        # Since PearsonR is a single value per group, min() is safe for aggregation
         correlation_df = correlation_df.groupby(level=valid_group_by).min()
     
     print("--- [get_pearson_correlation_summary] Finished. Returning correlation DataFrame. ---")
@@ -424,9 +477,9 @@ if __name__ == "__main__":
     os.makedirs("plots", exist_ok=True)
     os.makedirs(os.path.join("data", "data"), exist_ok=True)
 
-    data_file_path = os.path.abspath(os.path.join("data", "data", f"all_subject_data.pkl"))
+    data_file_path = os.path.join(BASE_DATA_PATH, f"all_subject_data.pkl")
     
-    if os.path.exists(data_file_path):
+    if os.path.exists(data_file_path) and not REGENERATE_DATA_PKLS:
         print(f"Loading existing DataFrame from {data_file_path}...")
         all_data_df = pd.read_pickle(data_file_path)
     else:
@@ -436,14 +489,13 @@ if __name__ == "__main__":
             for subject_id in SUBJECT_IDS:
                 subject_pkl_path = os.path.abspath(os.path.join("data", "data", subject_id, trial_type, f"{subject_id}_{trial_type}_data.pkl"))
                 print(f"--- Processing {subject_id} - {trial_type} ---")
-                if not os.path.exists(subject_pkl_path):
+                if not os.path.exists(subject_pkl_path) or REGENERATE_DATA_PKLS:
                     print(f"Data for {subject_id} - {trial_type} not found. Loading and processing...")
                     try:
                         subject_df = load_joint_traces_for_subject_df(
                             subject_id=subject_id,
                             methods=METHODS,
-                            trial_type=trial_type,
-                            euler_order='XYZ' # Using 'XYZ' as per your original call
+                            trial_type=trial_type
                         )
                         subject_df.to_pickle(subject_pkl_path)  # Ensure DataFrame is valid
                     except Exception as e:
@@ -470,8 +522,8 @@ if __name__ == "__main__":
     print("Data loading and concatenation complete.")
 
     # --- Get Summary Statistics ---
-    stats_file_path = os.path.abspath(os.path.join("data", "data", f"all_subject_statistics.pkl"))
-    if os.path.exists(stats_file_path):
+    stats_file_path = os.path.join(BASE_DATA_PATH, f"all_subject_statistics.pkl")
+    if os.path.exists(stats_file_path) and not REGENERATE_DATA_PKLS:
         print(f"Loading existing summary statistics from {stats_file_path}...")
         summary_stats_df = pd.read_pickle(stats_file_path)
     else:
@@ -482,17 +534,11 @@ if __name__ == "__main__":
         summary_stats_df.to_pickle(stats_file_path)
 
     print("Summary statistics calculation complete.")
+    summary_stats_df.to_csv(os.path.join(BASE_DATA_PATH, f"all_subject_statistics.csv"))
 
-    print("Summary statistics has the following structure:")
-    with pd.option_context('display.max_seq_items', None):
-        # print(summary_stats_df.head())
-        # Check if pearsonR column exists
-        if 'PearsonR' in summary_stats_df.columns:
-            print(summary_stats_df['PearsonR'].head())
-    summary_stats_df.to_csv(os.path.abspath(os.path.join("data", "data", f"all_subject_statistics.csv")))
-    print("good job daniel")
-    pearson_corr_file_path = os.path.abspath(os.path.join("data", "data", f"all_subject_pearson_correlation.pkl"))
-    if os.path.exists(pearson_corr_file_path):
+    # --- Get Pearson Correlation Summary ---
+    pearson_corr_file_path = os.path.join(BASE_DATA_PATH, f"all_subject_pearson_correlation.pkl")
+    if os.path.exists(pearson_corr_file_path) and not REGENERATE_DATA_PKLS:
         print(f"Loading existing Pearson correlation data from {pearson_corr_file_path}...")
         pearson_corr_df = pd.read_pickle(pearson_corr_file_path)
     else:
@@ -501,3 +547,6 @@ if __name__ == "__main__":
             group_by=['trial_type', 'method', 'joint_name', 'subject', 'axis']
         )
         pearson_corr_df.to_pickle(pearson_corr_file_path)
+
+    print("Pearson correlation calculation complete.")
+    pearson_corr_df.to_csv(os.path.join(BASE_DATA_PATH, f"all_subject_pearson_correlation.csv"))

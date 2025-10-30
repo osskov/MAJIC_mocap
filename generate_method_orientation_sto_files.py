@@ -6,17 +6,17 @@ from src.toolchest.PlateTrial import PlateTrial
 from src.RelativeFilterPlus import RelativeFilter
 from src.toolchest.AHRSFilter import AHRSFilter
 
-JOINT_SEGMENT_DICT = {'R_Hip': ('pelvis_imu', 'femur_r_imu'),
+JOINT_SEGMENT_DICT = {'Lumbar': ('pelvis_imu', 'torso_imu'),
+                      'R_Hip': ('pelvis_imu', 'femur_r_imu'),
                       'R_Knee': ('femur_r_imu', 'tibia_r_imu'),
                       'R_Ankle': ('tibia_r_imu', 'calcn_r_imu'),
                       'L_Hip': ('pelvis_imu', 'femur_l_imu'),
                       'L_Knee': ('femur_l_imu', 'tibia_l_imu'),
                       'L_Ankle': ('tibia_l_imu', 'calcn_l_imu'),
-                      'Lumbar': ('pelvis_imu', 'torso_imu'),
                       }
 
 SUBJECTS = ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11']
-METHODS = ['Marker', 'Madgwick', 'Mahony', 'EKF', 'Mag On', 'Mag Adapt', 'Mag Off', 'Unprojected']
+METHODS = ['Mag On', 'Mag Adapt', 'Mag Off', 'Unprojected'] #  'Madgwick', 'Mahony', 'EKF', 
 TRIALS = ['walking', 'complexTasks']
 
 def _generate_orientation_sto_file_(output_directory: str,
@@ -53,7 +53,7 @@ def _generate_orientation_sto_file_(output_directory: str,
     elif condition == 'mahony' or condition == 'madgwick' or condition == 'ekf':
         segment_orientations = {}
         for plate in plate_trials:
-            print(f'Processing {plate.name} with {condition} filter...')
+            # print(f'Processing {plate.name} with {condition} filter...')
             ahrs_filter = AHRSFilter(select_filter=condition.capitalize())
             R_initial = Rotation.from_matrix(plate.world_trace.rotations[0])
             q_initial = R_initial.as_quat()
@@ -78,7 +78,7 @@ def _generate_orientation_sto_file_(output_directory: str,
             child_trial = next((p for p in plate_trials if p.name.__contains__(child_name)), None)
             if not parent_trial or not child_trial:
                 continue
-            print(f'Processing {joint_name} between {parent_name} and {child_name}...')
+            # print(f'Processing {joint_name} between {parent_name} and {child_name}...')
 
             joint_orientations = _get_joint_orientations_from_plate_trials_(parent_trial, child_trial, condition)
 
@@ -99,9 +99,9 @@ def _generate_orientation_sto_file_(output_directory: str,
 def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
                                                child_trial: PlateTrial,
                                                condition: str = 'mag on',
-                                               gyro_std: float = 0.01,
-                                               acc_std: float = 0.05,
-                                               mag_std: float = 0.05) -> List[np.ndarray]:
+                                               gyro_std: float = np.sqrt(0.01),
+                                               acc_std: float = np.sqrt(0.05),
+                                               mag_std: float = np.sqrt(0.05)) -> List[np.ndarray]:
     """
     Estimates joint orientations between parent and child trials using specified filter conditions.
 
@@ -114,6 +114,8 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
         List[np.ndarray]: A list of joint orientation matrices.
     """
     # Create the filter structure
+    parent_trial = parent_trial.copy()
+    child_trial = child_trial.copy()
     joint_filter = RelativeFilter(gyro_std_parent=np.ones(3) * gyro_std, gyro_std_child=np.ones(3) * gyro_std,
                                   sensor_stds_parent=[np.ones(3) * acc_std, np.ones(3) * mag_std],
                                   sensor_stds_child=[np.ones(3) * acc_std, np.ones(3) * mag_std])
@@ -134,9 +136,6 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
         child_trial.imu_trace = child_trial.project_imu_trace(child_joint_center_offset)
 
         if condition == 'mag adapt':
-            parent_trial.imu_trace = parent_trial.project_imu_trace(parent_joint_center_offset)
-            child_trial.imu_trace = child_trial.project_imu_trace(child_joint_center_offset)
-
             da_parent = np.diff(parent_trial.imu_trace.acc, axis=0) + np.cross(parent_trial.imu_trace.gyro[1:], parent_trial.imu_trace.acc[1:])
             da_child = np.diff(child_trial.imu_trace.acc, axis=0) + np.cross(child_trial.imu_trace.gyro[1:], child_trial.imu_trace.acc[1:])
             o_parent = np.cross(parent_trial.imu_trace.acc[1:], da_parent)
@@ -165,8 +164,8 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
         raise ValueError(f"Unknown condition '{condition}' specified for joint orientation estimation.")
     for t in range(len(parent_trial)):
         joint_filter.update(parent_trial.imu_trace.gyro[t], child_trial.imu_trace.gyro[t],
-                            [parent_trial.imu_trace.acc[t], child_trial.imu_trace.acc[t]],
-                            [parent_trial.imu_trace.mag[t], child_trial.imu_trace.mag[t]], dt)
+                            [parent_trial.imu_trace.acc[t], parent_trial.imu_trace.mag[t]],
+                            [child_trial.imu_trace.acc[t], child_trial.imu_trace.mag[t]], dt)
 
         # Store the joint orientation
         R_pc.append(joint_filter.get_R_pc())
@@ -254,6 +253,7 @@ if __name__ == "__main__":
                 print(f"Identified segments: {[plate.name for plate in plate_trials]}")
 
                 for condition in METHODS:
+                    print(f"Generating STO file for condition: {condition}...")
                     condition = condition.lower()
                     output_dir = subject_activity_folder
                     if not os.path.exists(output_dir):
