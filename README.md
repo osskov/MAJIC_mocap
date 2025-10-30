@@ -48,14 +48,6 @@ The repository is organized into several key Python scripts and a data directory
 ├── plot_imu_data_in_world_frame.py
 └── README.md
 
-code
-Code
-
-download
-
-content_copy
-
-expand_less
 -   **`src/RelativeFilterPlus.py`**: The core implementation of the Relative Filter.
 -   **`src/toolchest/`**: A collection of utility classes for handling IMU data (`IMUTrace`), motion capture data (`WorldTrace`), and synchronized trial data (`PlateTrial`).
 -   **`generate_method_orientation_sto_files.py`**: This script processes the raw data for each subject and trial, runs various orientation estimation methods (including the Relative Filter variants), and saves the resulting segment orientations as `.sto` files.
@@ -104,14 +96,6 @@ data/
 │ └── ...
 └── ...
 
-code
-Code
-
-download
-
-content_copy
-
-expand_less
 -   Each subject should have their own directory (e.g., `Subject01`, `Subject02`).
 -   Inside each subject's directory, there should be subdirectories for each trial type (e.g., `walking`, `complexTasks`).
 -   Each trial directory must contain:
@@ -178,17 +162,3 @@ If you use this code or the Relative Filter in your research, please cite our pu
 
 License
 [Specify your chosen license here, e.g., MIT License, Apache 2.0. If you don't have one, you can omit this section or state that the code is provided as-is.]
-
-code
-Code
-
-download
-
-content_copy
-
-expand_less
-Google Search Suggestions
-Display of Search Suggestions is required when using Grounding with Google Search. Learn more
-
-best practices for github readme
-how to write a good readme for a research code repository
