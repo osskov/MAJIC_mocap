@@ -14,7 +14,7 @@ SUBJECTS_TO_PLOT = ['Subject01', 'Subject02', 'Subject03', 'Subject04', 'Subject
 
 # Methods to plot can be 'EKF' (Global EKF), 'Madgwick (Al Borno)' (Loaded from Al Borno files), 'Madgwick' (GLobal Madgwick), Mahony (Global Mahony),
 # 'Mag On' (Magnetometer always used), 'Mag Off' (Magnetometer never integrated), 'Unprojected' (No acceleration projection), 'Mag Adapt' (Magnetometer used adaptively).
-METHODS_TO_PLOT = ['EKF', 'Mag Off', 'Mag Adapt']
+METHODS_TO_PLOT = ['EKF', 'Mag On', 'Mag Off', 'Mag Adapt']
 
 # Which summary metrics to plot from: RMSE, MAE, Mean, STD, Kurtosis, Skewness, Pearson, Median, Q25, Q75, MAD.
 # Default is in radians, for degrees use '_deg' suffix, e.g., 'RMSE_deg'.
@@ -32,8 +32,8 @@ RENAME_JOINTS = {
 }
 JOINT_PLOT_ORDER = ['Lumbar', 'Hip', 'Knee', 'Ankle']
 
-# Plot style can be 'strip' (strip + box-whisker for median + iqr) or 'bar' (mean + std error bars)
-PLOT_STYLE = 'strip'
+# Plot style can be 'strip' (strip + box-whisker for median + iqr), 'bar' (mean + std error bars), or 'box' (standard boxplot + strip)
+PLOT_STYLE = 'box'
 
 
 DATA_FILE_PATH = os.path.join("data", "all_subject_statistics.pkl")
@@ -152,7 +152,7 @@ def _finalize_and_save_plot(
     """
     Applies final touches to a plot and saves it to disk.
     """
-    figure.suptitle(plot_title, fontsize=16, y=1.02)
+    figure.suptitle(plot_title, fontsize=16, y=1.02, fontweight='bold')
     plt.tight_layout()
 
     if SAVE_PLOTS:
@@ -331,11 +331,110 @@ def _add_bar_ci_and_stats(
     sns.despine(left=False, bottom=False, top=True, right=True, ax=ax)
 
 
+def _add_boxplot_and_stats(
+    data: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    order: List[str],
+    significant_pairs: List[tuple[str, str]],
+    ax: plt.Axes,
+    show_labels: bool = True, # <-- MODIFICATION: Added show_labels
+    **kwargs: Any
+) -> None:
+    """
+    Draws a standard boxplot, an overlying stripplot, and significance brackets.
+    """
+    # 1. Plot the box plot
+    boxplot_kwargs = {
+        'palette': PALETTE,
+        'legend': False,
+        'showfliers': False,  # We will show all points with a stripplot
+        'zorder': 5,
+        'width': 0.7
+    }
+    boxplot_kwargs.update(kwargs)
+    
+    sns.boxplot(
+        data=data, x=x_col, y=y_col, order=order, ax=ax,
+        **boxplot_kwargs
+    )
+    
+    # 2. Add the strip plot on top
+    sns.stripplot(
+        data=data, x=x_col, y=y_col, order=order, palette=PALETTE,
+        legend=False, ax=ax, alpha=0.2, jitter=0.15, zorder=3 
+    )
+
+    # --- START OF MODIFICATION ---
+    # 2b. Add median labels
+    if show_labels:
+        # Calculate medians
+        stats_df = data.groupby(x_col)[y_col].quantile(0.5).reindex(order)
+        # Get the width of the boxplot from the kwargs
+        box_width = boxplot_kwargs.get('width', 0.7) 
+        
+        for i, method in enumerate(order):
+            if method not in stats_df.index or pd.isna(stats_df.loc[method]):
+                continue
+            median = stats_df.loc[method]
+            
+            # Position text in the center of the box
+            x_pos = i
+
+            ax.text(
+                x_pos, median + 0.1, f'{median:.2f}', 
+                ha='center', va='bottom', fontsize=12, color='black', 
+                fontweight='bold', zorder=11
+            )
+    # --- END OF MODIFICATION ---
+
+    # 3. Add Significance Brackets (Logic from the other functions)
+    if significant_pairs:
+        # Find max y-value. The 1.5*IQR whisker is a good reference.
+        # We need to find the max value *within* the 1.5 IQR range,
+        # as this is where the whiskers are drawn.
+        
+        try:
+            grouped = data.groupby(x_col)[y_col]
+            q1 = grouped.transform('quantile', 0.25)
+            q3 = grouped.transform('quantile', 0.75)
+            iqr = q3 - q1
+            upper_bound = q3 + 1.5 * iqr
+            
+            # Find the max data point that is *at or below* the upper_bound
+            data_within_whiskers = data[data[y_col] <= upper_bound]
+            max_val = data_within_whiskers[y_col].max()
+        except Exception:
+             max_val = data[y_col].max() # Fallback
+
+        max_val = max_val if pd.notna(max_val) else data[y_col].mean() + data[y_col].std() # Failsafe
+        
+        y_range = ax.get_ylim()[1] - ax.get_ylim()[0]
+        y_step = y_range * 0.05 
+        current_y_level = max_val + y_step * 2 # Add a bit more padding
+
+        sorted_pairs = sorted(significant_pairs, key=lambda p: abs(order.index(p[0]) - order.index(p[1])))
+        
+        for method1, method2 in sorted_pairs:
+            if method1 not in order or method2 not in order: continue
+            x1, x2 = order.index(method1), order.index(method2)
+            bar_y = current_y_level
+            
+            ax.plot([x1, x1, x2, x2], [bar_y, bar_y + y_step, bar_y + y_step, bar_y], lw=1.5, c='black')
+            ax.text((x1 + x2) * 0.5, bar_y + y_step, '*', ha='center', va='bottom', fontsize=20, fontweight='bold', c='black')
+            current_y_level += 2 * y_step 
+        
+        ax.set_ylim(ax.get_ylim()[0], current_y_level + y_step)
+    
+    # Finalize style
+    sns.despine(left=False, bottom=False, top=True, right=True, ax=ax)
+
+
 # --- Unified Plotting Function ---
 def plot_summary_data(
     summary_df: pd.DataFrame,
     group_cols: List[str],
-    plot_type: Literal['bar', 'strip'],
+    plot_type: Literal['bar', 'strip', 'box'],
     metric: str,
     method_order: List[str],
     show_labels: bool = True,
@@ -350,7 +449,7 @@ def plot_summary_data(
     
     If no split is needed, it calls _generate_single_plot() once.
     """
-    if plot_type not in ['bar', 'strip']:
+    if plot_type not in ['bar', 'strip', 'box']:
         print(f"Error: Unknown plot_type '{plot_type}'. Skipping plot for {metric}.")
         return
 
@@ -455,7 +554,7 @@ def plot_summary_data(
 def _generate_single_plot(
     data: pd.DataFrame,
     group_cols: List[str],
-    plot_type: Literal['bar', 'strip'],
+    plot_type: Literal['bar', 'strip', 'box'],
     metric: str,
     method_order: List[str],
     show_labels: bool,
@@ -603,18 +702,36 @@ def _generate_single_plot(
                     data=data, x_col='method', y_col=metric, order=plot_order,
                     significant_pairs=sig_pairs, ax=ax, show_labels=show_labels,
                 )
+            elif plot_type == 'box':
+                _add_boxplot_and_stats(
+                    data=data, x_col='method', y_col=metric, order=plot_order,
+                    significant_pairs=sig_pairs, ax=ax,
+                    show_labels=show_labels, # <-- MODIFICATION: Pass show_labels
+                    width=0.8 # Set a consistent width
+                )
 
         g.map_dataframe(_facet_plot_helper)
         
         g.set_axis_labels(x_var="", y_var=f"{metric.replace('_deg', '')} (Degrees)" if "_deg" in metric else metric)
-        g.set_xticklabels(rotation=45, ha='right')
+        g.set_xticklabels(rotation=45, ha='right', fontweight='black')
         g.set_titles(f"{{col_name}}") 
         g.fig.subplots_adjust(wspace=0.1, hspace=1.0)
         fig = g.fig
         
         clean_facet_title = facet_col_str.replace('_', ' ').title()
         # MODIFIED: Use data_type_title in title and filename
-        plot_title = f"{data_type_title} Performance for {metric} by {clean_facet_title} ({plot_type})"
+        # Figure out if its a magnitude or axes plot for the title
+        if "mag" in data_type_title.lower():
+            data_type_title = "Joint Angle Magnitude "
+        elif "axis" in data_type_title.lower():
+            data_type_title = "Joint Angle Axes "
+        else:
+            data_type_title = "Joint Angle "
+        if plot_type == 'strip' or plot_type == 'box':
+            plot_type_full = "(Median + Quartiles)"
+        else:
+            plot_type_full = "(Mean + 95% CI)"
+        plot_title = f"{data_type_title} Performance for {metric.upper()} by {clean_facet_title} {plot_type_full}"
         filename = f"by_{facet_col_str.lower()}_{metric.lower()}_{data_type_title.lower()}_{plot_type}.png"
         
     else:
@@ -638,14 +755,33 @@ def _generate_single_plot(
                 significant_pairs=sig_pairs, ax=ax, show_labels=show_labels
             )
             plot_detail = "(Mean $\pm$ 95% CI)"
+        elif plot_type == 'box':
+            _add_boxplot_and_stats(
+                data=filtered_data, x_col='method', y_col=metric, order=plot_order,
+                significant_pairs=sig_pairs, ax=ax,
+                show_labels=show_labels, # <-- MODIFICATION: Pass show_labels
+                width=0.8 # Set a consistent width
+            )
+            plot_detail = "(Boxplot)"
         
         ax.set_ylabel(f"{metric.replace('_deg', '')}\n(Degrees)" if "_deg" in metric else f"{metric}\n(Radians)")
         ax.set_xlabel("", fontsize=12) 
         ax.tick_params(axis='x', rotation=25, labelsize=16)
         ax.tick_params(axis='y', labelsize=16)
         
+        if "mag" in data_type_title.lower():
+            data_type_title = "Joint Angle Magnitude "
+        elif "axis" in data_type_title.lower():
+            data_type_title = "Joint Angle Axes "
+        else:
+            data_type_title = "Joint Angle "
+        if plot_type == 'strip' or plot_type == 'box':
+            plot_type_full = "(Median + Quartiles)"
+        else:
+            plot_type_full = "(Mean + 95% CI)"
+
         # MODIFIED: Use data_type_title in title and filename
-        plot_title = f"{data_type_title} Method Performance{single_facet_name}\n{metric.replace('_deg', '').title()} {plot_detail}"
+        plot_title = f"{data_type_title} \n{metric.replace('_deg', '')} {plot_type_full}"
         filename = f"overall{single_facet_name.replace(' ', '_').lower()}_{metric.lower()}_{data_type_title.lower()}_{plot_type}.png"
     
     _finalize_and_save_plot(fig, plot_title, filename)
@@ -852,21 +988,21 @@ def main():
 
     print(summary_stats_df.head())
     
-    # plot_summary_data(
-    #     summary_df=summary_stats_df,
-    #     group_cols=[],  # You can add more grouping columns as needed
-    #     plot_type=PLOT_STYLE,  # 'bar' or 'strip'
-    #     metric=METRIC_TO_PLOT,  # e.g., 'rmse_deg'
-    #     method_order=METHODS_TO_PLOT,
-    #     show_labels=True,
-    # )
-
-    plot_metric_vs_joint_heatmap(
+    plot_summary_data(
         summary_df=summary_stats_df,
-        metric=METRIC_TO_PLOT,
+        group_cols=[],  # You can add more grouping columns as needed
+        plot_type=PLOT_STYLE,  # 'bar', 'strip', or 'box'
+        metric=METRIC_TO_PLOT,  # e.g., 'rmse_deg'
         method_order=METHODS_TO_PLOT,
-        joint_order=JOINT_PLOT_ORDER
+        show_labels=True,
     )
+
+    # plot_metric_vs_joint_heatmap(
+    #     summary_df=summary_stats_df,
+    #     metric=METRIC_TO_PLOT,
+    #     method_order=METHODS_TO_PLOT,
+    #     joint_order=JOINT_PLOT_ORDER
+    # )
 
     # --- 2. Load Data ---
     if not os.path.exists(DATA_FILE_PATH.replace("statistics", "pearson_correlation")):
@@ -892,7 +1028,7 @@ def main():
     # plot_summary_data(
     #     summary_df=pearson_stats_df,
     #     group_cols=['joint_name'],  # You can add more grouping columns as needed
-    #     plot_type=PLOT_STYLE,  # 'bar' or 'strip'
+    #     plot_type=PLOT_STYLE,  # 'bar', 'strip', or 'box'
     #     metric='PearsonR',  # e.g., 'pearson'
     #     method_order=METHODS_TO_PLOT,
     #     show_labels=True,

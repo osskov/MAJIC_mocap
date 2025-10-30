@@ -22,7 +22,7 @@ RENAME_SEGMENTS = {
 SUBJECTS_TO_LOAD = [f"{i:02d}" for i in range(1, 12)]
 TRIAL_TYPES_TO_LOAD = ['walking', 'complexTasks']
 SHOW_PLOTS = True
-SAVE_PLOTS = False
+SAVE_PLOTS = True
 ACC_PALETTE = 'Reds'
 MAG_PALETTE = 'Blues'
 
@@ -411,7 +411,7 @@ def plot_pooled_imu_distributions(df: pd.DataFrame):
     ax2.spines['right'].set_color(darker_color)
     ax2.grid(False) 
     
-    ax1.set_title(f'Pooled IMU Distribution (Mean $\pm$ STD) by {x_col} and {hue_col}', fontsize=14)
+    ax1.set_title(f'Pooled IMU Distribution (Mean $\pm$ STD) by {x_col}', fontsize=14)
     
     # Combine and place the legend
     color_handles = sorted(legend_proxies_color.values(), key=lambda x: x.get_label())
@@ -449,8 +449,12 @@ def plot_pooled_imu_distributions(df: pd.DataFrame):
 
     fig.tight_layout() 
     fig.subplots_adjust(right=0.7) 
-
-    plt.show()
+    if SAVE_PLOTS:
+        output_path = os.path.abspath(os.path.join("plots", f"pooled_imu_distribution_{x_col}_{hue_col}.png"))
+        fig.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Plot saved to: {output_path}")
+    if SHOW_PLOTS:
+        plt.show()
 
 if __name__ == "__main__":
     # Mocking data loading since the file is not available
