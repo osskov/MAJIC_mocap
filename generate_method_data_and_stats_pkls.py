@@ -20,7 +20,7 @@ ALL_JOINTS = ['R_Ankle', 'L_Ankle', 'R_Knee', 'L_Knee', 'R_Hip', 'L_Hip', 'Lumba
 ALL_TRIAL_TYPES = ['walking', 'complexTasks']
 
 REGENERATE_FILES = True
-BASE_DATA_PATH = os.path.abspath(os.path.join("data", "data"))
+BASE_DATA_PATH = os.path.abspath(os.path.join("data"))
 
 # ------------------------------------------------
 
@@ -95,7 +95,7 @@ def load_joint_traces_for_subject_df(subject_id: str,
     try:
         plate_trials_by_method: Dict[str, List['PlateTrial']] = {}
         plate_trials_by_method['Marker'] = PlateTrial.load_trial_from_folder(
-                        os.path.join("data", "data", subject_id, trial_type)
+                        os.path.join("data", subject_id, trial_type)
                     )
         imu_traces = {trial.name: trial.imu_trace.copy() for trial in plate_trials_by_method['Marker']}
         min_length = min(min(len(trial) for trial in plate_trials_by_method['Marker']), 60000)
@@ -106,11 +106,11 @@ def load_joint_traces_for_subject_df(subject_id: str,
             else:
                 if method == 'Madgwick (Al Borno)':
                     world_traces = WorldTrace.load_WorldTraces_from_folder(
-                        os.path.abspath(os.path.join("data", "data", subject_id, trial_type, "madgwick (al borno)"))
+                        os.path.abspath(os.path.join("data", subject_id, trial_type, "madgwick (al borno)"))
                     )
                 else:
                     world_traces = WorldTrace.load_from_sto_file(
-                        os.path.abspath(os.path.join("data", "data", subject_id, trial_type, f"{trial_type}_orientations_{method.replace(' ', '_').lower()}.sto"))
+                        os.path.abspath(os.path.join("data", subject_id, trial_type, f"{trial_type}_orientations_{method.replace(' ', '_').lower()}.sto"))
                     )
                 plate_trials_by_method[method] = PlateTrial.generate_plate_from_traces(imu_traces, world_traces, align_plate_trials=False)
                 min_length = min(min_length, min(len(trial) for trial in plate_trials_by_method[method]))
@@ -442,7 +442,7 @@ if __name__ == "__main__":
 
     # Create directories if they don't exist
     os.makedirs("plots", exist_ok=True)
-    os.makedirs(os.path.join("data", "data"), exist_ok=True)
+    os.makedirs(os.path.join("data"), exist_ok=True)
 
     data_file_path = os.path.join(BASE_DATA_PATH, f"all_subject_data.pkl")
     
@@ -457,7 +457,7 @@ if __name__ == "__main__":
         all_subject_dfs = []
         for trial_type in TRIAL_TYPES:
             for subject_id in SUBJECT_IDS:
-                subject_pkl_path = os.path.abspath(os.path.join("data", "data", subject_id, trial_type, f"{subject_id}_{trial_type}_data.pkl"))
+                subject_pkl_path = os.path.abspath(os.path.join("data", subject_id, trial_type, f"{subject_id}_{trial_type}_data.pkl"))
                 print(f"--- Processing {subject_id} - {trial_type} ---")
 
                 if not REGENERATE_FILES and os.path.exists(subject_pkl_path):

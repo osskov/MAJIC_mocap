@@ -8,7 +8,7 @@ import numpy as np
 import sys
 import seaborn as sns
 
-PKL_FILE = os.path.abspath(os.path.join("data", "data", "all_subject_imu_data_summary.pkl"))
+PKL_FILE = os.path.abspath(os.path.join("data", "all_subject_imu_data_summary.pkl"))
 RENAME_SEGMENTS = {
     'torso_imu': 'Torso',
     'pelvis_imu': 'Pelvis',
@@ -35,7 +35,7 @@ def load_and_process_imu_data(subject_num: str, trial_type: str, max_frames: int
     results = [] 
     
     try:
-        data_folder_path = os.path.join("data", "data", subject_id, trial_type)
+        data_folder_path = os.path.join("data", subject_id, trial_type)
         data_folder_path = os.path.abspath(data_folder_path)
         
         plate_trials = PlateTrial.load_trial_from_folder(data_folder_path)

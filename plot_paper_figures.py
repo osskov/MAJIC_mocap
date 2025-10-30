@@ -18,24 +18,24 @@ METHODS_TO_PLOT = ['EKF', 'Mag On', 'Mag Off', 'Mag Adapt']
 
 # Which summary metrics to plot from: RMSE, MAE, Mean, STD, Kurtosis, Skewness, Pearson, Median, Q25, Q75, MAD.
 # Default is in radians, for degrees use '_deg' suffix, e.g., 'RMSE_deg'.
-METRICS_TO_PLOT = ['RMSE_deg'] 
+METRIC_TO_PLOT = 'RMSE_deg' 
 
 # If you do not want data to be combined across left/right sides, you can specify them individually as R_{joint} and L_{joint}
 # in both RENAME_JOINTS.
 RENAME_JOINTS = {
-    'R_Hip': 'Hip',
-    'L_Hip': 'Hip',
-    'R_Knee': 'Knee',
-    'L_Knee': 'Knee',
-    'R_Ankle': 'Ankle',
-    'L_Ankle': 'Ankle',
+    'R_Hip': 'MHip',
+    'L_Hip': 'MHip',
+    'R_Knee': 'NKnee',   
+    'L_Knee': 'NKnee',
+    'R_Ankle': 'OAnkle',
+    'L_Ankle': 'OAnkle',
 }
 
 # Plot style can be 'strip' (strip + box-whisker for median + iqr) or 'bar' (mean + std error bars)
-PLOT_STYLE = 'strip'
+PLOT_STYLE = 'bar'
 
 
-DATA_FILE_PATH = os.path.join("data", "data", "all_subject_statistics.pkl")
+DATA_FILE_PATH = os.path.join("data", "all_subject_statistics.pkl")
 PLOTS_DIRECTORY = "plots"
 
 SHOW_PLOTS = True
@@ -192,7 +192,7 @@ def _remove_outliers(
     
     filtered_df = df[(df[metric] >= lower_bound) & (df[metric] <= upper_bound)]
     
-    return filtered_df
+    return df
 
 # --- Main Plotting Functions ---
 
@@ -235,7 +235,7 @@ def _add_strip_whisker_and_stats(
             ax.hlines(q1, i - whisker_width/2, i + whisker_width/2, color=darker_color, linestyle='--', linewidth=1.5, zorder=10)
             ax.hlines(q3, i - whisker_width/2, i + whisker_width/2, color=darker_color, linestyle='--', linewidth=1.5, zorder=10)
             ax.hlines(median, i - whisker_width/2, i + line_width/2 + x_offset, color=darker_color, linestyle='-', linewidth=2, zorder=10)
-            ax.text(i + whisker_width/2 + x_offset, median, f'{median:.1f}', ha='center', va='bottom', fontsize=12, color='black', fontweight='bold', zorder=11)
+            ax.text(i + whisker_width/2 + x_offset, median, f'{median:.2f}', ha='center', va='bottom', fontsize=12, color='black', fontweight='bold', zorder=11)
 
     # 3. Add Significance Brackets (Logic from the original _add_strip_and_whisker_elements)
     if significant_pairs:
@@ -298,7 +298,7 @@ def _add_bar_ci_and_stats(
             y_pos = ci_upper * 1.05 # Position text above the CI bar
             
             ax.text(
-                i, y_pos, f'{mean_val:.1f}',
+                i, y_pos, f'{mean_val:.2f}',
                 ha='center', va='bottom', fontsize=12,
                 color='black', fontweight='bold', zorder=11
             )
@@ -331,7 +331,6 @@ def _add_bar_ci_and_stats(
 
 
 # --- Unified Plotting Function ---
-
 def plot_summary_data(
     summary_df: pd.DataFrame,
     group_cols: List[str],
@@ -341,9 +340,14 @@ def plot_summary_data(
     show_labels: bool = True,
 ) -> None:
     """
-    Generates a statistical plot (bar or strip/whisker) faceted by the given
-    grouping columns.
-    ... (args unchanged) ...
+    DISPATCHER: Generates statistical plots, splitting for Axes vs. Magnitude.
+    
+    Checks if 'axis' column contains both 'MAG' and 'X'/'Y'/'Z'.
+    If so, it splits the data and calls _generate_single_plot() twice:
+    1. Once for 'MAG' data.
+    2. Once for 'X', 'Y', 'Z' data.
+    
+    If no split is needed, it calls _generate_single_plot() once.
     """
     if plot_type not in ['bar', 'strip']:
         print(f"Error: Unknown plot_type '{plot_type}'. Skipping plot for {metric}.")
@@ -355,51 +359,127 @@ def plot_summary_data(
         print("Error: DataFrame must contain 'method' and the specified metric.")
         return
 
-    print(f"\n--- Generating {plot_type.title()} Plot for {metric} ---")
-    
     # Filter data to only include specified methods
     data = data[data['method'].isin(method_order)]
+    
+    # 1. Check if we need to split data into Axes and Magnitude
+    if 'axis' in data.columns and len(data['axis'].unique()) > 1:
+        unique_axes = set(data['axis'].unique())
+        has_mag = 'MAG' in unique_axes
+        has_axes = any(ax in unique_axes for ax in ['X', 'Y', 'Z'])
+
+        if has_mag and has_axes:
+            print(f"--- Splitting data into 'Axes (X,Y,Z)' and 'Magnitude' for {metric} ---")
+            
+            # 1. Plot Magnitude Data
+            data_mag = data[data['axis'] == 'MAG'].copy()
+            if not data_mag.empty:
+                print("\n=== Generating MAGNITUDE Plot ===")
+                _generate_single_plot(
+                    data=data_mag,
+                    group_cols=group_cols,
+                    plot_type=plot_type,
+                    metric=metric,
+                    method_order=method_order,
+                    show_labels=show_labels,
+                    data_type_title="Magnitude"
+                )
+            else:
+                print("\n=== No 'MAG' data found. Skipping Magnitude plot. ===")
+
+            # 2. Plot Axes Data
+            data_axes = data[data['axis'].isin(['X', 'Y', 'Z'])].copy()
+            if not data_axes.empty:
+                print("\n=== Generating AXES (X,Y,Z) Plot ===")
+                _generate_single_plot(
+                    data=data_axes,
+                    group_cols=group_cols,
+                    plot_type=plot_type,
+                    metric=metric,
+                    method_order=method_order,
+                    show_labels=show_labels,
+                    data_type_title="Axes"
+                )
+            else:
+                print("\n=== No 'X,Y,Z' data found. Skipping Axes plot. ===")
+                
+            return # We are done after splitting
+
+        elif has_mag:
+            data_type_title = "Magnitude"
+            print(f"--- Only Magnitude data found for {metric}. ---")
+        elif has_axes:
+            data_type_title = "Axes"
+            print(f"--- Only Axes (X,Y,Z) data found for {metric}. ---")
+        else:
+            data_type_title = "UnknownAxis"
+            print(f"--- 'axis' column has multiple values, but not X/Y/Z or MAG. Plotting as single group. ---")
+            
+    else:
+        data_type_title = "Overall"
+        print(f"--- No 'axis' column detected or single axis value. Plotting as single group. ---")
+
+    # If no split was needed, run the plot once on the full (filtered) data
+    _generate_single_plot(
+        data=data,
+        group_cols=group_cols,
+        plot_type=plot_type,
+        metric=metric,
+        method_order=method_order,
+        show_labels=show_labels,
+        data_type_title=data_type_title
+    )
+
+
+def _generate_single_plot(
+    data: pd.DataFrame,
+    group_cols: List[str],
+    plot_type: Literal['bar', 'strip'],
+    metric: str,
+    method_order: List[str],
+    show_labels: bool,
+    data_type_title: str # New arg: e.g., "Magnitude", "Axes", "Overall"
+) -> None:
+    """
+    WORKER: Generates a single statistical plot for a given data subset.
+    (This function contains the logic from the original plot_summary_data)
+    """
+    
+    print(f"\n--- Generating {plot_type.title()} Plot for {metric} ({data_type_title}) ---")
+
     plot_order = [m for m in method_order if m in data['method'].unique()]
     
     # Create a modifiable list of grouping columns for this plot
     plot_group_cols = group_cols.copy()
 
-    # 1. Differentiate AngleAxis vs. Magnitude and handle axis-pooling
-    if 'axis' in data.columns and len(data['axis'].unique()) > 1:
-        data_type = 'AngleAxis'
-        
-        if 'axis' in plot_group_cols:
-            print(f"  > 'axis' requested. Faceting by original 'axis' column (X, Y, Z, MAG).")
-        
-        else:
-            print(f"  > 'axis' not requested. Defaulting to faceting by 'axis_group' (AngleAxis_Pooled vs. MAG).")
-            data['axis_group'] = data['axis'].apply(lambda x: 'MAG' if x == 'MAG' else 'AngleAxis_Pooled')
-            
-            if 'axis_group' not in plot_group_cols:
-                plot_group_cols.append('axis_group')
-                
-            data = data.drop(columns='axis', errors='ignore')
-    
-    else:
-        data_type = 'Magnitude'
-        print("  > Magnitude data detected (or 'axis' column missing/single-value).")
+    # 1. Handle axis faceting based on data_type_title
+    if data_type_title == "Magnitude" or data_type_title == "Overall":
+        # This data is magnitude-only or has no axis, remove 'axis' faceting.
         if 'axis' in plot_group_cols:
              plot_group_cols.remove('axis')
-        data = data.drop(columns='axis', errors='ignore')
-    
-    print(f"  > Plotting {data_type} data.")
+        if 'axis_group' in plot_group_cols:
+             plot_group_cols.remove('axis_group')
+        data = data.drop(columns=['axis', 'axis_group'], errors='ignore')
+        print(f"  > Plotting {data_type_title} data.")
 
+    elif data_type_title == "Axes":
+        # This data is X, Y, Z. Check if user *wants* to facet by axis.
+        if 'axis' in plot_group_cols:
+            print(f"  > 'axis' requested. Faceting by original 'axis' column (X, Y, Z).")
+        else:
+            print(f"  > 'axis' not requested. Pooling X, Y, Z data.")
+            # We drop the 'axis' column so it's not used in stats/faceting.
+            if 'axis' in data.columns:
+                data = data.drop(columns='axis', errors='ignore')
+    
     # Handle Outliers
     original_count = len(data)
     
-    # --- START OF FIX ---
-    # Create a list of columns to group by for outlier removal.
-    # This MUST include 'method' plus any faceting columns.
+    # --- START OF FIX (from original code) ---
     outlier_group_cols = plot_group_cols.copy()
     if 'method' not in outlier_group_cols:
         outlier_group_cols.append('method')
     
-    # Group by the faceting columns AND method to remove outliers
     filtered_data = _remove_outliers(data, metric, group_cols=outlier_group_cols)
     
     removed_count = original_count - len(filtered_data)
@@ -419,11 +499,9 @@ def plot_summary_data(
     # 2. Run Statistical Analysis for ALL facets
     stats_results = {}
     if not facet_cols:
-        # No facets (overall plot)
         stats_results['_overall_'] = _run_statistical_analysis(filtered_data, metric, plot_order, alpha=0.05)
         facet_levels = ['_overall_']
     else:
-        # Faceted plot: calculate stats for each combination of facet levels
         try:
             facet_levels_iter = filtered_data.groupby(facet_cols, dropna=True).groups.keys()
             facet_levels = list(facet_levels_iter)
@@ -484,7 +562,7 @@ def plot_summary_data(
             col_wrap=col_wrap,
             height=6,
             aspect=0.8,
-            sharey=False 
+            sharey=True
         )
         
         def _facet_plot_helper(data, **kwargs):
@@ -492,7 +570,7 @@ def plot_summary_data(
             if data.empty:
                 return
             current_facet_key = data[facet_col_str].iloc[0] 
-            sig_pairs = stats_results.get(current_facet_key, [])
+            sig_pairs = stats_results.get(current_facet_key, []) if 'Pearson' not in metric else []
             
             if plot_type == 'strip':
                 _add_strip_whisker_and_stats(
@@ -509,13 +587,18 @@ def plot_summary_data(
         
         g.set_axis_labels(x_var="", y_var=f"{metric.replace('_deg', '')} (Degrees)" if "_deg" in metric else metric)
         g.set_xticklabels(rotation=45, ha='right')
+        if 'joint_name' in plot_group_cols:
+            labels = [label.get_text() for label in g.axes.flat[0].get_xticklabels()]
+            renamed_labels = [label.replace('MHip', 'Hip').replace('NKnee', 'Knee').replace('OAnkle', 'Ankle') for label in labels]
+            g.set_xticklabels(renamed_labels)
         g.set_titles(f"{{col_name}}") 
         g.fig.subplots_adjust(wspace=0.1, hspace=1.0)
         fig = g.fig
         
         clean_facet_title = facet_col_str.replace('_', ' ').title()
-        plot_title = f"Performance for {metric} by {clean_facet_title} ({plot_type})"
-        filename = f"unified_by_{facet_col_str.lower()}_{metric.lower()}_{plot_type}.png"
+        # MODIFIED: Use data_type_title in title and filename
+        plot_title = f"{data_type_title} Performance for {metric} by {clean_facet_title} ({plot_type})"
+        filename = f"unified_by_{facet_col_str.lower()}_{metric.lower()}_{data_type_title.lower()}_{plot_type}.png"
         
     else:
         fig, ax = plt.subplots(figsize=(4, 7))
@@ -542,12 +625,18 @@ def plot_summary_data(
         ax.set_ylabel(f"{metric.replace('_deg', '')}\n(Degrees)" if "_deg" in metric else f"{metric}\n(Radians)")
         ax.set_xlabel("", fontsize=12) 
         ax.tick_params(axis='x', rotation=25, labelsize=16)
+        if 'joint_name' in plot_group_cols:
+            labels = [label.get_text() for label in ax.get_xticklabels()]
+            renamed_labels = [label.replace('MHip', 'Hip').replace('NKnee', 'Knee').replace('OAnkle', 'Ankle') for label in labels]
+            ax.set_xticklabels(renamed_labels)
         ax.tick_params(axis='y', labelsize=16)
         
-        plot_title = f"Overall Method Performance{single_facet_name}\n{metric.replace('_deg', '').title()} {plot_detail}"
-        filename = f"unified_overall{single_facet_name.replace(' ', '_').lower()}_{metric.lower()}_{plot_type}.png"
+        # MODIFIED: Use data_type_title in title and filename
+        plot_title = f"{data_type_title} Method Performance{single_facet_name}\n{metric.replace('_deg', '').title()} {plot_detail}"
+        filename = f"unified_overall{single_facet_name.replace(' ', '_').lower()}_{metric.lower()}_{data_type_title.lower()}_{plot_type}.png"
     
     _finalize_and_save_plot(fig, plot_title, filename)
+    
 # --- Main Execution ---
 
 def main():
@@ -592,40 +681,42 @@ def main():
     
     plot_summary_data(
         summary_df=summary_stats_df,
-        group_cols=[],  # You can add more grouping columns as needed
+        group_cols=['joint_name'],  # You can add more grouping columns as needed
         plot_type=PLOT_STYLE,  # 'bar' or 'strip'
-        metric=METRICS_TO_PLOT[0],  # e.g., 'rmse_deg'
+        metric=METRIC_TO_PLOT,  # e.g., 'rmse_deg'
         method_order=METHODS_TO_PLOT,
         show_labels=True,
     )
+
+    # --- 2. Load Data ---
+    if not os.path.exists(DATA_FILE_PATH.replace("statistics", "pearson_correlation")):
+        print(f"Error: Statistics file not found at {DATA_FILE_PATH.replace("statistics", "pearson_correlation")}")
+        return
+    else:
+        print(f"Loading summary statistics from {DATA_FILE_PATH.replace("statistics", "pearson_correlation")}...")
+        try:
+            pearson_stats_df = pd.read_pickle(DATA_FILE_PATH.replace("statistics", "pearson_correlation"))
+        except Exception as e:
+            print(f"Error loading pickle file: {e}")
+            return
+    print("Data loaded successfully.")
+
+    # Rename joints for clarity
+    pearson_stats_df = pearson_stats_df.rename(index=RENAME_JOINTS, level='joint_name')
+
+    # Drop subjects and methods not in the analysis
+    pearson_stats_df = pearson_stats_df[pearson_stats_df.index.get_level_values('method').isin(METHODS_TO_PLOT)]
+    pearson_stats_df = pearson_stats_df[pearson_stats_df.index.get_level_values('subject').isin(SUBJECTS_TO_PLOT)]
+    print(pearson_stats_df.head())
 
     plot_summary_data(
-        summary_df=summary_stats_df,
-        group_cols=['axis'],  # You can add more grouping columns as needed
+        summary_df=pearson_stats_df,
+        group_cols=['joint_name'],  # You can add more grouping columns as needed
         plot_type=PLOT_STYLE,  # 'bar' or 'strip'
-        metric=METRICS_TO_PLOT[0],  # e.g., 'rmse_deg'
+        metric='PearsonR',  # e.g., 'pearson'
         method_order=METHODS_TO_PLOT,
         show_labels=True,
     )
-
-    # plot_summary_data(
-    #     summary_df=summary_stats_df,
-    #     group_cols=['joint_name'],  # You can add more grouping columns as needed
-    #     plot_type=PLOT_STYLE,  # 'bar' or 'strip'
-    #     metric=METRICS_TO_PLOT[0],  # e.g., 'rmse_deg'
-    #     method_order=METHODS_TO_PLOT,
-    #     show_labels=True,
-    # )
-
-    # plot_summary_data(
-    #     summary_df=summary_stats_df,
-    #     group_cols=['subject'],  # You can add more grouping columns as needed
-    #     plot_type=PLOT_STYLE,  # 'bar' or 'strip'
-    #     metric=METRICS_TO_PLOT[0],  # e.g., 'rmse_deg'
-    #     method_order=METHODS_TO_PLOT,
-    #     show_labels=True,
-    # )
-
     print("\n--- All plotting complete ---")
 
 if __name__ == "__main__":

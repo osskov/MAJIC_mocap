@@ -116,9 +116,12 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
     # Create the filter structure
     parent_trial = parent_trial.copy()
     child_trial = child_trial.copy()
-    joint_filter = RelativeFilter(gyro_std_parent=np.ones(3) * gyro_std, gyro_std_child=np.ones(3) * gyro_std,
-                                  sensor_stds_parent=[np.ones(3) * acc_std, np.ones(3) * mag_std],
-                                  sensor_stds_child=[np.ones(3) * acc_std, np.ones(3) * mag_std])
+    joint_filter = RelativeFilter(
+        gyro_std_parent=np.ones(3) * gyro_std,
+        gyro_std_child=np.ones(3) * gyro_std,
+        vector_sensor_stds_parent=[np.ones(3) * acc_std, np.ones(3) * mag_std],
+        vector_sensor_stds_child=[np.ones(3) * acc_std, np.ones(3) * mag_std]
+    )
     joint_filter.set_qs(Rotation.from_matrix(parent_trial.world_trace.rotations[0]), Rotation.from_matrix(child_trial.world_trace.rotations[0]))
     dt = parent_trial.imu_trace.timestamps[1] - parent_trial.imu_trace.timestamps[0]
     R_pc = []
@@ -243,7 +246,7 @@ if __name__ == "__main__":
             print(f"-------Processing Subject {subject_num}, Activity {activity}...--------")
             # Load the plate trials for the current subject and activity
             try:
-                subject_activity_folder = os.path.abspath(os.path.join("data", "data", f"Subject{subject_num}", activity))
+                subject_activity_folder = os.path.abspath(os.path.join("data", f"Subject{subject_num}", activity))
                 plate_trials = PlateTrial.load_trial_from_folder(
                     subject_activity_folder,
                     align_plate_trials=True
