@@ -114,20 +114,14 @@ This step processes the raw data and runs the different orientation estimation a
 
 ```bash
 python generate_method_orientation_sto_files.py
+```
 This will create .sto files for each method within each subject's trial directory (e.g., data/data/Subject01/walking/walking_orientations_mag_on.sto).
 
-Step 2: Generate Data and Statistics .pkl Files
+### Step 2: Generate Data and Statistics .pkl Files
 This step calculates the joint angles from the .sto files and computes detailed error statistics, saving them in convenient .pkl files.
-
-code
-Bash
-
-download
-
-content_copy
-
-expand_less
+```bash
 python generate_method_data_and_stats_pkls.py
+```
 This will produce three key files in the data/data/ directory:
 
 all_subject_data.pkl: A large file containing the full time-series data for all joints, methods, and subjects.
@@ -137,19 +131,12 @@ Note: You can set REGENERATE_FILES = False in this script to load existing .pkl 
 
 Step 3: Generate the Paper Figures
 This is the final step to generate the plots shown in the paper.
-
-code
-Bash
-
-download
-
-content_copy
-
-expand_less
+```bash
 python plot_paper_figures.py
+```
 The output plots will be saved in the plots/ directory by default.
 
-Configuration
+# Configuration
 The main plotting script, plot_paper_figures.py, contains a global configuration section at the top of the file where you can easily modify the analysis and plotting parameters:
 
 SUBJECTS_TO_PLOT: A list of subject IDs to include in the analysis.
@@ -157,10 +144,10 @@ METHODS_TO_PLOT: A list of the estimation methods to compare.
 METRICS_TO_PLOT: The performance metrics to be plotted (e.g., RMSE_deg).
 PLOT_STYLE: Choose between 'strip' (strip plot with median/IQR) or 'bar' (bar plot with mean/CI).
 SAVE_PLOTS and SHOW_PLOTS: Control whether plots are saved to disk and/or displayed on screen.
-Citation
+# Citation
 If you use this code or the Relative Filter in your research, please cite our publication:
 
 [Your Publication Citation Here - e.g., Author(s), "Title of Paper," Journal, Volume, Pages, Year.]
 
-License
+# License
 [Specify your chosen license here, e.g., MIT License, Apache 2.0. If you don't have one, you can omit this section or state that the code is provided as-is.]
