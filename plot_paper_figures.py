@@ -14,7 +14,7 @@ SUBJECTS_TO_PLOT = ['Subject01', 'Subject02', 'Subject03', 'Subject04', 'Subject
 
 # Methods to plot can be 'EKF' (Global EKF), 'Madgwick (Al Borno)' (Loaded from Al Borno files), 'Madgwick' (GLobal Madgwick), Mahony (Global Mahony),
 # 'Mag On' (Magnetometer always used), 'Mag Off' (Magnetometer never integrated), 'Unprojected' (No acceleration projection), 'Mag Adapt' (Magnetometer used adaptively).
-METHODS_TO_PLOT = ['EKF', 'Mag On', 'Mag Off', 'Mag Adapt']
+METHODS_TO_PLOT = ['EKF', 'Mag Off', 'Mag Adapt']
 
 # Which summary metrics to plot from: RMSE, MAE, Mean, STD, Kurtosis, Skewness, Pearson, Median, Q25, Q75, MAD.
 # Default is in radians, for degrees use '_deg' suffix, e.g., 'RMSE_deg'.
@@ -714,6 +714,10 @@ def _generate_single_plot(
         
         g.set_axis_labels(x_var="", y_var=f"{metric.replace('_deg', '')} (Degrees)" if "_deg" in metric else metric)
         g.set_xticklabels(rotation=45, ha='right', fontweight='black')
+        # Modify the 'Mag Adapt' to 'MAJIC' in xtick labels if present
+        for ax in g.axes.flatten():
+            xtick_labels = [label.get_text().replace('Mag Adapt', 'MAJIC') for label in ax.get_xticklabels()]
+            ax.set_xticklabels(xtick_labels)
         g.set_titles(f"{{col_name}}") 
         g.fig.subplots_adjust(wspace=0.1, hspace=1.0)
         fig = g.fig
@@ -767,6 +771,9 @@ def _generate_single_plot(
         ax.set_ylabel(f"{metric.replace('_deg', '')}\n(Degrees)" if "_deg" in metric else f"{metric}\n(Radians)")
         ax.set_xlabel("", fontsize=12) 
         ax.tick_params(axis='x', rotation=25, labelsize=16)
+        # Modify the 'Mag Adapt' to 'MAJIC' in xtick labels if present
+        xtick_labels = [label.get_text().replace('Mag Adapt', 'MAJIC') for label in ax.get_xticklabels()]
+        ax.set_xticklabels(xtick_labels)
         ax.tick_params(axis='y', labelsize=16)
         
         if "mag" in data_type_title.lower():
@@ -796,7 +803,7 @@ def _generate_single_heatmap(
 ) -> None:
     """
     WORKER: Generates a single heatmap for a given data subset (e.g., "Axes" or "Magnitude").
-    (MODIFIED: Puts methods on Y-axis and joints on X-axis)
+    (MODIFIED: Puts joints on Y-axis and methods on X-axis)
     """
     print(f"--- Generating Heatmap for {metric} ({data_type_title}) ---")
 
@@ -810,17 +817,17 @@ def _generate_single_heatmap(
     # Create the pivot table: mean metric for each joint/method
     try:
         # --- MODIFICATION ---
-        # Group by method first, then joint_name, to put methods on the index (Y-axis)
-        pivot_data = data.groupby(['method', 'joint_name'])[metric].mean().unstack()
+        # Group by joint_name first, then method, to put joints on the index (Y-axis)
+        pivot_data = data.groupby(['joint_name', 'method'])[metric].mean().unstack()
         # --- END MODIFICATION ---
     except Exception as e:
         print(f"  > Error creating pivot table: {e}. Skipping heatmap.")
         return
 
-    # Order the rows (methods) and columns (joints)
+    # Order the rows (joints) and columns (methods)
     # --- MODIFICATION ---
-    valid_methods = [m for m in method_order if m in pivot_data.index]
-    valid_joints = [j for j in joint_order if j in pivot_data.columns]
+    valid_joints = [j for j in joint_order if j in pivot_data.index]
+    valid_methods = [m for m in method_order if m in pivot_data.columns]
     # --- END MODIFICATION ---
     
     if not valid_joints or not valid_methods:
@@ -828,19 +835,22 @@ def _generate_single_heatmap(
         return
 
     # --- MODIFICATION ---
-    pivot_data = pivot_data.reindex(index=valid_methods, columns=valid_joints)
+    pivot_data = pivot_data.reindex(index=valid_joints, columns=valid_methods)
     # --- END MODIFICATION ---
 
     # Set up plot
     # Adjust fig_height/width based on swapped axes
-    fig_height = max(6, len(valid_methods) * 1.5) 
-    fig_width = max(8, len(valid_joints) * 2)
+    # --- MODIFICATION ---
+    fig_height = len(valid_joints) * 1.8
+    fig_width = len(valid_methods) * 2.1
+    # --- END MODIFICATION ---
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     
     # Set default heatmap arguments, allowing override
     cbar_label = f"Mean {metric.replace('_deg', '')} (Degrees)" if "_deg" in metric else f"Mean {metric}"
     default_kwargs = {
         'annot': True, 
+        'annot_kws': {'size': 14, 'weight': 'bold'},
         'fmt': '.2f', 
         'cmap': 'Reds',  # Good for errors (lower is better)
         'linewidths': 0.5, 
@@ -860,21 +870,25 @@ def _generate_single_heatmap(
 
     # --- MODIFICATION ---
     # Swap axis labels
-    ax.set_ylabel("Method", fontsize=16)
-    ax.set_xlabel("Joint", fontsize=16)
+    ax.set_ylabel("Joint", fontsize=16)
+    ax.set_xlabel("Method", fontsize=16)
     
-    # Apply rotation to X-axis (now Joints)
+    # Apply rotation to X-axis (now Methods)
     ax.tick_params(axis='x', rotation=45, labelsize=14)
-    # Apply the fix from before to the x-tick-labels (Joints)
+    # Replace 'Mag Adapt' with 'MAJIC' in x-tick labels if present
+    xtick_labels = [label.get_text().replace('Mag Adapt', 'MAJIC') for label in ax.get_xticklabels()]
+    ax.set_xticklabels(xtick_labels)
+
+    # Apply the fix from before to the x-tick-labels (Methods)
     plt.setp(ax.get_xticklabels(), ha="right", rotation_mode="anchor")
 
-    # No rotation for Y-axis (now Methods)
+    # No rotation for Y-axis (now Joints)
     ax.tick_params(axis='y', rotation=0, labelsize=14)
     # --- END MODIFICATION ---
 
     # Finalize
-    plot_title = f"Mean {metric} by Method and Joint ({data_type_title})"
-    filename = f"heatmap_meth_vs_joint_{metric.lower()}_{data_type_title.lower()}.png"
+    plot_title = f"Mean Joint Angle {metric.replace('_deg', '')}\nby Method and Joint ({data_type_title})"
+    filename = f"heatmap_joint_vs_meth_{metric.lower()}_{data_type_title.lower()}.png"
     
     _finalize_and_save_plot(fig, plot_title, filename)
 
@@ -945,7 +959,6 @@ def plot_metric_vs_joint_heatmap(
         **heatmap_kwargs
     )
 
-
 # --- Main Execution ---
 
 def main():
@@ -997,12 +1010,12 @@ def main():
         show_labels=True,
     )
 
-    # plot_metric_vs_joint_heatmap(
-    #     summary_df=summary_stats_df,
-    #     metric=METRIC_TO_PLOT,
-    #     method_order=METHODS_TO_PLOT,
-    #     joint_order=JOINT_PLOT_ORDER
-    # )
+    plot_metric_vs_joint_heatmap(
+        summary_df=summary_stats_df,
+        metric=METRIC_TO_PLOT,
+        method_order=METHODS_TO_PLOT,
+        joint_order=JOINT_PLOT_ORDER
+    )
 
     # --- 2. Load Data ---
     if not os.path.exists(DATA_FILE_PATH.replace("statistics", "pearson_correlation")):
