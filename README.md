@@ -15,6 +15,7 @@ This repository provides all the necessary scripts to:
 ## Repository Structure
 
 The repository is organized into several key Python scripts and a data directory:
+```
 .
 ├── data/
 │   ├── Subject01/
@@ -47,7 +48,7 @@ The repository is organized into several key Python scripts and a data directory
 ├── plot_paper_figures.py
 ├── plot_imu_data_in_world_frame.py
 └── README.md
-
+```
 -   **`src/RelativeFilterPlus.py`**: The core implementation of the Relative Filter.
 -   **`src/toolchest/`**: A collection of utility classes for handling IMU data (`IMUTrace`), motion capture data (`WorldTrace`), and synchronized trial data (`PlateTrial`).
 -   **`generate_method_orientation_sto_files.py`**: This script processes the raw data for each subject and trial, runs various orientation estimation methods (including the Relative Filter variants), and saves the resulting segment orientations as `.sto` files.
@@ -82,6 +83,7 @@ To set up the environment and run the scripts, follow these steps:
 ## Data Setup
 
 The scripts expect a specific directory structure for the input data. You will need to populate the `data/data/` directory as follows:
+```
 data/
 ├── Subject01/
 │ ├── walking/
@@ -95,7 +97,7 @@ data/
 ├── Subject02/
 │ └── ...
 └── ...
-
+```
 -   Each subject should have their own directory (e.g., `Subject01`, `Subject02`).
 -   Inside each subject's directory, there should be subdirectories for each trial type (e.g., `walking`, `complexTasks`).
 -   Each trial directory must contain:
