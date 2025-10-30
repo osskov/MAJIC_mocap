@@ -14,7 +14,7 @@ SUBJECTS_TO_PLOT = ['Subject01', 'Subject02', 'Subject03', 'Subject04', 'Subject
 
 # Methods to plot can be 'EKF' (Global EKF), 'Madgwick (Al Borno)' (Loaded from Al Borno files), 'Madgwick' (GLobal Madgwick), Mahony (Global Mahony),
 # 'Mag On' (Magnetometer always used), 'Mag Off' (Magnetometer never integrated), 'Unprojected' (No acceleration projection), 'Mag Adapt' (Magnetometer used adaptively).
-METHODS_TO_PLOT = ['EKF', 'Mag On', 'Mag Off', 'Mag Adapt']
+METHODS_TO_PLOT = ['EKF', 'Mag Off', 'Mag Adapt']
 
 # Which summary metrics to plot from: RMSE, MAE, Mean, STD, Kurtosis, Skewness, Pearson, Median, Q25, Q75, MAD.
 # Default is in radians, for degrees use '_deg' suffix, e.g., 'RMSE_deg'.
@@ -23,16 +23,17 @@ METRIC_TO_PLOT = 'RMSE_deg'
 # If you do not want data to be combined across left/right sides, you can specify them individually as R_{joint} and L_{joint}
 # in both RENAME_JOINTS.
 RENAME_JOINTS = {
-    'R_Hip': 'MHip',
-    'L_Hip': 'MHip',
-    'R_Knee': 'NKnee',   
-    'L_Knee': 'NKnee',
-    'R_Ankle': 'OAnkle',
-    'L_Ankle': 'OAnkle',
+    'R_Hip': 'Hip',
+    'L_Hip': 'Hip',
+    'R_Knee': 'Knee',   
+    'L_Knee': 'Knee',
+    'R_Ankle': 'Ankle',
+    'L_Ankle': 'Ankle',
 }
+JOINT_PLOT_ORDER = ['Lumbar', 'Hip', 'Knee', 'Ankle']
 
 # Plot style can be 'strip' (strip + box-whisker for median + iqr) or 'bar' (mean + std error bars)
-PLOT_STYLE = 'bar'
+PLOT_STYLE = 'strip'
 
 
 DATA_FILE_PATH = os.path.join("data", "all_subject_statistics.pkl")
@@ -192,7 +193,7 @@ def _remove_outliers(
     
     filtered_df = df[(df[metric] >= lower_bound) & (df[metric] <= upper_bound)]
     
-    return df
+    return filtered_df
 
 # --- Main Plotting Functions ---
 
@@ -358,6 +359,26 @@ def plot_summary_data(
     if 'method' not in data.columns or metric not in data.columns:
         print("Error: DataFrame must contain 'method' and the specified metric.")
         return
+    
+    # Apply categorical ordering if 'joint_name' is a grouping column
+    if 'joint_name' in data.columns and 'joint_name' in group_cols:
+        # Filter the global order to only joints present in the data
+        present_joints = data['joint_name'].unique()
+        
+        # Start with the desired order
+        ordered_categories = [j for j in JOINT_PLOT_ORDER if j in present_joints]
+        
+        # Add any other joints (not in JOINT_PLOT_ORDER) to the end
+        for joint in present_joints:
+            if joint not in ordered_categories:
+                ordered_categories.append(joint)
+                
+        data['joint_name'] = pd.Categorical(
+            data['joint_name'],
+            categories=ordered_categories,
+            ordered=True
+        )
+        print(f"  > Applied custom sort order to 'joint_name': {ordered_categories}")
 
     # Filter data to only include specified methods
     data = data[data['method'].isin(method_order)]
@@ -587,10 +608,6 @@ def _generate_single_plot(
         
         g.set_axis_labels(x_var="", y_var=f"{metric.replace('_deg', '')} (Degrees)" if "_deg" in metric else metric)
         g.set_xticklabels(rotation=45, ha='right')
-        if 'joint_name' in plot_group_cols:
-            labels = [label.get_text() for label in g.axes.flat[0].get_xticklabels()]
-            renamed_labels = [label.replace('MHip', 'Hip').replace('NKnee', 'Knee').replace('OAnkle', 'Ankle') for label in labels]
-            g.set_xticklabels(renamed_labels)
         g.set_titles(f"{{col_name}}") 
         g.fig.subplots_adjust(wspace=0.1, hspace=1.0)
         fig = g.fig
@@ -598,7 +615,7 @@ def _generate_single_plot(
         clean_facet_title = facet_col_str.replace('_', ' ').title()
         # MODIFIED: Use data_type_title in title and filename
         plot_title = f"{data_type_title} Performance for {metric} by {clean_facet_title} ({plot_type})"
-        filename = f"unified_by_{facet_col_str.lower()}_{metric.lower()}_{data_type_title.lower()}_{plot_type}.png"
+        filename = f"by_{facet_col_str.lower()}_{metric.lower()}_{data_type_title.lower()}_{plot_type}.png"
         
     else:
         fig, ax = plt.subplots(figsize=(4, 7))
@@ -625,18 +642,174 @@ def _generate_single_plot(
         ax.set_ylabel(f"{metric.replace('_deg', '')}\n(Degrees)" if "_deg" in metric else f"{metric}\n(Radians)")
         ax.set_xlabel("", fontsize=12) 
         ax.tick_params(axis='x', rotation=25, labelsize=16)
-        if 'joint_name' in plot_group_cols:
-            labels = [label.get_text() for label in ax.get_xticklabels()]
-            renamed_labels = [label.replace('MHip', 'Hip').replace('NKnee', 'Knee').replace('OAnkle', 'Ankle') for label in labels]
-            ax.set_xticklabels(renamed_labels)
         ax.tick_params(axis='y', labelsize=16)
         
         # MODIFIED: Use data_type_title in title and filename
         plot_title = f"{data_type_title} Method Performance{single_facet_name}\n{metric.replace('_deg', '').title()} {plot_detail}"
-        filename = f"unified_overall{single_facet_name.replace(' ', '_').lower()}_{metric.lower()}_{data_type_title.lower()}_{plot_type}.png"
+        filename = f"overall{single_facet_name.replace(' ', '_').lower()}_{metric.lower()}_{data_type_title.lower()}_{plot_type}.png"
     
     _finalize_and_save_plot(fig, plot_title, filename)
+
+def _generate_single_heatmap(
+    data: pd.DataFrame,
+    metric: str,
+    method_order: List[str],
+    joint_order: List[str],
+    data_type_title: str,
+    **heatmap_kwargs: Any
+) -> None:
+    """
+    WORKER: Generates a single heatmap for a given data subset (e.g., "Axes" or "Magnitude").
+    (MODIFIED: Puts methods on Y-axis and joints on X-axis)
+    """
+    print(f"--- Generating Heatmap for {metric} ({data_type_title}) ---")
+
+    # Filter data to only included methods and joints
+    data = data[data['method'].isin(method_order) & data['joint_name'].isin(joint_order)]
+
+    if data.empty:
+        print(f"  > No data found for {data_type_title}. Skipping heatmap.")
+        return
+
+    # Create the pivot table: mean metric for each joint/method
+    try:
+        # --- MODIFICATION ---
+        # Group by method first, then joint_name, to put methods on the index (Y-axis)
+        pivot_data = data.groupby(['method', 'joint_name'])[metric].mean().unstack()
+        # --- END MODIFICATION ---
+    except Exception as e:
+        print(f"  > Error creating pivot table: {e}. Skipping heatmap.")
+        return
+
+    # Order the rows (methods) and columns (joints)
+    # --- MODIFICATION ---
+    valid_methods = [m for m in method_order if m in pivot_data.index]
+    valid_joints = [j for j in joint_order if j in pivot_data.columns]
+    # --- END MODIFICATION ---
     
+    if not valid_joints or not valid_methods:
+        print(f"  > No valid data after pivoting. Skipping heatmap.")
+        return
+
+    # --- MODIFICATION ---
+    pivot_data = pivot_data.reindex(index=valid_methods, columns=valid_joints)
+    # --- END MODIFICATION ---
+
+    # Set up plot
+    # Adjust fig_height/width based on swapped axes
+    fig_height = max(6, len(valid_methods) * 1.5) 
+    fig_width = max(8, len(valid_joints) * 2)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    
+    # Set default heatmap arguments, allowing override
+    cbar_label = f"Mean {metric.replace('_deg', '')} (Degrees)" if "_deg" in metric else f"Mean {metric}"
+    default_kwargs = {
+        'annot': True, 
+        'fmt': '.2f', 
+        'cmap': 'Reds',  # Good for errors (lower is better)
+        'linewidths': 0.5, 
+        'cbar_kws': {'label': cbar_label, 'shrink': 0.8}
+    }
+    
+    # Use a diverging colormap for Pearson correlation
+    if 'pearson' in metric.lower():
+         default_kwargs['cmap'] = 'vlag' 
+         default_kwargs['fmt'] = '.3f'
+         default_kwargs['vmin'] = -1.0
+         default_kwargs['vmax'] = 1.0
+
+    default_kwargs.update(heatmap_kwargs)
+
+    sns.heatmap(pivot_data, ax=ax, **default_kwargs)
+
+    # --- MODIFICATION ---
+    # Swap axis labels
+    ax.set_ylabel("Method", fontsize=16)
+    ax.set_xlabel("Joint", fontsize=16)
+    
+    # Apply rotation to X-axis (now Joints)
+    ax.tick_params(axis='x', rotation=45, labelsize=14)
+    # Apply the fix from before to the x-tick-labels (Joints)
+    plt.setp(ax.get_xticklabels(), ha="right", rotation_mode="anchor")
+
+    # No rotation for Y-axis (now Methods)
+    ax.tick_params(axis='y', rotation=0, labelsize=14)
+    # --- END MODIFICATION ---
+
+    # Finalize
+    plot_title = f"Mean {metric} by Method and Joint ({data_type_title})"
+    filename = f"heatmap_meth_vs_joint_{metric.lower()}_{data_type_title.lower()}.png"
+    
+    _finalize_and_save_plot(fig, plot_title, filename)
+
+def plot_metric_vs_joint_heatmap(
+    summary_df: pd.DataFrame,
+    metric: str,
+    method_order: List[str],
+    joint_order: List[str],
+    **heatmap_kwargs: Any
+) -> None:
+    """
+    DISPATCHER: Generates heatmaps, splitting for Axes vs. Magnitude.
+    
+    Checks if 'axis' column contains both 'MAG' and 'X'/'Y'/'Z'.
+    If so, it splits the data and calls _generate_single_heatmap() twice.
+    """
+    data = summary_df.reset_index()
+
+    if 'method' not in data.columns or 'joint_name' not in data.columns or metric not in data.columns:
+        print("Error: DataFrame must contain 'method', 'joint_name', and the specified metric for heatmap.")
+        return
+
+    # 1. Check if we need to split data into Axes and Magnitude
+    if 'axis' in data.columns and len(data['axis'].unique()) > 1:
+        unique_axes = set(data['axis'].unique())
+        has_mag = 'MAG' in unique_axes
+        has_axes = any(ax in unique_axes for ax in ['X', 'Y', 'Z'])
+
+        if has_mag and has_axes:
+            print(f"--- Splitting data into 'Axes (X,Y,Z)' and 'Magnitude' for {metric} Heatmap ---")
+            
+            # Only Plot Magnitude Data
+            data_mag = data[data['axis'] == 'MAG'].copy()
+            _generate_single_heatmap(
+                data=data_mag,
+                metric=metric,
+                method_order=method_order,
+                joint_order=joint_order,
+                data_type_title="Magnitude",
+                **heatmap_kwargs
+            )
+            return # We are done after splitting
+
+        elif has_mag:
+            data_type_title = "Magnitude"
+            data_to_plot = data[data['axis'] == 'MAG'].copy()
+            print(f"--- Only Magnitude data found for {metric}. ---")
+        elif has_axes:
+            data_type_title = "Axes"
+            data_to_plot = data[data['axis'].isin(['X', 'Y', 'Z'])].copy()
+            print(f"--- Only Axes (X,Y,Z) data found for {metric}. ---")
+        else:
+            data_type_title = "Overall"
+            data_to_plot = data.copy()
+            print(f"--- 'axis' column has multiple values, but not X/Y/Z or MAG. Plotting as single group. ---")
+    else:
+        data_type_title = "Overall"
+        data_to_plot = data.copy()
+        print(f"--- No 'axis' column detected or single axis value. Plotting as single group. ---")
+
+    # If no split was needed (or only one type was found), run the plot once
+    _generate_single_heatmap(
+        data=data_to_plot,
+        metric=metric,
+        method_order=method_order,
+        joint_order=joint_order,
+        data_type_title=data_type_title,
+        **heatmap_kwargs
+    )
+
+
 # --- Main Execution ---
 
 def main():
@@ -679,13 +852,20 @@ def main():
 
     print(summary_stats_df.head())
     
-    plot_summary_data(
+    # plot_summary_data(
+    #     summary_df=summary_stats_df,
+    #     group_cols=[],  # You can add more grouping columns as needed
+    #     plot_type=PLOT_STYLE,  # 'bar' or 'strip'
+    #     metric=METRIC_TO_PLOT,  # e.g., 'rmse_deg'
+    #     method_order=METHODS_TO_PLOT,
+    #     show_labels=True,
+    # )
+
+    plot_metric_vs_joint_heatmap(
         summary_df=summary_stats_df,
-        group_cols=['joint_name'],  # You can add more grouping columns as needed
-        plot_type=PLOT_STYLE,  # 'bar' or 'strip'
-        metric=METRIC_TO_PLOT,  # e.g., 'rmse_deg'
+        metric=METRIC_TO_PLOT,
         method_order=METHODS_TO_PLOT,
-        show_labels=True,
+        joint_order=JOINT_PLOT_ORDER
     )
 
     # --- 2. Load Data ---
@@ -709,14 +889,14 @@ def main():
     pearson_stats_df = pearson_stats_df[pearson_stats_df.index.get_level_values('subject').isin(SUBJECTS_TO_PLOT)]
     print(pearson_stats_df.head())
 
-    plot_summary_data(
-        summary_df=pearson_stats_df,
-        group_cols=['joint_name'],  # You can add more grouping columns as needed
-        plot_type=PLOT_STYLE,  # 'bar' or 'strip'
-        metric='PearsonR',  # e.g., 'pearson'
-        method_order=METHODS_TO_PLOT,
-        show_labels=True,
-    )
+    # plot_summary_data(
+    #     summary_df=pearson_stats_df,
+    #     group_cols=['joint_name'],  # You can add more grouping columns as needed
+    #     plot_type=PLOT_STYLE,  # 'bar' or 'strip'
+    #     metric='PearsonR',  # e.g., 'pearson'
+    #     method_order=METHODS_TO_PLOT,
+    #     show_labels=True,
+    # )
     print("\n--- All plotting complete ---")
 
 if __name__ == "__main__":
