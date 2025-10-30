@@ -90,7 +90,7 @@ def _generate_orientation_sto_file_(output_directory: str,
                                                       zip(segment_orientations[parent_trial.name], joint_orientations)]
 
     output_path = os.path.join(output_directory,
-                               f'walking_orientations_{condition.lower().replace(" ", "_")}_2.sto' if 'walking' in output_directory else f'complexTasks_orientations_{condition.lower().replace(" ", "_")}_2.sto')
+                               f'walking_orientations_{condition.lower().replace(" ", "_")}.sto' if 'walking' in output_directory else f'complexTasks_orientations_{condition.lower().replace(" ", "_")}.sto')
     if not os.path.exists(output_directory):
         os.makedirs(output_directory)
     _export_to_sto_(output_path, timestamps, segment_orientations)

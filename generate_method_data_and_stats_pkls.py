@@ -1,16 +1,10 @@
-import matplotlib.pyplot as plt
-import matplotlib.container as mpc
-from typing import List, Dict, Tuple
 from src.toolchest.PlateTrial import PlateTrial
 from src.toolchest.WorldTrace import WorldTrace
 from scipy.spatial.transform import Rotation
+from typing import List, Dict
 import numpy as np
-import scipy.stats as stats
 import pandas as pd
 import os
-import seaborn as sns
-import itertools
-import json
 from generate_method_orientation_sto_files import JOINT_SEGMENT_DICT
 
 
@@ -118,7 +112,7 @@ def load_joint_traces_for_subject_df(subject_id: str,
                     )
                 else:
                     world_traces = WorldTrace.load_from_sto_file(
-                        os.path.abspath(os.path.join("data", "data", subject_id, trial_type, f"{trial_type}_orientations_{method.replace(' ', '_').lower()}_2.sto"))
+                        os.path.abspath(os.path.join("data", "data", subject_id, trial_type, f"{trial_type}_orientations_{method.replace(' ', '_').lower()}.sto"))
                     )
                 plate_trials_by_method[method] = PlateTrial.generate_plate_from_traces(imu_traces, world_traces, align_plate_trials=False)
                 min_length = min(min_length, min(len(trial) for trial in plate_trials_by_method[method]))
@@ -168,15 +162,14 @@ def load_joint_traces_for_subject_df(subject_id: str,
 # --- RMSE Calculation Function ---
 def get_summary_statistics(all_data_df: pd.DataFrame, group_by: List[str]) -> pd.DataFrame:
     """
-    Calculates a comprehensive set of error statistics and correlation 
-    between all methods and the 'Marker' method.
-    ... [rest of docstring] ...
+    Calculates a comprehensive set of error statistics 
+    between all methods and the 'Marker' method, including:
+    1. Statistics for individual Euler angle errors (X, Y, Z).
+    2. Statistics for the 3D angle-axis error magnitude (MAG).
     """
-    print("--- [get_summary_statistics] Starting statistics calculation... ---")
+    print("--- [get_summary_statistics] Starting error statistics calculation... ---")
     
     # --- 1. Prepare DataFrame ---
-    # Ensure 'subject' is in the group_by list if 'subject_id' is in the index
-    # This standardizes the index name to match the expected group_by list.
     if 'subject' in group_by and 'subject_id' in all_data_df.index.names:
         print("   > Renaming index 'subject_id' to 'subject'.")
         df = all_data_df.rename_axis(index={'subject_id': 'subject'})
@@ -185,13 +178,9 @@ def get_summary_statistics(all_data_df: pd.DataFrame, group_by: List[str]) -> pd
 
     # --- 2. Separate Reference (Marker) and Test (IMU) Data ---
     try:
-        # 'Marker' is our ground truth.
         marker_df = df.xs('Marker', level='method')
-        
-        # 'imu_df' contains all other methods to be tested.
         imu_df = df.drop('Marker', level='method')
         print(f"   > Separated 'Marker' ({len(marker_df)} rows) from IMU methods ({len(imu_df)} rows).")
-
     except KeyError:
         print("Error: 'Marker' method not found in DataFrame. Cannot calculate error.")
         return pd.DataFrame()
@@ -200,23 +189,20 @@ def get_summary_statistics(all_data_df: pd.DataFrame, group_by: List[str]) -> pd
         print("Error: No IMU methods found to compare against 'Marker'.")
         return pd.DataFrame()
 
-    # --- 3. Calculate Error via Merge (to avoid ambiguous join) ---
+    # --- 3. Calculate Error via Merge ---
     
-    # Get the column names for euler angles
-    euler_cols = [col for col in df.columns if col.startswith('euler_') or col == 'angle_axis_magnitude_rad']
+    euler_cols = [col for col in df.columns if col.startswith('euler_')]
+    angle_axis_cols = [col for col in df.columns if col.startswith('angle_axis_')]
+        
     if not euler_cols:
         print("Error: No Euler angle columns (e.g., 'euler_X_rad') found.")
         return pd.DataFrame()
         
-    # Get index names to join on (all levels in marker_df)
     join_levels = marker_df.index.names
-    
-    # Reset indices for merge
     marker_reset = marker_df.reset_index()
     imu_reset = imu_df.reset_index()
     
     print(f"   > Merging IMU and Marker data on {len(join_levels)} levels...")
-    # Perform a left join: keep all imu_df rows, find matching marker_df rows
     merged_df = pd.merge(
         imu_reset, 
         marker_reset, 
@@ -224,97 +210,61 @@ def get_summary_statistics(all_data_df: pd.DataFrame, group_by: List[str]) -> pd
         suffixes=('_imu', '_marker')
     )
     
-    # Check if merge was successful
     if merged_df.empty:
         print("Error: Merge between IMU and Marker data resulted in an empty DataFrame.")
-        print(f"IMU index levels: {imu_df.index.names}")
-        print(f"Marker index levels: {marker_df.index.names}")
-        print(f"Join levels: {join_levels}")
         return pd.DataFrame()
     
     print(f"   > Merge complete. Result has {len(merged_df)} rows.")
 
-    # Calculate error for each euler angle
+    # Calculate error for each euler angle component
     error_cols_dict = {}
     for col in euler_cols:
-        # e.g., 'error_X'
         error_col_name = "error_" + col 
         merged_df[error_col_name] = merged_df[f'{col}_imu'] - merged_df[f'{col}_marker']
-        # 'X', 'Y', 'Z', 'MAG'
-        error_cols_dict[error_col_name] = col.split('_')[1] if col != 'angle_axis_magnitude_rad' else 'MAG'
+        error_cols_dict[error_col_name] = col.split('_')[1] # 'X', 'Y', 'Z'
+    
+    # --- Calculate 3D Angle-Axis Error Magnitude ---
+    angle_axis_vector_imu = merged_df[[f'{c}_imu' for c in angle_axis_cols]].values
+    angle_axis_vector_marker = merged_df[[f'{c}_marker' for c in angle_axis_cols]].values
+    
+    # Error Vector: Delta = Theta_IMU - Theta_Marker
+    error_vector = angle_axis_vector_imu - angle_axis_vector_marker
+    
+    # Magnitude of the Error Vector: ||Delta||
+    error_magnitude = np.linalg.norm(error_vector, axis=1) 
+    
+    MAGNITUDE_COL_NAME = 'angle_axis_error_magnitude_rad'
+    merged_df[MAGNITUDE_COL_NAME] = error_magnitude
+    
+    error_cols_dict[MAGNITUDE_COL_NAME] = 'MAG' # Key for the summary index
     
     print(f"   > Calculated error columns: {list(error_cols_dict.keys())}.")
-
-    # --- NEW STEP 3.5: Calculate Pearson Correlation ---
     
-    # Identify the IMU and Marker column pairs
-    corr_cols = {
-        col: (f'{col}_imu', f'{col}_marker') 
-        for col in euler_cols
-    }
-    
-    # Levels to group by for the correlation (all non-time/sample levels)
-    # The 'method' column is already in the grouped object via its index.
-    corr_group_levels = [lvl for lvl in join_levels if lvl != 'timestamp']
-    
-    print(f"   > Calculating Pearson correlation grouped by {corr_group_levels}...")
-    
-    # Group the IMU and Marker data together and calculate correlation
-    # We will use .apply() to calculate the correlation for each pair within each group
-    
-    def calculate_pair_correlation(group, col_pairs):
-        results = {}
-        for original_col, (imu_col, marker_col) in col_pairs.items():
-            # Calculate Pearson R and map it to the axis name (e.g., 'X', 'Y', 'Z', 'MAG')
-            axis_name = error_cols_dict[original_col.replace('euler_', 'error_').replace('_rad', '') if original_col != 'angle_axis_magnitude_rad' else 'error_angle_axis_magnitude']
-            results[axis_name] = group[imu_col].corr(group[marker_col], method='pearson')
-        return pd.Series(results, name='PearsonR')
-
-    # Apply the function to the grouped data
-    # The result will have an index of corr_group_levels and a column for each axis ('X', 'Y', 'Z', 'MAG')
-    corr_grouped = merged_df.groupby(corr_group_levels).apply(lambda x: calculate_pair_correlation(x, corr_cols))
-    
-    # Stack the axis results to match the final summary_df index levels
-    correlation_df = corr_grouped.stack().rename('PearsonR').to_frame()
-    # The index is now (subject, trial_type, method, joint_name, axis)
-    correlation_df.index.names = final_corr_index = corr_group_levels + ['axis']
-    print("   > Pearson correlation calculated and formatted.")
+    # --- Correlation steps (3.5) are removed ---
 
     # --- 4. Reshape to Long Format (Melt) ---
     
-    # Metadata columns to keep
-    # e.g., ['subject', 'trial_type', 'method', 'joint_name', 'timestamp']
-    meta_cols = list(imu_df.index.names) 
+    meta_cols = [lvl for lvl in join_levels if lvl != 'timestamp'] # subject, trial_type, method, joint_name
+    error_columns_to_melt = list(error_cols_dict.keys())
     
     print("   > Reshaping DataFrame (melting) from wide to long format...")
-    # We want to melt the new error columns
     error_long = pd.melt(
         merged_df,
-        id_vars=meta_cols,
-        value_vars=list(error_cols_dict.keys()),
-        var_name='axis_name',
+        id_vars=meta_cols + ['timestamp'], # Keep timestamp for potential later use
+        value_vars=error_columns_to_melt,
+        var_name='error_metric_name',
         value_name='error_rad'
-    )
-    print(f"   > Melt complete. Result has {len(error_long)} rows.")
+    ).set_index(meta_cols + ['timestamp'])
     
     # --- 5. Clean up 'axis' Names ---
-    # Map 'error_X' to 'X'
-    error_long['axis'] = error_long['axis_name'].map(error_cols_dict)
+    error_long['axis'] = error_long['error_metric_name'].map(error_cols_dict)
     
-    # Set the index
-    all_levels = meta_cols + ['axis']
-    # Drop the temporary 'axis_name' column ('error_X', etc.)
-    error_long = error_long.set_index(all_levels).drop(columns=['axis_name'])
-    print("   > Set new MultiIndex including 'axis'.")
+    all_levels = meta_cols + ['timestamp', 'axis']
+    error_long = error_long.reset_index().set_index(all_levels).drop(columns=['error_metric_name'])
     
     # --- 6. Group and Calculate Statistics ---
     
-    # Ensure all group_by items are valid index levels
     valid_group_by = [lvl for lvl in group_by if lvl in error_long.index.names]
-    if len(valid_group_by) != len(group_by):
-        m_keys = [k for k in group_by if k not in valid_group_by]
-        print(f"Warning: Not all group_by keys found in index. Missing: {m_keys}. Using: {valid_group_by}")
-        
     if not valid_group_by:
         print("Error: No valid group_by keys. Returning empty DataFrame.")
         return pd.DataFrame()
@@ -323,24 +273,13 @@ def get_summary_statistics(all_data_df: pd.DataFrame, group_by: List[str]) -> pd
     grouped = error_long['error_rad'].groupby(level=valid_group_by)
     
     # Define the aggregation functions
-    def q25(x):
-        return x.quantile(0.25)
-
-    def q75(x):
-        return x.quantile(0.75)
-        
-    def rmse(x):
-        return np.sqrt(np.mean(x**2))
-
-    def mae(x):
-        return x.abs().mean()
-        
-    def mad(x):
-        # Median Absolute Deviation from the median
-        return (x - x.median()).abs().median()
+    def q25(x): return x.quantile(0.25)
+    def q75(x): return x.quantile(0.75)
+    def rmse(x): return np.sqrt(np.mean(x**2))
+    def mae(x): return x.abs().mean()
+    def mad(x): return (x - x.median()).abs().median()
 
     print("   > Calculating aggregate statistics (RMSE, MAE, Mean, etc.)...")
-    # Calculate all statistics at once using agg
     summary_df = grouped.agg(
         RMSE = rmse,
         MAE = mae,
@@ -353,55 +292,123 @@ def get_summary_statistics(all_data_df: pd.DataFrame, group_by: List[str]) -> pd
         Median = 'median',
         Q75 = q75,
     ).sort_index()
-    print("   > Aggregation complete.")
     
-    # --- Merge Correlation Data ---
-    print("   > Merging Pearson correlation data.")
-    # The correlation_df is already indexed by a subset of the summary_df index
-    # We need to ensure the group_by columns are used for merging
-    
-    # Re-group the correlation data to match the final summary_df group_by index
-    # Note: Using min() on the PearsonR in case the summary_df index is a subset
-    # of the correlation_df index (e.g., if summary_df groups by subject but not trial_type)
-    # Since PearsonR is a single value per (method, axis, etc.), min() is safe.
-    corr_to_merge = correlation_df.groupby(level=valid_group_by).min() 
-    
-    summary_df = summary_df.merge(
-        corr_to_merge, 
-        how='left', 
-        left_index=True, 
-        right_index=True
-    )
+    # --- Correlation Merge is Removed ---
 
-    # Convert radian-based stats to degrees for easier interpretation
+    # Convert radian-based stats to degrees
     rad_cols = ['RMSE', 'MAE', 'Mean', 'STD', 'MAD', 'Q25', 'Median', 'Q75']
     deg_cols = [f'{col}_deg' for col in rad_cols]
     
-    # Create new degree columns
     summary_df[deg_cols] = summary_df[rad_cols].apply(np.rad2deg)
 
-    # Rename original columns to indicate radians
     rad_rename_dict = {col: f'{col}_rad' for col in rad_cols}
     summary_df = summary_df.rename(columns=rad_rename_dict)
     print("   > Converted statistics to degrees and renamed columns.")
     
-    # Reorder columns to group rad/deg together (optional, but clean)
+    # Reorder columns
     final_cols = []
     for col in rad_cols:
         final_cols.append(f'{col}_rad')
         final_cols.append(f'{col}_deg')
-    # Add non-angle stats
     final_cols.append('Skew')
     final_cols.append('Kurtosis')
-    final_cols.append('PearsonR') # ADDED
     
-    # Ensure all final columns exist before reordering
     final_cols = [c for c in final_cols if c in summary_df.columns]
-    
     summary_df = summary_df[final_cols]
 
-    print("--- [get_summary_statistics] Finished. Returning summary DataFrame. ---")
+    print("--- [get_summary_statistics] Finished. Returning error summary DataFrame. ---")
     return summary_df
+
+def get_pearson_correlation_summary(all_data_df: pd.DataFrame, group_by: List[str]) -> pd.DataFrame:
+    """
+    Calculates the Pearson correlation (R) between the time series of each method 
+    and the 'Marker' method for all Euler and Angle-Axis components.
+    
+    Returns:
+        pd.DataFrame: A DataFrame indexed by the specified groups and 'axis' 
+                      (X, Y, Z, AA_X, AA_Y, AA_Z) with a 'PearsonR' column.
+    """
+    print("--- [get_pearson_correlation_summary] Starting correlation calculation... ---")
+
+    # --- 1. Prepare DataFrame ---
+    if 'subject' in group_by and 'subject_id' in all_data_df.index.names:
+        df = all_data_df.rename_axis(index={'subject_id': 'subject'})
+    else:
+        df = all_data_df.copy()
+
+    # --- 2. Separate Data and Get Columns ---
+    try:
+        marker_df = df.xs('Marker', level='method')
+        imu_df = df.drop('Marker', level='method')
+    except KeyError:
+        print("Error: 'Marker' method not found in DataFrame. Cannot calculate correlation.")
+        return pd.DataFrame()
+        
+    euler_cols = [col for col in df.columns if col.startswith('euler_')]
+    angle_axis_cols = [col for col in df.columns if col.startswith('angle_axis_')]
+    all_correlation_cols = euler_cols + angle_axis_cols
+        
+    if not all_correlation_cols:
+        print("Error: No angle columns found for correlation.")
+        return pd.DataFrame()
+
+    # --- 3. Merge Data ---
+    join_levels = marker_df.index.names
+    corr_group_levels = [lvl for lvl in join_levels if lvl != 'timestamp'] # e.g., [subject, trial_type, method, joint_name]
+
+    marker_reset = marker_df.reset_index()
+    imu_reset = imu_df.reset_index()
+    
+    # Merge IMU and Marker data
+    merged_df = pd.merge(
+        imu_reset, 
+        marker_reset, 
+        on=list(join_levels), 
+        suffixes=('_imu', '_marker')
+    )
+    if merged_df.empty:
+        print("Error: Merge resulted in an empty DataFrame.")
+        return pd.DataFrame()
+    
+    # --- 4. Calculate Correlation ---
+    
+    corr_cols = {
+        col: (f'{col}_imu', f'{col}_marker') 
+        for col in all_correlation_cols
+    }
+    
+    print(f"   > Calculating Pearson correlation grouped by {corr_group_levels}...")
+    
+    def calculate_pair_correlation(group, col_pairs):
+        results = {}
+        for original_col, (imu_col, marker_col) in col_pairs.items():
+            # Determine axis name for the correlation index
+            if original_col.startswith('euler_'):
+                axis_name = original_col.split('_')[1]      # 'X', 'Y', 'Z'
+            else: # angle_axis_x/y/z_rad
+                axis_name = 'AA_' + original_col.split('_')[2].upper()
+                
+            results[axis_name] = group[imu_col].corr(group[marker_col], method='pearson')
+        return pd.Series(results, name='PearsonR')
+
+    # Apply the function to the correctly grouped data
+    corr_grouped = merged_df.groupby(corr_group_levels).apply(lambda x: calculate_pair_correlation(x, corr_cols))
+    
+    correlation_df = corr_grouped.stack().rename('PearsonR').to_frame()
+    # The index names must match the levels used for grouping + the new 'axis' level
+    correlation_df.index.names = corr_group_levels + ['axis'] 
+
+    # --- 5. Final Grouping (if necessary) ---
+    valid_group_by = [lvl for lvl in group_by if lvl in correlation_df.index.names]
+    
+    if len(valid_group_by) < len(correlation_df.index.names):
+        # This handles cases where the user groups by a subset (e.g., only by method and axis)
+        print(f"   > Re-grouping correlation data by requested levels: {valid_group_by}...")
+        # Since PearsonR is a single value per group, min() is safe for aggregation
+        correlation_df = correlation_df.groupby(level=valid_group_by).min()
+    
+    print("--- [get_pearson_correlation_summary] Finished. Returning correlation DataFrame. ---")
+    return correlation_df
 
 # --- Main Execution ---
 
@@ -417,7 +424,7 @@ if __name__ == "__main__":
     os.makedirs("plots", exist_ok=True)
     os.makedirs(os.path.join("data", "data"), exist_ok=True)
 
-    data_file_path = os.path.abspath(os.path.join("data", "data", f"all_subject_data_2.pkl"))
+    data_file_path = os.path.abspath(os.path.join("data", "data", f"all_subject_data.pkl"))
     
     if os.path.exists(data_file_path):
         print(f"Loading existing DataFrame from {data_file_path}...")
@@ -472,7 +479,7 @@ if __name__ == "__main__":
             all_data_df,
             group_by=['trial_type', 'method', 'joint_name', 'subject', 'axis']
         )
-        summary_stats_df.to_pickle(os.path.abspath(os.path.join("data", "data", f"all_subject_statistics.pkl")))
+        summary_stats_df.to_pickle(stats_file_path)
 
     print("Summary statistics calculation complete.")
 
@@ -482,3 +489,15 @@ if __name__ == "__main__":
         # Check if pearsonR column exists
         if 'PearsonR' in summary_stats_df.columns:
             print(summary_stats_df['PearsonR'].head())
+    summary_stats_df.to_csv(os.path.abspath(os.path.join("data", "data", f"all_subject_statistics.csv")))
+    print("good job daniel")
+    pearson_corr_file_path = os.path.abspath(os.path.join("data", "data", f"all_subject_pearson_correlation.pkl"))
+    if os.path.exists(pearson_corr_file_path):
+        print(f"Loading existing Pearson correlation data from {pearson_corr_file_path}...")
+        pearson_corr_df = pd.read_pickle(pearson_corr_file_path)
+    else:
+        pearson_corr_df = get_pearson_correlation_summary(
+            all_data_df,
+            group_by=['trial_type', 'method', 'joint_name', 'subject', 'axis']
+        )
+        pearson_corr_df.to_pickle(pearson_corr_file_path)
