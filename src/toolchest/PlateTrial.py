@@ -5,6 +5,8 @@ from .IMUTrace import IMUTrace
 from .WorldTrace import WorldTrace
 from typing import Tuple, List, Dict
 import matplotlib.pyplot as plt
+from scipy.optimize import least_squares
+from scipy.spatial.transform import Rotation
 
 IMU_TO_TRC_NAME_MAP = {
     'pelvis_imu': 'Pelvis_IMU', 'femur_r_imu': 'R.Femur_IMU', 'femur_l_imu': 'L.Femur_IMU',
@@ -201,3 +203,124 @@ class PlateTrial:
             acc=rotated_acc,
             gyro=rotated_gyro,
             mag=rotated_mag)
+
+    def find_2dof_joint_axes_from_relative_orientation(self,
+        other_plate: 'PlateTrial'
+    ) -> dict:
+        """
+        Estimates the two axes of a 2-DoF joint from a time history of relative orientation,
+        using scipy.spatial.transform.Rotation for quaternion operations.
+
+        This method is based on the principle that a 2-DoF joint motion can be
+        described by a sequence of rotations (e.g., z-x'-y" Euler) where the middle
+        rotation angle (the 'carrying angle') remains constant.
+
+        The function optimizes for the two static rotations that transform the initial
+        body segment coordinate frames into new, "ideal" frames where the variance of
+        the carrying angle is minimized. From these static rotations, it computes
+        the joint axes in the original frames.
+
+        Args:
+            relative_orientations (list[np.ndarray]): A list of quaternions ([w, x, y, z])
+                representing the orientation of body segment 2 relative to body
+                segment 1 for each time step.
+
+        Returns:
+            dict: A dictionary containing:
+                - 'axis_in_frame1': The estimated 3D unit axis vector (j1) for the first
+                rotation, expressed in the original coordinate frame of body segment 1.
+                - 'axis_in_frame2': The estimated 3D unit axis vector (j2) for the second
+                rotation, expressed in the original coordinate frame of body segment 2.
+                - 'carrying_angle_rad': The estimated constant carrying angle in radians.
+                - 'success': A boolean from the optimizer indicating if it converged.
+                - 'message': The convergence message from the optimizer.
+        """
+        assert other_plate is not None, "Other PlateTrial must be provided"
+        assert isinstance(other_plate, PlateTrial), "other_plate must be a PlateTrial instance"
+        assert len(self) == len(other_plate), "PlateTrials must have the same length"
+        self_rotations = Rotation.from_matrix(self.world_trace.rotations)
+        other_rotations = Rotation.from_matrix(other_plate.world_trace.rotations)
+
+        R_rel = (self_rotations.inv() * other_rotations)
+        
+        def _get_carrying_angle_from_quat(q: np.ndarray) -> float:
+            """
+            Calculates the second Euler angle (beta) from a z-x'-y" sequence,
+            based on the explicit formula from Laidig et al. (2022), Eq. 23.
+
+            Args:
+                q (np.ndarray): A single quaternion in [w, x, y, z] format.
+
+            Returns:
+                float: The carrying angle in radians.
+            """
+            qw, qx, qy, qz = q
+            # Ensure the argument for arcsin is within [-1, 1] to avoid NaN errors
+            val = np.clip(2 * (qw * qx + qy * qz), -1.0, 1.0)
+            return np.arcsin(val)
+    
+        def _residuals(params):
+            """
+            The cost function to be minimized. It calculates the deviation of the
+            carrying angle from its mean for the entire motion.
+            """
+            # Parameters are two 3D rotation vectors for the frame alignments
+            rot_vec1 = params[0:3]
+            rot_vec2 = params[3:6]
+
+            # Convert rotation vectors to Rotation objects
+            R1 = Rotation.from_rotvec(rot_vec1)
+            R2 = Rotation.from_rotvec(rot_vec2)
+
+            # Apply alignment rotations using efficient, vectorized multiplication:
+            # R_calibrated = R1 * R_relative * R2_inverse
+            R_calibrated = R1 * R_rel * R2.inv()
+
+            # Convert the stack of calibrated rotations back to [w, x, y, z] quaternions
+            q_cal_w_last = R_calibrated.as_quat()
+            q_cal_w_first = q_cal_w_last[:, [3, 0, 1, 2]]
+
+            # Calculate the carrying angle for each time step
+            carrying_angles = np.array([_get_carrying_angle_from_quat(q) for q in q_cal_w_first])
+            
+            # The error is the deviation from the mean, which forces the variance to be small
+            return carrying_angles - np.mean(carrying_angles)
+
+        # Initial guess: No rotation needed for either frame
+        initial_params = np.zeros(6)
+
+        # Run the non-linear least squares optimization
+        result = least_squares(_residuals, initial_params, method='trf', ftol=1e-6)
+
+        # --- Extract and compute final results from the optimal parameters ---
+        optimal_params = result.x
+        R1_opt = Rotation.from_rotvec(optimal_params[0:3])
+        R2_opt = Rotation.from_rotvec(optimal_params[3:6])
+
+        # In the "ideal" calibrated frame, the joint axes are standard basis vectors
+        j1_ideal = np.array([0, 0, 1])  # z-axis for flexion/extension
+        j2_ideal = np.array([0, 1, 0])  # y-axis for pronation/supination
+
+        # To find the axes in the original frames, we apply the inverse of the
+        # optimized alignment rotations.
+        axis_in_frame1 = R1_opt.apply(j1_ideal, inverse=True)
+        axis_in_frame2 = R2_opt.apply(j2_ideal, inverse=True)
+        
+        # Recalculate the final mean carrying angle from the optimized alignment
+        final_residuals = _residuals(optimal_params)
+        
+        # carrying_angles = final_residuals + mean_angle.
+        # So, mean_angle = first_carrying_angle - first_residual.
+        R_cal_first = R1_opt * R_rel[0] * R2_opt.inv()
+        q_cal_first_w_last = R_cal_first.as_quat()
+        q_cal_first_w_first = q_cal_first_w_last[[3, 0, 1, 2]]
+        
+        final_mean_carrying_angle = _get_carrying_angle_from_quat(q_cal_first_w_first) - final_residuals[0]
+
+        return {
+            'axis_in_frame1': axis_in_frame1,
+            'axis_in_frame2': axis_in_frame2,
+            'carrying_angle_rad': final_mean_carrying_angle,
+            'success': result.success,
+            'message': result.message
+        }

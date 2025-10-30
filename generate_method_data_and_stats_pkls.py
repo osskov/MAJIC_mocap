@@ -8,18 +8,18 @@ import os
 from generate_method_orientation_sto_files import JOINT_SEGMENT_DICT
 
 
-ALL_SUBJECTS = ["Subject01"]#, "Subject02", "Subject03", "Subject04", "Subject05", "Subject06",
-                #"Subject07", "Subject08", "Subject09", "Subject10", "Subject11"]
+ALL_SUBJECTS = ["Subject01", "Subject02", "Subject03", "Subject04", "Subject05", "Subject06",
+                "Subject07", "Subject08", "Subject09", "Subject10", "Subject11"]
 
 ALL_METHODS = ['Marker', 
-            #    'Madgwick (Al Borno)', 'EKF', 'Mahony', 'Madgwick',
+                'Madgwick (Al Borno)', 'EKF', 'Mahony', 'Madgwick',
                'Mag On', 'Mag Off', 'Mag Adapt', 'Unprojected']
 
 ALL_JOINTS = ['R_Ankle', 'L_Ankle', 'R_Knee', 'L_Knee', 'R_Hip', 'L_Hip', 'Lumbar']
 
 ALL_TRIAL_TYPES = ['walking', 'complexTasks']
 
-REGENERATE_FILES = False
+REGENERATE_FILES = True
 BASE_DATA_PATH = os.path.abspath(os.path.join("data", "data"))
 
 # ------------------------------------------------

@@ -15,7 +15,7 @@ SUBJECTS_TO_PLOT = ['Subject01']#, 'Subject02', 'Subject03', 'Subject04', 'Subje
 # Methods to plot can be 'Marker' (OMC Based), 'EKF' (Global EKF), 'Madgwick (Al Borno)' (Loaded from Al Borno files),
 # 'Never Project' (Magnetometer always used), 'Cascade' (Magnetometer sometimes integrated), 'Unprojected' (Relative filter
 # without projecting the acceleration), 'Mag Free' (Relative filter without magnetometer).
-METHODS_TO_PLOT = ['EKF', 'Mag Off', 'Mag Adapt']
+METHODS_TO_PLOT = ['Mag Off', 'Mag Adapt']
 
 # Which summary metrics to plot from: RMSE, MAE, Mean, STD, Kurtosis, Skewness, Pearson, Median, Q25, Q75, MAD.
 # Default is in radians, for degrees use '_deg' suffix, e.g., 'RMSE_deg'.
@@ -367,9 +367,9 @@ def plot_summary_data(
 
     # --- START OF FIX ---
 
-    # 1. Differentiate Euler vs. Angle-Axis and handle axis-pooling
+    # 1. Differentiate AngleAxis vs. Magnitude and handle axis-pooling
     if 'axis' in data.columns and len(data['axis'].unique()) > 1:
-        data_type = 'Euler'
+        data_type = 'AngleAxis'
         
         if 'axis' in plot_group_cols:
             # Path 1: User explicitly requested 'axis'.
@@ -379,9 +379,9 @@ def plot_summary_data(
         
         else:
             # Path 2: User did NOT request 'axis'.
-            # Default behavior: Pool Euler angles, separate 'MAG' into 'axis_group'.
-            print(f"  > 'axis' not requested. Defaulting to faceting by 'axis_group' (Euler_Pooled vs. MAG).")
-            data['axis_group'] = data['axis'].apply(lambda x: 'MAG' if x == 'MAG' else 'Euler_Pooled')
+            # Default behavior: Pool AngleAxis angles, separate 'MAG' into 'axis_group'.
+            print(f"  > 'axis' not requested. Defaulting to faceting by 'axis_group' (AngleAxis_Pooled vs. MAG).")
+            data['axis_group'] = data['axis'].apply(lambda x: 'MAG' if x == 'MAG' else 'AngleAxis_Pooled')
             
             # Add 'axis_group' to the list of columns to group/facet by
             if 'axis_group' not in plot_group_cols:
@@ -391,9 +391,9 @@ def plot_summary_data(
             data = data.drop(columns='axis', errors='ignore')
     
     else:
-        # Path 3: Angle-Axis data (or 'axis' column missing/single value)
-        data_type = 'Angle-Axis'
-        print("  > Angle-Axis data detected (or 'axis' column missing/single-value).")
+        # Path 3: Magnitude data (or 'axis' column missing/single value)
+        data_type = 'Magnitude'
+        print("  > Magnitude data detected (or 'axis' column missing/single-value).")
         # Ensure 'axis' is removed if it's an artifact or was requested but doesn't exist
         if 'axis' in plot_group_cols:
              plot_group_cols.remove('axis')
