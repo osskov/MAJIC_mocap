@@ -9,13 +9,12 @@ import numpy as np
 
 # --- Global Configuration ---
 # Subjects to plot can be "Subject01", "Subject02", ..., "Subject11"
-SUBJECTS_TO_PLOT = ['Subject01']#, 'Subject02', 'Subject03', 'Subject04', 'Subject05',
-                    #'Subject06', 'Subject07', 'Subject08', 'Subject09', 'Subject10', 'Subject11']
+SUBJECTS_TO_PLOT = ['Subject01', 'Subject02', 'Subject03', 'Subject04', 'Subject05',
+                    'Subject06', 'Subject07', 'Subject08', 'Subject09', 'Subject10', 'Subject11']
 
-# Methods to plot can be 'Marker' (OMC Based), 'EKF' (Global EKF), 'Madgwick (Al Borno)' (Loaded from Al Borno files),
-# 'Never Project' (Magnetometer always used), 'Cascade' (Magnetometer sometimes integrated), 'Unprojected' (Relative filter
-# without projecting the acceleration), 'Mag Free' (Relative filter without magnetometer).
-METHODS_TO_PLOT = ['Mag Off', 'Mag Adapt']
+# Methods to plot can be 'EKF' (Global EKF), 'Madgwick (Al Borno)' (Loaded from Al Borno files), 'Madgwick' (GLobal Madgwick), Mahony (Global Mahony),
+# 'Mag On' (Magnetometer always used), 'Mag Off' (Magnetometer never integrated), 'Unprojected' (No acceleration projection), 'Mag Adapt' (Magnetometer used adaptively).
+METHODS_TO_PLOT = ['EKF', 'Mag On', 'Mag Off', 'Mag Adapt']
 
 # Which summary metrics to plot from: RMSE, MAE, Mean, STD, Kurtosis, Skewness, Pearson, Median, Q25, Q75, MAD.
 # Default is in radians, for degrees use '_deg' suffix, e.g., 'RMSE_deg'.
@@ -32,7 +31,7 @@ RENAME_JOINTS = {
     'L_Ankle': 'Ankle',
 }
 
-# Plot style can be 'whisker' (strip + box-whisker for median + iqr) or 'bar' (mean + std error bars)
+# Plot style can be 'strip' (strip + box-whisker for median + iqr) or 'bar' (mean + std error bars)
 PLOT_STYLE = 'strip'
 
 
@@ -365,36 +364,25 @@ def plot_summary_data(
     # Create a modifiable list of grouping columns for this plot
     plot_group_cols = group_cols.copy()
 
-    # --- START OF FIX ---
-
     # 1. Differentiate AngleAxis vs. Magnitude and handle axis-pooling
     if 'axis' in data.columns and len(data['axis'].unique()) > 1:
         data_type = 'AngleAxis'
         
         if 'axis' in plot_group_cols:
-            # Path 1: User explicitly requested 'axis'.
-            # We will facet by the original 'axis' column (X, Y, Z, MAG).
             print(f"  > 'axis' requested. Faceting by original 'axis' column (X, Y, Z, MAG).")
-            # No changes needed, 'axis' is already in plot_group_cols.
         
         else:
-            # Path 2: User did NOT request 'axis'.
-            # Default behavior: Pool AngleAxis angles, separate 'MAG' into 'axis_group'.
             print(f"  > 'axis' not requested. Defaulting to faceting by 'axis_group' (AngleAxis_Pooled vs. MAG).")
             data['axis_group'] = data['axis'].apply(lambda x: 'MAG' if x == 'MAG' else 'AngleAxis_Pooled')
             
-            # Add 'axis_group' to the list of columns to group/facet by
             if 'axis_group' not in plot_group_cols:
                 plot_group_cols.append('axis_group')
                 
-            # Drop the original 'axis' column ('X', 'Y', 'Z') as it's been replaced
             data = data.drop(columns='axis', errors='ignore')
     
     else:
-        # Path 3: Magnitude data (or 'axis' column missing/single value)
         data_type = 'Magnitude'
         print("  > Magnitude data detected (or 'axis' column missing/single-value).")
-        # Ensure 'axis' is removed if it's an artifact or was requested but doesn't exist
         if 'axis' in plot_group_cols:
              plot_group_cols.remove('axis')
         data = data.drop(columns='axis', errors='ignore')
@@ -403,12 +391,21 @@ def plot_summary_data(
 
     # Handle Outliers
     original_count = len(data)
-    # Group by ONLY the requested faceting columns
-    # This will now correctly use 'axis' (Path 1) or 'axis_group' (Path 2)
-    filtered_data = _remove_outliers(data, metric, group_cols=plot_group_cols)
+    
+    # --- START OF FIX ---
+    # Create a list of columns to group by for outlier removal.
+    # This MUST include 'method' plus any faceting columns.
+    outlier_group_cols = plot_group_cols.copy()
+    if 'method' not in outlier_group_cols:
+        outlier_group_cols.append('method')
+    
+    # Group by the faceting columns AND method to remove outliers
+    filtered_data = _remove_outliers(data, metric, group_cols=outlier_group_cols)
+    
     removed_count = original_count - len(filtered_data)
     if removed_count > 0:
-        print(f"  > Removed {removed_count} outliers (beyond 1.5 IQR) for '{metric}'.")
+        print(f"  > Removed {removed_count} outliers (beyond 1.5 IQR per method/group) for '{metric}'.")
+    # --- END OF FIX ---
     
     if filtered_data.empty:
         print("Warning: No data remaining after filtering. Skipping plot.")
@@ -416,8 +413,6 @@ def plot_summary_data(
 
     # Determine the faceting columns based on the *final* plot_group_cols
     facet_cols = [col for col in plot_group_cols if col in filtered_data.columns]
-    
-    # --- END OF FIX ---
     
     print(f"--- Starting Statistical Analysis for {metric} (Facets: {facet_cols or 'Overall'}) ---")
 
@@ -431,25 +426,21 @@ def plot_summary_data(
         # Faceted plot: calculate stats for each combination of facet levels
         try:
             facet_levels_iter = filtered_data.groupby(facet_cols, dropna=True).groups.keys()
-            # Convert to list to avoid issues with generator exhaustion if needed
             facet_levels = list(facet_levels_iter)
         except Exception as e:
             print(f"  > Error during groupby for facets: {e}. Aborting plot.")
             return
 
         for level_tuple in facet_levels:
-            # Ensure level_tuple is always iterable for zipping
             key_tuple = level_tuple if isinstance(level_tuple, tuple) else (level_tuple,)
             level_key = '_'.join(map(str, key_tuple))
             
-            # Filter data for this specific facet
             level_data = filtered_data.copy()
             query_parts = []
             for col, level in zip(facet_cols, key_tuple):
                 if pd.isna(level):
                     query_parts.append(f"`{col}`.isnull()")
                 else:
-                    # Use repr(level) to correctly handle string quoting
                     query_parts.append(f"`{col}` == {repr(level)}")
             
             try:
@@ -466,12 +457,8 @@ def plot_summary_data(
     # 3. Create the Plot: FacetGrid or Single Ax
     
     if len(facet_levels) > 1:
-        # Combine the facet columns into a single string for FacetGrid's 'col' parameter
         facet_col_str = '_'.join(facet_cols) 
-        
         plot_data = filtered_data.copy()
-        
-        # Ensure data is filtered to only include levels we tested
         valid_facet_keys = set(stats_results.keys())
         
         def create_facet_key(row):
@@ -479,15 +466,12 @@ def plot_summary_data(
             return '_'.join(map(str, key_parts))
             
         plot_data[facet_col_str] = plot_data.apply(create_facet_key, axis=1)
-        
-        # Filter plot_data to only include keys that were successfully analyzed
         plot_data = plot_data[plot_data[facet_col_str].isin(valid_facet_keys)]
         
         if plot_data.empty:
             print("Warning: No data left for plotting after filtering for valid facets. Skipping.")
             return
 
-        # Get the order of facets as they were processed
         facet_key_order = [
             '_'.join(map(str, k if isinstance(k, tuple) else (k,))) for k in facet_levels
         ]
@@ -496,7 +480,7 @@ def plot_summary_data(
         g = sns.FacetGrid(
             plot_data,
             col=facet_col_str,
-            col_order=facet_key_order, # Ensure order is maintained
+            col_order=facet_key_order,
             col_wrap=col_wrap,
             height=6,
             aspect=0.8,
@@ -525,21 +509,17 @@ def plot_summary_data(
         
         g.set_axis_labels(x_var="", y_var=f"{metric.replace('_deg', '')} (Degrees)" if "_deg" in metric else metric)
         g.set_xticklabels(rotation=45, ha='right')
-        # Use col_name to get the simple value (e.g., 'X', 'Y', 'Z')
         g.set_titles(f"{{col_name}}") 
         g.fig.subplots_adjust(wspace=0.1, hspace=1.0)
         fig = g.fig
         
-        # Clean up facet_col_str for the title
         clean_facet_title = facet_col_str.replace('_', ' ').title()
         plot_title = f"Performance for {metric} by {clean_facet_title} ({plot_type})"
         filename = f"unified_by_{facet_col_str.lower()}_{metric.lower()}_{plot_type}.png"
         
     else:
-        # (Single plot logic remains the same)
         fig, ax = plt.subplots(figsize=(4, 7))
         
-        # If there was one facet, use its name in the title
         single_facet_name = ""
         if facet_cols and len(facet_levels) == 1:
             single_facet_name = f" ({facet_levels[0]})"
@@ -568,7 +548,6 @@ def plot_summary_data(
         filename = f"unified_overall{single_facet_name.replace(' ', '_').lower()}_{metric.lower()}_{plot_type}.png"
     
     _finalize_and_save_plot(fig, plot_title, filename)
-
 # --- Main Execution ---
 
 def main():
@@ -614,73 +593,12 @@ def main():
     
     plot_summary_data(
         summary_df=summary_stats_df,
-        group_cols=[],  # You can add more grouping columns as needed
+        group_cols=['axis'],  # You can add more grouping columns as needed
         plot_type=PLOT_STYLE,  # 'bar' or 'strip'
         metric=METRICS_TO_PLOT[0],  # e.g., 'rmse_deg'
         method_order=METHODS_TO_PLOT,
         show_labels=True,
     )
-
-    # --- 3. Generate Overall Performance Plots (Strip + Whisker) ---
-    # --- MODIFIED ---
-    # plot_method_performance(
-    #     summary_df=summary_stats_df, metrics=METRICS_TO_PLOT,
-    #     plot_type=PLOT_STYLE, # <-- Pass the style
-    #     method_order=METHODS_TO_PLOT, palette="Set2",
-    #     show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
-    # )
-    
-    # # --- 4. Generate Performance Plots Faceted by Various Factors ---
-    # # --- MODIFIED ---
-    # plot_performance_by_factor(
-    #     summary_df=summary_stats_df, factor='joint_name', metrics=METRICS_TO_PLOT,
-    #     plot_type=PLOT_STYLE, # <-- Pass the style
-    #     method_order=METHODS_IN_ORDER, palette="Set2",
-    #     show_labels=True, show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
-    # )
-    
-    # # --- 5. Generate Interaction Heatmaps for various factors ---
-    # FACTOR_ORDERS = {
-    #         'joint_name': ['Lumbar', 'R_Hip', 'L_Hip', 'R_Knee', 'L_Knee', 'R_Ankle', 'L_Ankle'], # <-- DEFINE YOUR CUSTOM ORDER HERE
-    #         # 'trial_type': ['Slow', 'Medium', 'Fast']
-    #         # Add any other factor orders you might need
-    #     }
-    
-    # interaction_factors = ['joint_name']
-    # for factor in interaction_factors:
-        
-    #     # Get the custom order for this factor, or None if not defined
-    #     # custom_factor_order = FACTOR_ORDERS.get(factor)
-        
-    #     plot_interaction_heatmap(
-    #         summary_df=summary_stats_df, metrics=METRICS_TO_PLOT,
-    #         interaction_factor=factor, 
-    #         method_order=METHODS_TO_PLOT,
-    #         factor_order=['Lumbar', 'Hip', 'Knee', 'Ankle'], # <-- PASS THE NEW ARGUMENT
-    #         cmap='Reds', show_plots=SHOW_PLOTS, save_plots=SAVE_PLOTS
-    #     )
-
-    # # 2. Define a custom order for joints
-    # custom_joint_order = [
-    #     'Lumbar',
-    #     'Hip',
-    #     'Knee',
-    #     'Ankle',
-    # ]
-
-    # 3. Call the function
-    # This will save 'barchart_rmse_deg_by_joint.png'
-    # and 'barchart_other_metric_by_joint.png' in the script's directory.
-    # Set show_plots=True to see them pop up.
-    # plot_metric_barchart(
-    #     summary_df=summary_stats_df,
-    #     metric=METRICS_TO_PLOT[0],  # e.g., 'rmse_deg'
-    #     y_factor='joint_name',
-    #     y_order=custom_joint_order,
-    #     palette="Set2",
-    #     show_plots=SHOW_PLOTS, # Set to True to see the plot
-    #     save_plots=SAVE_PLOTS  # Set to True to save the plot
-    # )
 
     print("\n--- All plotting complete ---")
 
