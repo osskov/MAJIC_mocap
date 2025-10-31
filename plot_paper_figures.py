@@ -1,6 +1,5 @@
 import os
-from typing import Dict, List, Optional, Union, Any, Literal
-
+from typing import List, Any, Literal
 import matplotlib.pyplot as plt
 import pandas as pd
 import scipy.stats as stats
@@ -14,7 +13,7 @@ SUBJECTS_TO_PLOT = ['Subject01', 'Subject02', 'Subject03', 'Subject04', 'Subject
 
 # Methods to plot can be 'EKF' (Global EKF), 'Madgwick (Al Borno)' (Loaded from Al Borno files), 'Madgwick' (GLobal Madgwick), Mahony (Global Mahony),
 # 'Mag On' (Magnetometer always used), 'Mag Off' (Magnetometer never integrated), 'Unprojected' (No acceleration projection), 'Mag Adapt' (Magnetometer used adaptively).
-METHODS_TO_PLOT = ['EKF', 'Mag Off', 'Mag Adapt']
+METHODS_TO_PLOT = ['EKF', 'Mag Off', 'Mag On', 'Mag Adapt']
 
 # Which summary metrics to plot from: RMSE, MAE, Mean, STD, Kurtosis, Skewness, Pearson, Median, Q25, Q75, MAD.
 # Default is in radians, for degrees use '_deg' suffix, e.g., 'RMSE_deg'.
@@ -33,7 +32,7 @@ RENAME_JOINTS = {
 JOINT_PLOT_ORDER = ['Lumbar', 'Hip', 'Knee', 'Ankle']
 
 # Plot style can be 'strip' (strip + box-whisker for median + iqr), 'bar' (mean + std error bars), or 'box' (standard boxplot + strip)
-PLOT_STYLE = 'box'
+PLOT_STYLE = 'bar'
 
 
 DATA_FILE_PATH = os.path.join("data", "all_subject_statistics.pkl")
@@ -50,19 +49,15 @@ def _run_statistical_analysis(
     df: pd.DataFrame,
     metric: str,
     methods_order: List[str],
-    alpha: float = 0.05
+    alpha: float = 0.05,
+    verbose: bool = True  # <-- MODIFICATION: Added verbose flag
 ) -> List[tuple[str, str]]:
     """
     Performs statistical analysis using Friedman and Wilcoxon post-hoc tests.
-
-    Args:
-        ... (same as before) ...
-
-    Returns:
-        List[tuple[str, str]]: A list of (method1, method2) tuples
-                               for pairs that are significantly different.
+    ...
     """
-    print(f"--- a. Dependent-Sample Test (Friedman Test for '{metric}') ---")
+    if verbose:
+        print(f"--- a. Dependent-Sample Test (Friedman Test for '{metric}') ---")
     significant_pairs_list: List[tuple[str, str]] = []
 
     try:
@@ -72,7 +67,8 @@ def _run_statistical_analysis(
             if col in df.columns
         ]
         if not block_cols:
-            print("  > Error: Could not find block columns for Friedman test.")
+            if verbose:
+                print("  > Error: Could not find block columns for Friedman test.")
             return significant_pairs_list
 
         # Create a unique block_id for each combination of conditions.
@@ -88,21 +84,26 @@ def _run_statistical_analysis(
         valid_methods = [m for m in methods_order if m in pivot_df_clean.columns]
 
         if pivot_df_clean.shape[0] < 2 or len(valid_methods) < 2:
-            print(f"  > Skipping stats: Insufficient data (N_blocks={pivot_df_clean.shape[0]}, N_methods={len(valid_methods)}).")
+            if verbose:
+                print(f"  > Skipping stats: Insufficient data (N_blocks={pivot_df_clean.shape[0]}, N_methods={len(valid_methods)}).")
             return significant_pairs_list
 
-        print(f"  > Using {pivot_df_clean.shape[0]} complete blocks for {len(valid_methods)} methods.")
+        if verbose:
+            print(f"  > Using {pivot_df_clean.shape[0]} complete blocks for {len(valid_methods)} methods.")
         groups_for_test = [pivot_df_clean[col] for col in valid_methods]
 
         # --- b. Run Friedman Test ---
         _, p_friedman = stats.friedmanchisquare(*groups_for_test)
-        print(f"  Friedman Test (overall comparison): p-value = {p_friedman:.4e}")
+        if verbose:
+            print(f"  Friedman Test (overall comparison): p-value = {p_friedman:.4e}")
 
         # --- c. Run Post-hoc Test if overall difference is significant ---
         if p_friedman >= alpha:
-            print("  > No significant overall difference found between methods (p >= alpha).")
+            if verbose:
+                print("  > No significant overall difference found between methods (p >= alpha).")
         else:
-            print("  > Significant difference detected. Running post-hoc (Wilcoxon Signed-Rank)...")
+            if verbose:
+                print("  > Significant difference detected. Running post-hoc (Wilcoxon Signed-Rank)...")
             p_uncorrected_list = []
             method_pairs = []
 
@@ -111,7 +112,12 @@ def _run_statistical_analysis(
                     method1, method2 = valid_methods[i], valid_methods[j]
                     method_pairs.append((method1, method2))
                     try:
-                        _, p_val = stats.wilcoxon(pivot_df_clean[method1], pivot_df_clean[method2])
+                        _, p_val = stats.wilcoxon(
+                                                    pivot_df_clean[method1], 
+                                                    pivot_df_clean[method2],
+                                                    alternative='two-sided', # Explicitly state you're checking for *any* difference
+                                                    zero_method='zsplit'   # A robust method for handling zero-differences
+                                                )
                         p_uncorrected_list.append(p_val)
                     except ValueError:
                         p_uncorrected_list.append(1.0)
@@ -127,20 +133,23 @@ def _run_statistical_analysis(
                 p_adjusted[sort_indices] = p_adjusted_sorted
             else:
                 p_adjusted = []
-
-            print("  Significant pairs (p_adj < alpha):")
+                
+            if verbose:
+                print("  Significant pairs (p_adj < alpha):")
             significant_pairs_count = 0
             for (method1, method2), p_adj in zip(method_pairs, p_adjusted):
                 if p_adj < alpha:
-                    print(f"    - {method1} vs. {method2}: p_adj = {p_adj:.4e}")
+                    if verbose:
+                        print(f"    - {method1} vs. {method2}: p_adj = {p_adj:.4e}")
                     significant_pairs_list.append((method1, method2)) # <-- Add to list
                     significant_pairs_count += 1
 
-            if significant_pairs_count == 0:
+            if significant_pairs_count == 0 and verbose:
                 print("    - None (after p-value correction).")
 
     except (ValueError, AttributeError) as e:
-        print(f"  > An error occurred during statistical testing: {e}")
+        if verbose:
+            print(f"  > An error occurred during statistical testing: {e}")
     
     return significant_pairs_list # <-- RETURN THE LIST
 
@@ -148,12 +157,31 @@ def _finalize_and_save_plot(
     figure: plt.Figure,
     plot_title: str,
     filename: str,
+    epilog: str = None  # <-- MODIFICATION: Added epilog
 ) -> None:
     """
     Applies final touches to a plot and saves it to disk.
     """
     figure.suptitle(plot_title, fontsize=16, y=1.02, fontweight='bold')
+    
+    # --- START MODIFICATION ---
+    # Add an epilog text to the bottom-right of the figure
+    if epilog:
+        figure.text(
+            0.99, 0.01, epilog, 
+            ha='right', va='bottom', fontsize=10, 
+            fontstyle='italic', transform=figure.transFigure
+        )
+    # --- END MODIFICATION ---
+    
     plt.tight_layout()
+
+    # Adjust layout to make space for title and epilog if they exist
+    top_margin = 0.97 if plot_title else 1.0
+    bottom_margin = 0.03 if epilog else 0.0
+    if epilog or plot_title:
+        plt.tight_layout(rect=[0, bottom_margin, 1, top_margin])
+
 
     if SAVE_PLOTS:
         plots_dir = "plots"
@@ -210,6 +238,8 @@ def _add_strip_whisker_and_stats(
     """
     Draws a stripplot, custom whisker lines (median/quartiles), and significance
     brackets onto a given Axes. Consolidated logic from previous two whisker/bar functions.
+    
+    MODIFIED: Also prints a table of median and quartiles.
     """
     jitter = kwargs.pop('jitter', 0.1)
     color_map = {method: color for method, color in zip(order, sns.color_palette(PALETTE, n_colors=len(order)))}
@@ -222,6 +252,16 @@ def _add_strip_whisker_and_stats(
     
     # 2. Add whisker lines (Median/Quartiles)
     stats_df = data.groupby(x_col)[y_col].quantile([0.25, 0.5, 0.75]).unstack().reindex(order)
+
+    # --- START OF MODIFICATION ---
+    # Print the stats table
+    stats_df_print = stats_df.copy()
+    stats_df_print.columns = ['Q1 (25%)', 'Median (50%)', 'Q3 (75%)']
+    print(f"\n--- Stats for {y_col} (Median/Quartiles) ---")
+    print(stats_df_print.to_string(float_format="%.3f"))
+    print("--------------------------------------------------\n")
+    # --- END OF MODIFICATION ---
+    
     if show_labels:
         line_width = kwargs.get('line_width', 0.8)
         whisker_width = kwargs.get('whisker_width', 0.7)
@@ -275,6 +315,8 @@ def _add_bar_ci_and_stats(
 ) -> None:
     """
     Draws a barplot with mean and CI error bars, plus significance brackets.
+    
+    MODIFIED: Also prints a table of mean and 95% CI.
     """
     # 1. Plot the bar plot with CI error bars
     sns.barplot(
@@ -284,10 +326,23 @@ def _add_bar_ci_and_stats(
     
     # 2. Calculate mean and CI for label/bracket positioning
     # Calculate stats needed for labels and bracket positioning
-    ci_stats = data.groupby(x_col)[y_col].agg(['mean', lambda x: x.std() / np.sqrt(len(x)) * stats.t.ppf(1 - 0.05/2, len(x) - 1)]).reindex(order)
+    ci_stats = data.groupby(x_col)[y_col].agg(
+        ['mean', lambda x: x.std() / np.sqrt(len(x)) * stats.t.ppf(1 - 0.05/2, len(x) - 1)]
+    ).reindex(order)
     ci_stats.columns = ['mean', 'ci_half']
+    ci_stats['ci_lower'] = ci_stats['mean'] - ci_stats['ci_half']
     ci_stats['ci_upper'] = ci_stats['mean'] + ci_stats['ci_half']
     
+    # --- START OF MODIFICATION ---
+    # Print the stats table
+    # Select and reorder columns for a clean print
+    stats_df_print = ci_stats[['mean', 'ci_lower', 'ci_upper']].copy()
+    stats_df_print.columns = ['Mean', 'CI (2.5%)', 'CI (97.5%)']
+    print(f"\n--- Stats for {y_col} (Mean + 95% CI) ---")
+    print(stats_df_print.to_string(float_format="%.3f"))
+    print("------------------------------------------------\n")
+    # --- END OF MODIFICATION ---
+
     # 3. Add text labels for the mean
     if show_labels:
         for i, method in enumerate(order):
@@ -338,11 +393,13 @@ def _add_boxplot_and_stats(
     order: List[str],
     significant_pairs: List[tuple[str, str]],
     ax: plt.Axes,
-    show_labels: bool = True, # <-- MODIFICATION: Added show_labels
+    show_labels: bool = True,
     **kwargs: Any
 ) -> None:
     """
     Draws a standard boxplot, an overlying stripplot, and significance brackets.
+    
+    MODIFIED: Also prints a table of median and quartiles.
     """
     # 1. Plot the box plot
     boxplot_kwargs = {
@@ -366,11 +423,21 @@ def _add_boxplot_and_stats(
     )
 
     # --- START OF MODIFICATION ---
+    # 2a. Calculate and Print Stats
+    # This calculation is now done here to be printed and re-used by show_labels
+    stats_df_quantiles = data.groupby(x_col)[y_col].quantile([0.25, 0.5, 0.75]).unstack().reindex(order)
+    
+    # Format and print the table
+    stats_df_print = stats_df_quantiles.copy()
+    stats_df_print.columns = ['Q1 (25%)', 'Median (50%)', 'Q3 (75%)']
+    print(f"\n--- Stats for {y_col} (Median/Quartiles) ---")
+    print(stats_df_print.to_string(float_format="%.3f"))
+    print("--------------------------------------------------\n")
+
     # 2b. Add median labels
     if show_labels:
-        # Calculate medians
-        stats_df = data.groupby(x_col)[y_col].quantile(0.5).reindex(order)
-        # Get the width of the boxplot from the kwargs
+        # Re-use the stats calculation from above
+        stats_df = stats_df_quantiles[0.5] # Get just the median Series
         box_width = boxplot_kwargs.get('width', 0.7) 
         
         for i, method in enumerate(order):
@@ -395,11 +462,15 @@ def _add_boxplot_and_stats(
         # as this is where the whiskers are drawn.
         
         try:
-            grouped = data.groupby(x_col)[y_col]
-            q1 = grouped.transform('quantile', 0.25)
-            q3 = grouped.transform('quantile', 0.75)
-            iqr = q3 - q1
-            upper_bound = q3 + 1.5 * iqr
+            # Use the calculated quantiles
+            q1_series = stats_df_quantiles[0.25]
+            q3_series = stats_df_quantiles[0.75]
+            
+            # Map q1/q3 back to the original dataframe
+            q1_map = data[x_col].map(q1_series)
+            q3_map = data[x_col].map(q3_series)
+            iqr = q3_map - q1_map
+            upper_bound = q3_map + 1.5 * iqr
             
             # Find the max data point that is *at or below* the upper_bound
             data_within_whiskers = data[data[y_col] <= upper_bound]
@@ -428,7 +499,6 @@ def _add_boxplot_and_stats(
     
     # Finalize style
     sns.despine(left=False, bottom=False, top=True, right=True, ax=ax)
-
 
 # --- Unified Plotting Function ---
 def plot_summary_data(
@@ -803,7 +873,7 @@ def _generate_single_heatmap(
 ) -> None:
     """
     WORKER: Generates a single heatmap for a given data subset (e.g., "Axes" or "Magnitude").
-    (MODIFIED: Puts joints on Y-axis and methods on X-axis)
+    (MODIFIED: Puts joints on Y-axis, methods on X-axis, and adds significance)
     """
     print(f"--- Generating Heatmap for {metric} ({data_type_title}) ---")
 
@@ -816,43 +886,94 @@ def _generate_single_heatmap(
 
     # Create the pivot table: mean metric for each joint/method
     try:
-        # --- MODIFICATION ---
-        # Group by joint_name first, then method, to put joints on the index (Y-axis)
         pivot_data = data.groupby(['joint_name', 'method'])[metric].mean().unstack()
-        # --- END MODIFICATION ---
     except Exception as e:
         print(f"  > Error creating pivot table: {e}. Skipping heatmap.")
         return
 
     # Order the rows (joints) and columns (methods)
-    # --- MODIFICATION ---
     valid_joints = [j for j in joint_order if j in pivot_data.index]
     valid_methods = [m for m in method_order if m in pivot_data.columns]
-    # --- END MODIFICATION ---
     
     if not valid_joints or not valid_methods:
         print(f"  > No valid data after pivoting. Skipping heatmap.")
         return
 
-    # --- MODIFICATION ---
     pivot_data = pivot_data.reindex(index=valid_joints, columns=valid_methods)
-    # --- END MODIFICATION ---
+
+    # --- START OF MODIFICATION (Run Stats & Create Annot Labels) ---
+
+    # 4. Run Statistical Analysis for each Joint (Row)
+    stats_results = {}
+    print(f"--- Running stats for heatmap ({data_type_title}) ---")
+    for joint in valid_joints:
+        joint_data = data[data['joint_name'] == joint]
+        sig_pairs = _run_statistical_analysis(
+            joint_data, metric, valid_methods, alpha=0.05, verbose=False # Run silently
+        )
+        stats_results[joint] = sig_pairs
+    print("--- Stats complete ---")
+
+    # 5. Determine Annotation Labels with Significance
+    is_error_metric = any(err in metric.lower() for err in ['rmse', 'mae', 'std', 'mad'])
+    is_corr_metric = 'pearson' in metric.lower()
+    
+    # Set formatting
+    fmt_str = '.2f'
+    if is_corr_metric:
+        fmt_str = '.3f'
+
+    # Create base annotation labels (the numbers)
+    annot_labels = pivot_data.applymap(lambda x: f"{x:{fmt_str}}" if pd.notna(x) else "")
+
+    # Add asterisks
+    for joint in annot_labels.index:
+        joint_mean_values = pivot_data.loc[joint]
+        if joint_mean_values.isnull().all():
+            continue
+
+        # Find the "best" method for this joint
+        best_method = ""
+        if is_error_metric:
+            best_method = joint_mean_values.idxmin()
+        elif is_corr_metric:
+            best_method = joint_mean_values.idxmax()
+        else:
+            # Default to min for unknown metrics (like 'Mean')
+            best_method = joint_mean_values.idxmin() 
+        
+        if pd.isna(best_method): continue # Skip if best method is NaN
+
+        sig_pairs = stats_results.get(joint, [])
+
+        for method in annot_labels.columns:
+            if method == best_method or pd.isna(pivot_data.loc[joint, method]):
+                continue
+            
+            # Check if (best, method) or (method, best) is in the significant list
+            is_significant = False
+            for p1, p2 in sig_pairs:
+                if (p1 == best_method and p2 == method) or (p1 == method and p2 == best_method):
+                    is_significant = True
+                    break
+            
+            if is_significant:
+                annot_labels.loc[joint, method] += "*"
+
+    # --- END OF MODIFICATION ---
 
     # Set up plot
-    # Adjust fig_height/width based on swapped axes
-    # --- MODIFICATION ---
     fig_height = len(valid_joints) * 1.8
     fig_width = len(valid_methods) * 2.1
-    # --- END MODIFICATION ---
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     
     # Set default heatmap arguments, allowing override
     cbar_label = f"Mean {metric.replace('_deg', '')} (Degrees)" if "_deg" in metric else f"Mean {metric}"
     default_kwargs = {
-        'annot': True, 
+        'annot': annot_labels,  # <-- MODIFICATION: Use custom labels
         'annot_kws': {'size': 14, 'weight': 'bold'},
-        'fmt': '.2f', 
-        'cmap': 'Reds',  # Good for errors (lower is better)
+        'fmt': '',  # <-- MODIFICATION: Disable default formatting
+        'cmap': 'Reds',
         'linewidths': 0.5, 
         'cbar_kws': {'label': cbar_label, 'shrink': 0.8}
     }
@@ -860,7 +981,6 @@ def _generate_single_heatmap(
     # Use a diverging colormap for Pearson correlation
     if 'pearson' in metric.lower():
          default_kwargs['cmap'] = 'vlag' 
-         default_kwargs['fmt'] = '.3f'
          default_kwargs['vmin'] = -1.0
          default_kwargs['vmax'] = 1.0
 
@@ -868,29 +988,24 @@ def _generate_single_heatmap(
 
     sns.heatmap(pivot_data, ax=ax, **default_kwargs)
 
-    # --- MODIFICATION ---
-    # Swap axis labels
+    # --- (Axis labeling - same as your original) ---
     ax.set_ylabel("Joint", fontsize=16)
     ax.set_xlabel("Method", fontsize=16)
     
-    # Apply rotation to X-axis (now Methods)
     ax.tick_params(axis='x', rotation=45, labelsize=14)
-    # Replace 'Mag Adapt' with 'MAJIC' in x-tick labels if present
     xtick_labels = [label.get_text().replace('Mag Adapt', 'MAJIC') for label in ax.get_xticklabels()]
     ax.set_xticklabels(xtick_labels)
-
-    # Apply the fix from before to the x-tick-labels (Methods)
     plt.setp(ax.get_xticklabels(), ha="right", rotation_mode="anchor")
-
-    # No rotation for Y-axis (now Joints)
     ax.tick_params(axis='y', rotation=0, labelsize=14)
-    # --- END MODIFICATION ---
+    # --- (End of axis labeling) ---
 
     # Finalize
-    plot_title = f"Mean Joint Angle {metric.replace('_deg', '')}\nby Method and Joint ({data_type_title})"
+    plot_title = f"Mean Joint Angle {metric.replace('_deg', '')}\nby Method and Joint"
     filename = f"heatmap_joint_vs_meth_{metric.lower()}_{data_type_title.lower()}.png"
     
-    _finalize_and_save_plot(fig, plot_title, filename)
+    # --- MODIFICATION: Pass epilog to save function ---
+    epilog_text = "* Significantly different from best method in row (p < 0.05, Wilcoxon)"
+    _finalize_and_save_plot(fig, plot_title, filename, epilog=epilog_text)
 
 def plot_metric_vs_joint_heatmap(
     summary_df: pd.DataFrame,
@@ -1003,7 +1118,7 @@ def main():
     
     plot_summary_data(
         summary_df=summary_stats_df,
-        group_cols=[],  # You can add more grouping columns as needed
+        group_cols=['joint_name'],  # You can add more grouping columns as needed
         plot_type=PLOT_STYLE,  # 'bar', 'strip', or 'box'
         metric=METRIC_TO_PLOT,  # e.g., 'rmse_deg'
         method_order=METHODS_TO_PLOT,
@@ -1038,14 +1153,14 @@ def main():
     pearson_stats_df = pearson_stats_df[pearson_stats_df.index.get_level_values('subject').isin(SUBJECTS_TO_PLOT)]
     print(pearson_stats_df.head())
 
-    # plot_summary_data(
-    #     summary_df=pearson_stats_df,
-    #     group_cols=['joint_name'],  # You can add more grouping columns as needed
-    #     plot_type=PLOT_STYLE,  # 'bar', 'strip', or 'box'
-    #     metric='PearsonR',  # e.g., 'pearson'
-    #     method_order=METHODS_TO_PLOT,
-    #     show_labels=True,
-    # )
+    plot_summary_data(
+        summary_df=pearson_stats_df,
+        group_cols=['joint_name'],  # You can add more grouping columns as needed
+        plot_type=PLOT_STYLE,  # 'bar', 'strip', or 'box'
+        metric='PearsonR',  # e.g., 'pearson'
+        method_order=METHODS_TO_PLOT,
+        show_labels=True,
+    )
     print("\n--- All plotting complete ---")
 
 if __name__ == "__main__":
