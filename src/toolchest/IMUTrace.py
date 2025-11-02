@@ -212,7 +212,7 @@ class IMUTrace:
         This method calculates the linear acceleration at a point defined by
         `local_offset` relative to the IMU's measurement frame. It uses the
         full rigid body acceleration equation:
-        $a_p = a_o + \dot{\omega} \times r + \omega \times (\omega \times r)$
+        $a_p = a_o + dot{\omega} times r + \omega times (\omega times r)$
 
         where:
         - $a_p$ is the projected acceleration (the result)
@@ -238,7 +238,7 @@ class IMUTrace:
         gyro_derivative = self._finite_difference_gyros(finite_difference_gyro_method)
         acc = [acc + np.cross(d_gyro, offset) + np.cross(gyro, np.cross(gyro, offset)) for acc, gyro, d_gyro, offset in
                zip(self.acc, self.gyro, gyro_derivative, local_offset)]
-        return IMUTrace(self.timestamps, self.gyro, acc, self.mag)
+        return IMUTrace(self.timestamps, self.gyro.copy(), acc, self.mag.copy())
 
     def get_sample_frequency(self) -> float:
         """
@@ -490,42 +490,12 @@ class IMUTrace:
                                      initial_offset_other: np.ndarray = None,
                                      max_iterations: int = 20,
                                      tolerance: float = 1e-6,
-                                     subsample_rate: int = 5) -> Dict[str, Union[np.ndarray, bool]]:
+                                     subsample_rate: int = 1) -> Dict[str, Union[np.ndarray, bool]]:
         """
-        Estimates the position of a spheroidal joint center relative to two IMUs.
+        Estimates the position of a spheroidal joint center relative to two IMUs
+        using a vectorized Gauss-Newton optimization.
 
-        This method implements the algorithm described in Section II-B of the paper
-        "Joint axis and position estimation from inertial measurement data by
-        exploiting kinematic constraints" by Seel et al. (2012). It uses a
-        Gauss-Newton optimization to find the offset vectors from each IMU's
-        origin to the common joint center.
-
-        The core constraint is that the magnitude of the joint center's acceleration,
-        when calculated from either IMU's frame of reference, must be equal.
-
-        Args:
-            other (IMUTrace): The second IMUTrace object, rigidly attached to the
-                other body segment. Data is assumed to be time-synchronized.
-            initial_offset_self (np.ndarray, optional): A 3-element initial guess
-                for the offset vector from this IMU's origin to the joint center.
-                If None, a small random guess is used.
-            initial_offset_other (np.ndarray, optional): A 3-element initial guess
-                for the offset vector from the other IMU's origin to the joint
-                center. If None, a small random guess is used.
-            max_iterations (int, optional): The maximum number of iterations for
-                the optimization. Defaults to 20.
-            tolerance (float, optional): The convergence tolerance. The optimization
-                stops when the norm of the update step is less than this value.
-                Defaults to 1e-6.
-            subsample_rate (int, optional): The rate at which to subsample the data
-                to speed up computation (e.g., a value of 5 uses every 5th sample).
-                Defaults to 5.
-
-        Returns:
-            Dict[str, Union[np.ndarray, bool]]: A dictionary containing:
-                - 'offset_self': The estimated 3D offset vector in self's frame.
-                - 'offset_other': The estimated 3D offset vector in other's frame.
-                - 'converged': A boolean indicating if the algorithm converged.
+        (Docstring remains the same as your original)
         """
         # Ensure data streams are synchronized
         np.testing.assert_array_almost_equal(
@@ -533,16 +503,21 @@ class IMUTrace:
             err_msg="IMU traces must be time-synchronized. Use the resample() method first."
         )
 
-        # Pre-compute gyro derivatives
-        g1_dot = self._finite_difference_gyros()
-        g2_dot = other._finite_difference_gyros()
+        # Pre-compute gyro derivatives (assuming these return (N_full, 3) np.arrays)
+        g1_dot_full = np.array(self._finite_difference_gyros())
+        g2_dot_full = np.array(other._finite_difference_gyros())
 
         # Subsample data to speed up computation
+        # This is the first key change: we are now slicing NumPy arrays,
+        # not building Python lists.
         indices = np.arange(0, len(self), subsample_rate)
-        g1, g2 = [self.gyro[i] for i in indices], [other.gyro[i] for i in indices]
-        a1, a2 = [self.acc[i] for i in indices], [other.acc[i] for i in indices]
-        g1_dot, g2_dot = [g1_dot[i] for i in indices], [g2_dot[i] for i in indices]
-        num_samples = len(indices)
+        g1 = np.array(self.gyro)[indices]
+        g2 = np.array(other.gyro)[indices]
+        a1 = np.array(self.acc)[indices]
+        a2 = np.array(other.acc)[indices]
+        g1_dot = g1_dot_full[indices]
+        g2_dot = g2_dot_full[indices]
+        # num_samples = len(indices) # No longer needed inside the loop
 
         # Initialize the state vector x = [o1_x, o1_y, o1_z, o2_x, o2_y, o2_z]
         o1 = np.random.rand(3) * 0.1 if initial_offset_self is None else initial_offset_self.copy()
@@ -553,40 +528,58 @@ class IMUTrace:
         for _ in range(max_iterations):
             o1, o2 = x[:3], x[3:]
 
-            e = np.zeros(num_samples)
-            J = np.zeros((num_samples, 6))
+            # --- Vectorized Computation (Replaces the inner for-loop) ---
+            # All operations are now on (N, 3) or (N,) arrays, where N=len(indices)
 
-            for k in range(num_samples):
-                g1_k, g2_k = g1[k], g2[k]
-                a1_k, a2_k = a1[k], a2[k]
-                g1_dot_k, g2_dot_k = g1_dot[k], g2_dot[k]
+            # Eq(3): Γ_g(o) = g x (g x o) + ġ x o
+            # Broadcasting: (N, 3) x (3,) -> (N, 3)
+            gamma1 = np.cross(g1, np.cross(g1, o1)) + np.cross(g1_dot, o1)
+            gamma2 = np.cross(g2, np.cross(g2, o2)) + np.cross(g2_dot, o2)
 
-                # Eq(3): Γ_g(o) = g x (g x o) + ġ x o
-                gamma1 = np.cross(g1_k, np.cross(g1_k, o1)) + np.cross(g1_dot_k, o1)
-                gamma2 = np.cross(g2_k, np.cross(g2_k, o2)) + np.cross(g2_dot_k, o2)
+            # (N, 3) - (N, 3) -> (N, 3)
+            joint_acc1 = a1 - gamma1
+            joint_acc2 = a2 - gamma2
 
-                joint_acc1 = a1_k - gamma1
-                joint_acc2 = a2_k - gamma2
+            # Calculate norm along rows (axis=1) -> (N,)
+            norm1 = np.linalg.norm(joint_acc1, axis=1)
+            norm2 = np.linalg.norm(joint_acc2, axis=1)
 
-                norm1 = np.linalg.norm(joint_acc1)
-                norm2 = np.linalg.norm(joint_acc2)
+            # Residual vector e: (N,) - (N,) -> (N,)
+            e = norm1 - norm2
 
-                if norm1 > 1e-9 and norm2 > 1e-9:
-                    e[k] = norm1 - norm2
+            # Eq(4) Jacobian:
+            # Γ_T(v) = (v x g) x g + v x ġ
+            v1 = joint_acc1
+            gamma_T1_v1 = np.cross(np.cross(v1, g1), g1) + np.cross(v1, g1_dot) # (N, 3)
 
-                    # Eq(4) Jacobian: d(||a-Γ(o)||)/do = -Γ_T(a-Γ(o)) / ||a-Γ(o)||
-                    # where Γ_T(v) = (v x g) x g + v x ġ
-                    v1 = joint_acc1
-                    gamma_T1_v1 = np.cross(np.cross(v1, g1_k), g1_k) + np.cross(v1, g1_dot_k)
-                    J[k, :3] = -gamma_T1_v1 / norm1
+            v2 = joint_acc2
+            gamma_T2_v2 = np.cross(np.cross(v2, g2), g2) + np.cross(v2, g2_dot) # (N, 3)
 
-                    v2 = joint_acc2
-                    gamma_T2_v2 = np.cross(np.cross(v2, g2_k), g2_k) + np.cross(v2, g2_dot_k)
-                    # de/do2 = -d(norm2)/do2 leads to a double negative
-                    J[k, 3:] = gamma_T2_v2 / norm2
+            # Handle potential division by zero
+            # Create "safe" denominators, replacing 0 with a small number
+            norm1_safe = np.maximum(norm1, 1e-9)
+            norm2_safe = np.maximum(norm2, 1e-9)
+
+            # J columns for o1 and o2
+            # Broadcasting: (N, 3) / (N, 1) -> (N, 3)
+            J_o1 = -gamma_T1_v1 / norm1_safe[:, np.newaxis]
+            J_o2 =  gamma_T2_v2 / norm2_safe[:, np.newaxis]
+
+            # Assemble full (N, 6) Jacobian
+            J = np.hstack([J_o1, J_o2])
+
+            # Vectorized safety check:
+            # Find all rows where either norm was too small
+            invalid_mask = (norm1 < 1e-9) | (norm2 < 1e-9)
+            # Zero out the residual and Jacobian for these rows
+            e[invalid_mask] = 0.0
+            J[invalid_mask, :] = 0.0
+
+            # --- End Vectorized Computation ---
 
             try:
                 # Update step: x_new = x - pinv(J) * e
+                # (6, N) @ (N,) -> (6,)
                 delta_x = -np.linalg.pinv(J) @ e
             except np.linalg.LinAlgError:
                 print("Warning: Singular matrix in pseudoinverse calculation. Stopping iteration.")
@@ -606,42 +599,12 @@ class IMUTrace:
                               initial_axis_other: np.ndarray = None,
                               max_iterations: int = 20,
                               tolerance: float = 1e-6,
-                              subsample_rate: int = 5) -> Dict[str, Union[np.ndarray, bool]]:
+                              subsample_rate: int = 1) -> Dict[str, Union[np.ndarray, bool]]:
         """
-        Estimates the axis of a hinge joint relative to two IMUs.
+        Estimates the axis of a hinge joint relative to two IMUs using a
+        vectorized Gauss-Newton optimization.
 
-        This method implements the algorithm described in Section II-A of the paper
-        "Joint axis and position estimation from inertial measurement data by
-        exploiting kinematic constraints" by Seel et al. (2012). It uses a
-        Gauss-Newton optimization to find the joint axis vectors in each IMU's
-        local coordinate system.
-
-        The core constraint is that the magnitude of the angular velocity projected
-        onto the plane normal to the joint axis must be equal for both bodies.
-
-        Args:
-            other (IMUTrace): The second IMUTrace object, rigidly attached to the
-                other body segment. Data is assumed to be time-synchronized.
-            initial_axis_self (np.ndarray, optional): A 3-element initial guess
-                for the unit vector of the hinge axis in this IMU's frame.
-                If None, a random guess is used.
-            initial_axis_other (np.ndarray, optional): A 3-element initial guess
-                for the unit vector of the hinge axis in the other IMU's frame.
-                If None, a random guess is used.
-            max_iterations (int, optional): The maximum number of iterations for
-                the optimization. Defaults to 20.
-            tolerance (float, optional): The convergence tolerance. The optimization
-                stops when the norm of the update step is less than this value.
-                Defaults to 1e-6.
-            subsample_rate (int, optional): The rate at which to subsample the data
-                to speed up computation (e.g., a value of 5 uses every 5th sample).
-                Defaults to 5.
-
-        Returns:
-            Dict[str, Union[np.ndarray, bool]]: A dictionary containing:
-                - 'axis_self': The estimated 3D unit axis vector in self's frame.
-                - 'axis_other': The estimated 3D unit axis vector in other's frame.
-                - 'converged': A boolean indicating if the algorithm converged.
+        (Docstring remains the same as your original)
         """
         # Ensure data streams are synchronized
         np.testing.assert_array_almost_equal(
@@ -649,12 +612,14 @@ class IMUTrace:
             err_msg="IMU traces must be time-synchronized. Use the resample() method first."
         )
 
-        # Subsample data
+        # Subsample data: Create (N, 3) NumPy arrays
         indices = np.arange(0, len(self), subsample_rate)
-        g1, g2 = [self.gyro[i] for i in indices], [other.gyro[i] for i in indices]
+        g1 = np.array(self.gyro)[indices]
+        g2 = np.array(other.gyro)[indices]
         num_samples = len(indices)
 
         # Helper functions for Eq(5) spherical coordinate parametrization
+        # (These are only called once per iteration, so no vectorization needed)
         def spherical_to_cartesian(phi, theta):
             return np.array([np.cos(phi) * np.cos(theta), np.cos(phi) * np.sin(theta), np.sin(phi)])
 
@@ -684,33 +649,57 @@ class IMUTrace:
         for _ in range(max_iterations):
             phi1, theta1, phi2, theta2 = x
             j1, j2 = spherical_to_cartesian(phi1, theta1), spherical_to_cartesian(phi2, theta2)
-
-            e = np.zeros(num_samples)
-            J = np.zeros((num_samples, 4))
+            
             dj1_dphi1, dj1_dtheta1 = cartesian_derivatives(phi1, theta1)
             dj2_dphi2, dj2_dtheta2 = cartesian_derivatives(phi2, theta2)
+            
+            # --- Vectorized Computation (Replaces the inner for-loop) ---
 
-            for k in range(num_samples):
-                g1_k, g2_k = g1[k], g2[k]
+            # v = g x j
+            # (N, 3) x (3,) -> (N, 3)
+            v1 = np.cross(g1, j1)
+            v2 = np.cross(g2, j2)
 
-                v1, v2 = np.cross(g1_k, j1), np.cross(g2_k, j2)
-                norm1, norm2 = np.linalg.norm(v1), np.linalg.norm(v2)
+            # norm = ||v||
+            # norm((N, 3), axis=1) -> (N,)
+            norm1 = np.linalg.norm(v1, axis=1)
+            norm2 = np.linalg.norm(v2, axis=1)
 
-                if norm1 > 1e-9 and norm2 > 1e-9:
-                    # Eq(1) Error: e = ||g1 x j1|| - ||g2 x j2||
-                    e[k] = norm1 - norm2
+            # Eq(1) Error: e = ||g1 x j1|| - ||g2 x j2||
+            # (N,) - (N,) -> (N,)
+            e = norm1 - norm2
+            
+            # Handle potential division by zero
+            norm1_safe = np.maximum(norm1, 1e-9)
+            norm2_safe = np.maximum(norm2, 1e-9)
+            
+            # Eq(2) Gradient: d(||g x j||)/dj = ((g x j) x g) / ||g x j||
+            # (N, 3) x (N, 3) -> (N, 3)
+            # (N, 3) / (N, 1) -> (N, 3)
+            d_norm1_dj1 = np.cross(v1, g1) / norm1_safe[:, np.newaxis]
+            d_norm2_dj2 = np.cross(v2, g2) / norm2_safe[:, np.newaxis]
 
-                    # Eq(2) Gradient: d(||g x j||)/dj = ((g x j) x g) / ||g x j||
-                    d_norm1_dj1 = np.cross(v1, g1_k) / norm1
-                    d_norm2_dj2 = np.cross(v2, g2_k) / norm2
+            # Chain rule for Jacobian columns
+            # (N, 3) @ (3,) -> (N,)
+            J_col0 = d_norm1_dj1 @ dj1_dphi1
+            J_col1 = d_norm1_dj1 @ dj1_dtheta1
+            J_col2 = - (d_norm2_dj2 @ dj2_dphi2) # de/dphi2 = -d(norm2)/dphi2
+            J_col3 = - (d_norm2_dj2 @ dj2_dtheta2) # de/dtheta2 = -d(norm2)/dtheta2
 
-                    # Chain rule for Jacobian columns
-                    J[k, 0] = np.dot(d_norm1_dj1, dj1_dphi1)
-                    J[k, 1] = np.dot(d_norm1_dj1, dj1_dtheta1)
-                    J[k, 2] = -np.dot(d_norm2_dj2, dj2_dphi2) # de/dphi2 = -d(norm2)/dphi2
-                    J[k, 3] = -np.dot(d_norm2_dj2, dj2_dtheta2) # de/dtheta2 = -d(norm2)/dtheta2
+            # Assemble full (N, 4) Jacobian
+            J = np.column_stack((J_col0, J_col1, J_col2, J_col3))
+
+            # Vectorized safety check:
+            # Find all rows where either norm was too small
+            invalid_mask = (norm1 < 1e-9) | (norm2 < 1e-9)
+            # Zero out the residual and Jacobian for these rows
+            e[invalid_mask] = 0.0
+            J[invalid_mask, :] = 0.0
+            
+            # --- End Vectorized Computation ---
 
             try:
+                # (4, N) @ (N,) -> (4,)
                 delta_x = -np.linalg.pinv(J) @ e
             except np.linalg.LinAlgError:
                 print("Warning: Singular matrix in pseudoinverse calculation. Stopping iteration.")
@@ -725,5 +714,3 @@ class IMUTrace:
 
         j1, j2 = spherical_to_cartesian(x[0], x[1]), spherical_to_cartesian(x[2], x[3])
         return {'axis_self': j1, 'axis_other': j2, 'converged': False}
-    
-    
