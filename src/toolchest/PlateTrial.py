@@ -2,8 +2,8 @@ import os
 import numpy as np
 import scipy.signal as signal
 from .IMUTrace import IMUTrace
-from .WorldTrace import WorldTrace
-from typing import Tuple, List, Dict
+from .WorldTrace import WorldTrace, _generate_smooth_motion_profile
+from typing import Tuple, List, Dict, Union
 import matplotlib.pyplot as plt
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
@@ -409,177 +409,358 @@ class PlateTrial:
             gyro=rotated_gyro,
             mag=rotated_mag
         )
-
-    def find_2dof_joint_axes_from_relative_orientation(self,
-                                                        other_plate: 'PlateTrial',
-                                                        verbose: bool = False 
-                                                        ) -> dict:
+    
+    @staticmethod
+    def generate_random_plate_trial(
+        duration: float = 10.0,
+        fs: float = 100.0,
+        add_noise: bool = True,
+        gyro_noise_std: float = 0.005,
+        acc_noise_std: float = 0.05
+    ) -> 'PlateTrial':
         """
-        Estimates the two axes of a 2-DoF joint from relative orientation.
+        Generates a single PlateTrial with random but smooth motion.
 
-        This method implements a "carrying angle" optimization. It assumes that
-        the relative motion between this plate (segment 1) and the `other_plate`
-        (segment 2) can be described by a 2-DoF joint (e.g., a knee).
-
-        The core principle is that there exist "ideal" coordinate frames for
-        segment 1 and segment 2, related to their original frames by static
-        rotations (R1 and R2), such that the relative motion between them,
-        when expressed as a Z-X'-Y" Euler sequence, has a *constant* X' angle
-        (the "carrying angle").
-
-        The function optimizes for the static rotations R1 and R2 that minimize
-        the variance of this carrying angle over the entire motion. From R1 and
-        R2, it computes the joint axes (j1 and j2) in the original segment frames.
+        This function performs the following steps:
+        1. Creates a smooth, random 3D position and orientation trajectory (WorldTrace).
+        2. Calculates the ideal IMU data (gyroscope, accelerometer) that corresponds
+        to this trajectory.
+        3. Adds synthetic Gaussian noise to the IMU data to simulate a real sensor.
+        4. Combines the world and IMU traces into a single PlateTrial object.
 
         Args:
-            other_plate (PlateTrial): The PlateTrial object for the *other*
-                body segment (segment 2).
-            verbose (bool, optional): If True, prints the `least_squares`
-                optimizer's termination report. Defaults to False.
+            duration (float, optional): The duration of the trial in seconds. Defaults to 10.0.
+            fs (float, optional): The sampling frequency in Hz. Defaults to 100.0.
+            add_noise (bool, optional): If True, adds noise to the synthetic IMU data.
+                Defaults to True.
+            gyro_noise_std (float, optional): Standard deviation of the gyroscope
+                noise in rad/s. Defaults to 0.005.
+            acc_noise_std (float, optional): Standard deviation of the accelerometer
+                noise in m/s^2. Defaults to 0.05.
 
         Returns:
-            dict: A dictionary containing:
-                - 'axis_in_frame1': (3,) ndarray. The estimated unit axis vector
-                  (j1) for the first rotation, in segment 1's original frame.
-                - 'axis_in_frame2': (3,) ndarray. The estimated unit axis vector
-                  (j2) for the second rotation, in segment 2's original frame.
-                - 'carrying_angle_rad': The estimated constant carrying angle in
-                  radians.
-                - 'success': bool. True if the optimizer converged.
-                - 'message': str. The convergence message from the optimizer.
+            PlateTrial: A new PlateTrial object with synthetic data.
         """
-        # --- 1. Input Validation ---
-        assert isinstance(other_plate, self.__class__), "other_plate must be a PlateTrial instance"
-        assert len(self) == len(other_plate), "PlateTrials must have the same length"
-        
-        # --- 2. Get Relative Rotations ---
-        # Get rotations from world frame to segment 1 (self) and segment 2 (other)
-        self_rotations = Rotation.from_matrix(self.world_trace.rotations)
-        other_rotations = Rotation.from_matrix(other_plate.world_trace.rotations)
+        # 1. Generate the ground-truth WorldTrace
+        world_trace = WorldTrace.generate_random_world_trace(duration, fs)
 
-        # R_rel = R_seg1_to_seg2 = R_world_to_seg1.inv() * R_world_to_seg2
-        R_rel = (self_rotations.inv() * other_rotations)
-        
-        # --- 3. Define Helper Functions for Carrying Angle ---
-        
-        def _get_carrying_angle_from_quat(q: np.ndarray) -> float:
-            """
-            Calculates the second Euler angle (beta) from a z-x'-y" sequence
-            for a *single* quaternion.
+        # 2. Calculate the corresponding "perfect" IMU trace
+        # Define a standard gravity vector
+        gravity = np.array([0, 0, -9.81])
+        magnetic_field = np.array([0.2, 0, 0.4])  # Example magnetic field vector
+        imu_trace = world_trace.calculate_imu_trace(acc_from_gravity=gravity, magnetic_field=magnetic_field)
+
+        # 3. (Optional) Add realistic noise to the IMU data
+        if add_noise:
+            imu_trace = imu_trace.add_noise(gyro_noise_std, acc_noise_std)
+
+        # 4. Create and return the final PlateTrial object
+        return PlateTrial(name="synthetic_random_trial", imu_trace=imu_trace, world_trace=world_trace)
+    
+    def find_biaxial_joint_axes(
+        self: 'PlateTrial',
+        other: 'PlateTrial',
+        initial_axis_parent: np.ndarray = None,
+        initial_axis_child: np.ndarray = None,
+        max_iterations: int = 20,
+        tolerance: float = 1e-6,
+        subsample_rate: int = 1
+    ) -> Dict[str, Union[np.ndarray, bool]]:
+        r"""
+        Estimates the two joint axes for a biaxial (2-DoF) joint, where each
+        axis is constant in its respective local segment frame.
+
+        This algorithm correctly models a biological joint where the axes are
+        fixed to the body segments. The core principle is that the relative
+        angular velocity, when expressed in the world frame, must lie in the
+        plane defined by the two joint axes, which are also expressed in the
+        world frame.
+
+        The unknowns being solved for are the constant representations of the
+        axes in their local frames:
+        - j1_parent: The first axis, constant in the 'self' (parent) frame.
+        - j2_child: The second axis, constant in the 'other' (child) frame.
+
+        The cost function at each timestep 't' is:
+        e(t) = (w_child_w(t) - w_parent_w(t)) . (j1_w(t) x j2_w(t))
+        where:
+        - j1_w(t) = R_parent(t) @ j1_parent
+        - j2_w(t) = R_child(t) @ j2_child
+
+        Args:
+            other (PlateTrial): The PlateTrial for the 'child' segment. 'self'
+                is treated as the 'parent' segment.
+            initial_axis_parent (np.ndarray, optional): A (3,) initial guess for
+                the first joint axis in the PARENT's local frame.
+            initial_axis_child (np.ndarray, optional): A (3,) initial guess for
+                the second joint axis in the CHILD's local frame.
+            max_iterations (int, optional): Max iterations for the optimization.
+            tolerance (float, optional): Convergence tolerance.
+            subsample_rate (int, optional): Rate to subsample data.
+
+        Returns:
+            Dict[str, Union[np.ndarray, bool]]: A dictionary containing:
+                - 'axis_parent_local': The optimized (3,) unit axis vector in the parent frame.
+                - 'axis_child_local': The optimized (3,) unit axis vector in the child frame.
+                - 'converged': A boolean flag indicating if convergence was reached.
+        """
+        # 1. --- Input Validation and Data Preparation ---
+        np.testing.assert_array_almost_equal(
+            self.imu_trace.timestamps, other.imu_trace.timestamps, decimal=5,
+            err_msg="PlateTrial traces must be time-synchronized."
+        )
+        indices = np.arange(0, len(self), subsample_rate)
+
+        # 2. --- Transform Gyro Data and Get Rotations ---
+        p_imu_trace = self.get_imu_trace_in_global_frame()
+        g_p_world = np.array(p_imu_trace.gyro)[indices]
+        R_wp = np.array(self.world_trace.rotations)[indices]
+
+        c_imu_trace = other.get_imu_trace_in_global_frame()
+        g_c_world = np.array(c_imu_trace.gyro)[indices]
+        R_wc = np.array(other.world_trace.rotations)[indices]
+
+        w_rel_world = g_c_world - g_p_world
+
+        # 3. --- Helper Functions for Parametrization ---
+        def spherical_to_cartesian(phi, theta):
+            return np.array([np.cos(phi)*np.cos(theta), np.cos(phi)*np.sin(theta), np.sin(phi)])
+
+        def cartesian_derivatives(phi, theta):
+            return (np.array([-np.sin(phi)*np.cos(theta), -np.sin(phi)*np.sin(theta), np.cos(phi)]),
+                    np.array([-np.cos(phi)*np.sin(theta), np.cos(phi)*np.cos(theta), 0]))
+
+        def cartesian_to_spherical(axis: np.ndarray):
+            phi = np.arcsin(np.clip(axis[2], -1.0, 1.0))
+            theta = np.arctan2(axis[1], axis[0])
+            return phi, theta
+
+        # 4. --- Initialization of State Vector ---
+        # State vector x = [phi1, theta1, phi2, theta2] for j1_parent and j2_child
+        if initial_axis_parent is None:
+            phi1, theta1 = np.random.uniform(-np.pi/2, np.pi/2), np.random.uniform(-np.pi, np.pi)
+        else:
+            phi1, theta1 = cartesian_to_spherical(initial_axis_parent/np.linalg.norm(initial_axis_parent))
+
+        if initial_axis_child is None:
+            phi2, theta2 = np.random.uniform(-np.pi/2, np.pi/2), np.random.uniform(-np.pi, np.pi)
+        else:
+            phi2, theta2 = cartesian_to_spherical(initial_axis_child/np.linalg.norm(initial_axis_child))
+
+        x = np.array([phi1, theta1, phi2, theta2])
+
+        # 5. --- Gauss-Newton Optimization Loop ---
+        for _ in range(max_iterations):
+            phi1, theta1, phi2, theta2 = x
+            j1_p = spherical_to_cartesian(phi1, theta1)
+            j2_c = spherical_to_cartesian(phi2, theta2)
+            dj1p_dphi1, dj1p_dtheta1 = cartesian_derivatives(phi1, theta1)
+            dj2c_dphi2, dj2c_dtheta2 = cartesian_derivatives(phi2, theta2)
+
+            # Transform local axes to world frame FOR EACH TIMESTEP
+            j1_w_t = np.einsum('nij,j->ni', R_wp, j1_p)
+            j2_w_t = np.einsum('nij,j->ni', R_wc, j2_c)
+
+            jn_w_t = np.cross(j1_w_t, j2_w_t)
+            norm_jn_t = np.linalg.norm(jn_w_t, axis=1, keepdims=True)
+
+            # Avoid division by zero
+            if np.any(norm_jn_t < 1e-9):
+                print("Warning: Joint axes became parallel during iteration. Stopping.")
+                break
             
-            q = [w, x, y, z]
-            beta = arcsin(2 * (w*x + y*z))
-            """
-            qw, qx, qy, qz = q
-            # Clip to avoid floating point errors with arcsin
-            val = np.clip(2 * (qw * qx + qy * qz), -1.0, 1.0)
-            return np.arcsin(val)
+            jn_w_norm_t = jn_w_t / norm_jn_t
+            e = np.einsum('ni,ni->n', w_rel_world, jn_w_norm_t) # Dot product for each row
 
-        def _get_carrying_angles_vec(q: np.ndarray) -> np.ndarray:
-            """
-            Vectorized version of _get_carrying_angle_from_quat for an
-            (N, 4) array of quaternions.
+            # Jacobian 'J' (N, 4) using the chain rule
+            dj1w_dphi1 = np.einsum('nij,j->ni', R_wp, dj1p_dphi1)
+            dj1w_dtheta1 = np.einsum('nij,j->ni', R_wp, dj1p_dtheta1)
+            dj2w_dphi2 = np.einsum('nij,j->ni', R_wc, dj2c_dphi2)
+            dj2w_dtheta2 = np.einsum('nij,j->ni', R_wc, dj2c_dtheta2)
+
+            # Derivatives of the plane normal (jn_w)
+            djn_dphi1 = np.cross(dj1w_dphi1, j2_w_t)
+            djn_dtheta1 = np.cross(dj1w_dtheta1, j2_w_t)
+            djn_dphi2 = np.cross(j1_w_t, dj2w_dphi2)
+            djn_dtheta2 = np.cross(j1_w_t, dj2w_dtheta2)
             
-            q = [w, x, y, z]
-            beta = arcsin(2 * (w*x + y*z))
-            """
-            qw = q[:, 0]
-            qx = q[:, 1]
-            qy = q[:, 2]
-            qz = q[:, 3]
-            val = np.clip(2 * (qw * qx + qy * qz), -1.0, 1.0)
-            return np.arcsin(val)
+            # Final Jacobian columns
+            J0 = np.einsum('ni,ni->n', w_rel_world, djn_dphi1 / norm_jn_t)
+            J1 = np.einsum('ni,ni->n', w_rel_world, djn_dtheta1 / norm_jn_t)
+            J2 = np.einsum('ni,ni->n', w_rel_world, djn_dphi2 / norm_jn_t)
+            J3 = np.einsum('ni,ni->n', w_rel_world, djn_dtheta2 / norm_jn_t)
 
-        # --- 4. Define The Cost (Residuals) Function for Optimization ---
-        
-        def _residuals(params: np.ndarray) -> np.ndarray:
-            """
-            The cost function to be minimized by `least_squares`.
+            J = np.column_stack((J0, J1, J2, J3))
             
-            It calculates the deviation of the carrying angle from its mean
-            for the entire motion. Minimizing this minimizes the variance.
+            try:
+                delta_x = -np.linalg.pinv(J) @ e
+            except np.linalg.LinAlgError:
+                print("Warning: Singular matrix in pseudoinverse. Stopping.")
+                break
 
-            Args:
-                params (np.ndarray): A (6,) array [rx1, ry1, rz1, rx2, ry2, rz2]
-                    containing the rotation vectors for R1 and R2.
-            """
-            # Unpack the static alignment rotations R1 and R2
-            rot_vec1 = params[0:3]
-            rot_vec2 = params[3:6]
-            R1 = Rotation.from_rotvec(rot_vec1)
-            R2 = Rotation.from_rotvec(rot_vec2)
+            x += delta_x
+            if np.linalg.norm(delta_x) < tolerance:
+                j1_res = spherical_to_cartesian(x[0], x[1])
+                j2_res = spherical_to_cartesian(x[2], x[3])
+                return {'axis_parent_local': j1_res, 'axis_child_local': j2_res, 'converged': True}
 
-            # Apply alignment rotations to get the "calibrated" relative rotation
-            # R_calibrated = R1 * R_relative * R2_inverse
-            R_calibrated = R1 * R_rel * R2.inv()
+        # 6. --- Return final (non-converged) estimate ---
+        j1_res = spherical_to_cartesian(x[0], x[1])
+        j2_res = spherical_to_cartesian(x[2], x[3])
+        return {'axis_parent_local': j1_res, 'axis_child_local': j2_res, 'converged': False}
 
-            # Convert to quaternions for Euler angle extraction
-            # .as_quat() returns [x, y, z, w]
-            q_cal_w_last = R_calibrated.as_quat() 
-            # Helper function expects [w, x, y, z]
-            q_cal_w_first = q_cal_w_last[:, [3, 0, 1, 2]] 
+    def generate_1dof_plate(
+        self,
+        joint_center_parent: np.ndarray,
+        joint_center_child: np.ndarray,
+        parent_to_joint_rotation: Rotation = None,
+        child_to_joint_rotation: Rotation = None,
+        add_noise: bool = True,
+        gyro_noise_std: float = 0.005,
+        acc_noise_std: float = 0.05
+    ) -> 'PlateTrial':
+        """
+        Generates a child PlateTrial connected by a 1-DOF hinge joint.
+        The kinematic chain is:
+        R_child = R_parent @ R_p2j @ R_joint_motion(z) @ R_c2j.inv()
+        """
+        if parent_to_joint_rotation is None: parent_to_joint_rotation = Rotation.random()
+        if child_to_joint_rotation is None: child_to_joint_rotation = Rotation.random()
 
-            # Calculate the carrying angle for every timestep
-            carrying_angles = _get_carrying_angles_vec(q_cal_w_first)
-            
-            # The error is the deviation of each angle from the mean angle.
-            # Minimizing the sum of squares of this residual minimizes the variance.
-            return carrying_angles - np.mean(carrying_angles)
+        parent_world_trace = self.world_trace
+        num_samples = len(parent_world_trace)
+        duration = parent_world_trace.timestamps[-1] - parent_world_trace.timestamps[0]
 
-        # --- 5. Run the Optimization ---
-        
-        # Initial guess: No rotation needed (R1 and R2 are identity)
-        initial_params = np.zeros(6)
+        angle = _generate_smooth_motion_profile(num_samples, duration, max_amp=np.pi)
+        R_joint_motion = Rotation.from_euler('z', angle)
 
-        # Run the non-linear least squares optimization
-        result = least_squares(
-            _residuals, 
-            initial_params, 
-            method='trf', 
-            ftol=1e-6,
-            gtol=1e-6,
-            verbose=(2 if verbose else 0) # Use level 2 for full report
+        R_parent_matrices = np.stack(self.world_trace.rotations)
+        R_p2j_mat = parent_to_joint_rotation.as_matrix()
+        R_c2j_inv_mat = child_to_joint_rotation.as_matrix().T
+        R_rel_total_matrices = R_p2j_mat @ R_joint_motion.as_matrix() @ R_c2j_inv_mat
+        R_child_matrices = R_parent_matrices @ R_rel_total_matrices
+
+        P_parent = np.stack(self.world_trace.positions)
+        parent_offset_global = (R_parent_matrices @ joint_center_parent).squeeze()
+        child_offset_global = (R_child_matrices @ joint_center_child).squeeze()
+        P_child = P_parent + parent_offset_global - child_offset_global
+
+        child_world_trace = WorldTrace(
+            timestamps=parent_world_trace.timestamps,
+            positions=[row for row in P_child],
+            rotations=[mat for mat in R_child_matrices]
         )
 
-        # --- 6. Extract and Compute Final Results ---
-        
-        # Get the optimized rotation vectors and create Rotation objects
-        optimal_params = result.x
-        R1_opt = Rotation.from_rotvec(optimal_params[0:3])
-        R2_opt = Rotation.from_rotvec(optimal_params[3:6])
+        gravity = np.array([0, 0, -9.81])
+        child_imu_trace = child_world_trace.calculate_imu_trace(acc_from_gravity=gravity)
+        if add_noise:
+            child_imu_trace = child_imu_trace.add_noise(gyro_noise_std, acc_noise_std)
 
-        # The "ideal" axes in the calibrated frames are z and y
-        # j1 (1st rotation) is z-axis, j2 (3rd rotation) is y-axis
-        j1_ideal = np.random.normal(size=3)
-        j1_ideal /= np.linalg.norm(j1_ideal)
-        j2_ideal = np.random.normal(size=3)
-        j2_ideal /= np.linalg.norm(j2_ideal)
+        return PlateTrial(f"{self.name}_child_dof1", child_imu_trace, child_world_trace)
 
-        # Transform these ideal axes back to the original segment frames
-        # j_original_1 = R1.inv() * j_ideal_1
-        # j_original_2 = R2.inv() * j_ideal_2
-        axis_in_frame1 = R1_opt.apply(j1_ideal, inverse=True)
-        axis_in_frame2 = R2_opt.apply(j2_ideal, inverse=True)
-        
-        # Recalculate the final mean carrying angle
-        # We can find the mean by taking the carrying angle at the first
-        # timestep and subtracting its residual (which is C[0] - mean(C)).
-        # C[0] - (C[0] - mean(C)) = mean(C)
-        final_residuals = _residuals(optimal_params)
-        
-        # Get calibrated rotation at first timestep
-        R_cal_first = R1_opt * R_rel[0] * R2_opt.inv()
-        q_cal_first_w_last = R_cal_first.as_quat() # [x, y, z, w]
-        q_cal_first_w_first = q_cal_first_w_last[[3, 0, 1, 2]] # [w, x, y, z]
-        
-        # Use the scalar helper for this single calculation
-        first_carrying_angle = _get_carrying_angle_from_quat(q_cal_first_w_first)
-        final_mean_carrying_angle = first_carrying_angle - final_residuals[0]
 
-        return {
-            'axis_in_frame1': axis_in_frame1,
-            'axis_in_frame2': axis_in_frame2,
-            'carrying_angle_rad': final_mean_carrying_angle,
-            'success': result.success,
-            'message': result.message
-        }
+    def generate_2dof_plate(
+        self,
+        joint_center_parent: np.ndarray,
+        joint_center_child: np.ndarray,
+        parent_to_joint_rotation: Rotation = None,
+        child_to_joint_rotation: Rotation = None,
+        add_noise: bool = True,
+        gyro_noise_std: float = 0.005,
+        acc_noise_std: float = 0.05
+    ) -> 'PlateTrial':
+        """
+        Generates a child PlateTrial connected by a 2-DOF universal joint.
+        The kinematic chain is:
+        R_child = R_parent @ R_p2j @ R_c2j.inv()
+        """
+        if parent_to_joint_rotation is None: parent_to_joint_rotation = Rotation.random()
+        if child_to_joint_rotation is None: child_to_joint_rotation = Rotation.random()
+
+        parent_world_trace = self.world_trace
+        num_samples = len(parent_world_trace)
+        duration = parent_world_trace.timestamps[-1] - parent_world_trace.timestamps[0]
+
+        p_angles = _generate_smooth_motion_profile(num_samples, duration, max_amp=np.pi/2)
+        c_angles = _generate_smooth_motion_profile(num_samples, duration, max_amp=np.pi/2)
+
+        R_parent_matrices = np.stack(self.world_trace.rotations)
+        parent_axis = parent_to_joint_rotation.as_rotvec() / np.linalg.norm(parent_to_joint_rotation.as_rotvec()) if parent_to_joint_rotation.as_rotvec().any() != 0 else np.array([1.0, 0.0, 0.0])
+        normalized_axis_stacked = np.tile(parent_axis, (num_samples, 1))
+        scaled_rotation_vectors = normalized_axis_stacked * p_angles[:, np.newaxis]
+        R_p2j_mat = Rotation.from_rotvec(scaled_rotation_vectors).as_matrix()
+
+        child_axis = child_to_joint_rotation.as_rotvec() / np.linalg.norm(child_to_joint_rotation.as_rotvec()) if child_to_joint_rotation.as_rotvec().any() != 0 else np.array([1.0, 0.0, 0.0])
+        normalized_axis_stacked_c = np.tile(child_axis, (num_samples, 1))
+        scaled_rotation_vectors_c = normalized_axis_stacked_c * c_angles[:, np.newaxis]
+        R_c2j_inv_mat = Rotation.from_rotvec(scaled_rotation_vectors_c).inv().as_matrix()
+        R_rel_total_matrices = R_p2j_mat @ R_c2j_inv_mat
+        R_child_matrices = R_parent_matrices @ R_rel_total_matrices
+
+        P_parent = np.stack(self.world_trace.positions)
+        parent_offset_global = (R_parent_matrices @ joint_center_parent).squeeze()
+        child_offset_global = (R_child_matrices @ joint_center_child).squeeze()
+        P_child = P_parent + parent_offset_global - child_offset_global
+
+        child_world_trace = WorldTrace(
+            timestamps=parent_world_trace.timestamps,
+            positions=[row for row in P_child],
+            rotations=[mat for mat in R_child_matrices]
+        )
+
+        gravity = np.array([0, 0, -9.81])
+        child_imu_trace = child_world_trace.calculate_imu_trace(acc_from_gravity=gravity)
+        if add_noise:
+            child_imu_trace = child_imu_trace.add_noise(gyro_noise_std, acc_noise_std)
+
+        return PlateTrial(f"{self.name}_child_dof2", child_imu_trace, child_world_trace)
+
+
+    def generate_3dof_plate(
+        self,
+        joint_center_parent: np.ndarray,
+        joint_center_child: np.ndarray,
+        parent_to_joint_rotation: Rotation = None,
+        child_to_joint_rotation: Rotation = None,
+        add_noise: bool = True,
+        gyro_noise_std: float = 0.005,
+        acc_noise_std: float = 0.05
+    ) -> 'PlateTrial':
+        """
+        Generates a child PlateTrial connected by a 3-DOF spherical joint.
+        The kinematic chain is:
+        R_child = R_parent @ R_p2j @ R_joint_motion(zyx) @ R_c2j.inv()
+        """
+        if parent_to_joint_rotation is None: parent_to_joint_rotation = Rotation.random()
+        if child_to_joint_rotation is None: child_to_joint_rotation = Rotation.random()
+
+        parent_world_trace = self.world_trace
+        num_samples = len(parent_world_trace)
+        duration = parent_world_trace.timestamps[-1] - parent_world_trace.timestamps[0]
+
+        angles = [_generate_smooth_motion_profile(num_samples, duration, max_amp=np.pi/2) for _ in range(3)]
+        R_joint_motion = Rotation.from_euler('zyx', np.vstack(angles).T)
+
+        R_parent_matrices = np.stack(self.world_trace.rotations)
+        R_p2j_mat = parent_to_joint_rotation.as_matrix()
+        R_c2j_inv_mat = child_to_joint_rotation.as_matrix().T
+        R_rel_total_matrices = R_p2j_mat @ R_joint_motion.as_matrix() @ R_c2j_inv_mat
+        R_child_matrices = R_parent_matrices @ R_rel_total_matrices
+
+        P_parent = np.stack(self.world_trace.positions)
+        parent_offset_global = (R_parent_matrices @ joint_center_parent).squeeze()
+        child_offset_global = (R_child_matrices @ joint_center_child).squeeze()
+        P_child = P_parent + parent_offset_global - child_offset_global
+
+        child_world_trace = WorldTrace(
+            timestamps=parent_world_trace.timestamps,
+            positions=[row for row in P_child],
+            rotations=[mat for mat in R_child_matrices]
+        )
+
+        gravity = np.array([0, 0, -9.81])
+        child_imu_trace = child_world_trace.calculate_imu_trace(acc_from_gravity=gravity)
+        if add_noise:
+            child_imu_trace = child_imu_trace.add_noise(gyro_noise_std, acc_noise_std)
+
+        return PlateTrial(f"{self.name}_child_dof3", child_imu_trace, child_world_trace)

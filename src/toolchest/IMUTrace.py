@@ -196,7 +196,7 @@ class IMUTrace:
         )
 
     def _finite_difference_gyros(self, method='polyfit') -> List[np.ndarray]:
-        """
+        r"""
         Private method to compute the angular acceleration (derivative of gyro).
         
         This can be calculated a number of different ways.
@@ -237,7 +237,7 @@ class IMUTrace:
 
     def project_acc(self, local_offset: Union[np.ndarray, List[np.ndarray]],
                     finite_difference_gyro_method='polyfit') -> 'IMUTrace':
-        """
+        r"""
         Projects acceleration to a new point on the same rigid body.
 
         This method calculates the linear acceleration at a point defined by
@@ -283,6 +283,51 @@ class IMUTrace:
             
         return IMUTrace(self.timestamps, self.gyro.copy(), acc_projected, self.mag.copy())
 
+    def add_noise(self,
+                  gyro_noise_std: float = 0.0,
+                  acc_noise_std: float = 0.0,
+                  mag_noise_std: float = 0.0
+                  ) -> 'IMUTrace':
+        """
+        Adds synthetic Gaussian noise to the sensor data.
+
+        This method generates random noise from a normal distribution (mean=0)
+        with the specified standard deviation for each sensor type and adds it
+        to the trace data. It returns a new IMUTrace object, leaving the
+        original unchanged.
+
+        Args:
+            gyro_noise_std (float, optional): Standard deviation of the
+                gyroscope noise (e.g., in rad/s). Defaults to 0.0.
+            acc_noise_std (float, optional): Standard deviation of the
+                accelerometer noise (e.g., in m/s^2). Defaults to 0.0.
+            mag_noise_std (float, optional): Standard deviation of the
+                magnetometer noise (in arbitrary units). Defaults to 0.0.
+
+        Returns:
+            IMUTrace: A new IMUTrace object with the added noise.
+        """
+        # Create a deep copy to avoid modifying the original trace
+        noisy_trace = self.copy()
+        num_samples = len(self)
+
+        # Add gyroscope noise if a non-zero standard deviation is provided
+        if gyro_noise_std > 0:
+            gyro_noise = np.random.normal(0, gyro_noise_std, size=(num_samples, 3))
+            noisy_trace.gyro = [g + n for g, n in zip(noisy_trace.gyro, gyro_noise)]
+
+        # Add accelerometer noise
+        if acc_noise_std > 0:
+            acc_noise = np.random.normal(0, acc_noise_std, size=(num_samples, 3))
+            noisy_trace.acc = [a + n for a, n in zip(noisy_trace.acc, acc_noise)]
+
+        # Add magnetometer noise
+        if mag_noise_std > 0:
+            mag_noise = np.random.normal(0, mag_noise_std, size=(num_samples, 3))
+            noisy_trace.mag = [m + n for m, n in zip(noisy_trace.mag, mag_noise)]
+
+        return noisy_trace
+    
     def get_sample_frequency(self) -> float:
         """
         Calculates and returns the average sample frequency of the trace.

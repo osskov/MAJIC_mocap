@@ -10,6 +10,33 @@ from typing import Dict
 import xml.etree.ElementTree as ET
 import pandas as pd
 
+def _generate_smooth_motion_profile(
+        num_samples: int,
+        duration: float,
+        num_waves: int = 4,
+        max_amp: float = 1.0
+    ) -> np.ndarray:
+        """
+        Generates a smooth, complex 1D motion profile using a sum of sine waves.
+
+        Args:
+            num_samples (int): The number of data points to generate.
+            duration (float): The total time duration in seconds.
+            num_waves (int): The number of sine waves to sum for complexity.
+            max_amp (float): The maximum amplitude of the resulting motion.
+
+        Returns:
+            np.ndarray: A 1D array representing the motion profile.
+        """
+        t = np.linspace(0, duration, num_samples, endpoint=False)
+        motion = np.zeros(num_samples)
+        for i in range(1, num_waves + 1):
+            amplitude = np.random.uniform(0.1, 1.0) * max_amp / num_waves
+            frequency = np.random.uniform(0.1, 2.0) * i
+            phase = np.random.uniform(0, 2 * np.pi)
+            motion += amplitude * np.sin(2 * np.pi * frequency * t + phase)
+        return motion
+
 class WorldTrace:
     """
     This class contains a trace of a world frame over time. Optionally, this can attach an IMUTrace and manipulate it.
@@ -365,6 +392,40 @@ class WorldTrace:
         R_list = [np.array([x, y, z]).T for x, y, z in zip(x_axis, y_axis, z_axis)]
         return WorldTrace(timestamps, loc_list, R_list)
 
+        
+    @staticmethod
+    def generate_random_world_trace(duration: float = 10.0, fs: float = 100.0) -> 'WorldTrace':
+        """
+        Generates a WorldTrace with random but smooth position and orientation.
+
+        Args:
+            duration (float): The duration of the trial in seconds.
+            fs (float): The sampling frequency in Hz.
+
+        Returns:
+            WorldTrace: The generated world trace.
+        """
+        num_samples = int(duration * fs)
+        timestamps = np.linspace(0, duration, num_samples, endpoint=False)
+
+        # --- Generate smooth random position ---
+        pos_x = _generate_smooth_motion_profile(num_samples, duration, max_amp=0.5)
+        pos_y = _generate_smooth_motion_profile(num_samples, duration, max_amp=0.3)
+        pos_z = _generate_smooth_motion_profile(num_samples, duration, max_amp=0.5)
+        positions = [np.array(p) for p in zip(pos_x, pos_y, pos_z)]
+
+        # --- Generate smooth random orientation ---
+        # Create motion profiles for Euler angles
+        rot_z = _generate_smooth_motion_profile(num_samples, duration, max_amp=np.pi)
+        rot_y = _generate_smooth_motion_profile(num_samples, duration, max_amp=np.pi / 2)
+        rot_x = _generate_smooth_motion_profile(num_samples, duration, max_amp=np.pi / 2)
+
+        # Convert Euler angles to a stack of rotation matrices
+        rotations_obj = Rotation.from_euler('zyx', np.vstack([rot_z, rot_y, rot_x]).T)
+        rotations = [r.as_matrix() for r in rotations_obj]
+
+        return WorldTrace(timestamps, positions, rotations)
+    
     def get_sample_frequency(self):
         """
         This function returns the sample frequency of the WorldTrace.
@@ -420,19 +481,19 @@ class WorldTrace:
         error = R_w_parent @ parent_offset - R_w_child @ child_offset + r_c_p
         error = error.reshape(-1, 3)
         return parent_offset, child_offset, error
-
+    
     def get_primary_joint_axis(self, other_world_trace: 'WorldTrace') -> Tuple[np.ndarray, np.ndarray]:
         """
-        Calculates the primary axis of rotation between two world traces, expressed
-        in both the parent's ('self') and child's ('other') coordinate frames.
+        Calculates the primary axis of a hinge joint between two world traces using
+        the Mean Axis method, expressed in both the parent's ('self') and
+        child's ('other') coordinate frames.
 
-        This method solves for the axis that is most invariant under the relative
-        rotations between the two bodies. It is based on the principle that for a
-        pure rotation around an axis `v`, the relationship `R*v = v` holds true.
-        The problem is formulated to find the `v` that minimizes `sum(||(R_rel - I)v||^2)`
-        over the time series, which is solved via an eigendecomposition of `A.T @ A`.
-
-        The primary axis corresponds to the eigenvector with the smallest eigenvalue.
+        This method works by finding the axis of rotation for the relative
+        orientation at each time step and then determining the mean direction of
+        that axis over the entire trial. This is robust to joints where the
+        instantaneous axis of rotation may wobble. The mean direction is found
+        by computing the principal eigenvector of the covariance matrix of the
+        instantaneous axes.
 
         Args:
             other_world_trace (WorldTrace): The 'child' segment's world trace.
@@ -448,53 +509,58 @@ class WorldTrace:
         assert isinstance(other_world_trace, WorldTrace), "Must pass a WorldTrace instance."
         assert len(self) == len(other_world_trace), "WorldTraces must have the same length."
 
-        # Helper function to perform the core calculation
-        def _find_primary_axis(relative_rotations: Rotation) -> np.ndarray:
+        def _find_mean_axis(relative_rotations: Rotation) -> np.ndarray:
             """
-            Finds the eigenvector corresponding to the smallest eigenvalue of ATA,
-            where A = (R_relative - I).
+            Finds the mean axis of rotation from a time series of rotations using
+            Principal Component Analysis on the instantaneous axes.
             """
-            # Get the (n, 3, 3) stack of relative rotation matrices
-            all_rel_matrices = relative_rotations.as_matrix()
+            # Get the rotation vectors (axis * angle) for each time step
+            rot_vecs = relative_rotations.as_rotvec()  # shape (N, 3)
             
-            # Use broadcasting to subtract Identity from each matrix in the stack
-            A_stack = all_rel_matrices - np.identity(3)
+            # Normalize each rotation vector to get the instantaneous axis of rotation
+            # Handle cases where the angle is zero to avoid division by zero
+            norms = np.linalg.norm(rot_vecs, axis=1)
+            non_zero_mask = norms > 1e-8
             
-            # Reshape from (n, 3, 3) to (n*3, 3)
-            A = A_stack.reshape(-1, 3)
-            
-            # Compute the (3, 3) matrix ATA
-            ATA = A.T @ A
-            
-            # Find its eigenvalues and eigenvectors
-            eigenvalues, eigenvectors = np.linalg.eig(ATA)
+            # If there's no significant rotation anywhere, we can't determine an axis.
+            if not np.any(non_zero_mask):
+                # Return a default axis, as no motion was detected.
+                return np.array([0., 0., 1.])
 
-            # The joint axis is the eigenvector with the smallest eigenvalue
-            smallest_eigenvalue_index = np.argmin(eigenvalues)
-            primary_axis = eigenvectors[:, smallest_eigenvalue_index]
+            axes = np.zeros_like(rot_vecs)
+            # Normalize only the non-zero rotation vectors
+            axes[non_zero_mask] = rot_vecs[non_zero_mask] / norms[non_zero_mask, np.newaxis]
             
-            # The eigenvector is already a unit vector
-            return primary_axis
+            # To handle the axis ambiguity (v is the same as -v), we ensure all
+            # axes point in the same general direction as the first axis.
+            first_axis = axes[np.argmax(non_zero_mask)]
+            for i in range(len(axes)):
+                if np.dot(axes[i], first_axis) < 0:
+                    axes[i] *= -1
+            
+            # The mean axis is the principal component of the distribution of axes,
+            # which is the eigenvector of the covariance matrix corresponding to the
+            # largest eigenvalue.
+            covariance_matrix = np.cov(axes[non_zero_mask].T)
+            eigenvalues, eigenvectors = np.linalg.eig(covariance_matrix)
+            
+            # The mean axis is the eigenvector with the largest eigenvalue
+            mean_axis = eigenvectors[:, np.argmax(eigenvalues)].real
+            return mean_axis / np.linalg.norm(mean_axis)
 
         # --- Step 1: Get Relative Rotations from both perspectives ---
-        
-        # Stack the lists of (3, 3) matrices into (n, 3, 3) arrays
-        R_wp_matrices = np.stack(self.rotations)
-        R_wc_matrices = np.stack(other_world_trace.rotations)
-
-        # Create stacked Rotation objects from the (n, 3, 3) arrays
-        R_wp_stack = Rotation.from_matrix(R_wp_matrices)
-        R_wc_stack = Rotation.from_matrix(R_wc_matrices)
+        R_wp_stack = Rotation.from_matrix(np.stack(self.rotations))
+        R_wc_stack = Rotation.from_matrix(np.stack(other_world_trace.rotations))
 
         # --- Step 2: Calculate axis in the 'self' (parent) frame ---
         # Use R_pc = R_parent.inv() * R_child
         R_pc_stack = R_wp_stack.inv() * R_wc_stack
-        axis_in_self = _find_primary_axis(R_pc_stack)
+        axis_in_self = _find_mean_axis(R_pc_stack)
 
         # --- Step 3: Calculate axis in the 'other' (child) frame ---
         # Use R_cp = R_child.inv() * R_parent
         R_cp_stack = R_wc_stack.inv() * R_wp_stack
-        axis_in_other = _find_primary_axis(R_cp_stack)
+        axis_in_other = _find_mean_axis(R_cp_stack)
 
         return axis_in_self, axis_in_other
     
@@ -666,54 +732,3 @@ class WorldTrace:
             except FileNotFoundError:
                 print(f"File {file_path} not found. Skipping sensor {sensor_name}.")
         return world_traces
-
-
-    def find_best_fit_rotation(self, other_trace: 'WorldTrace') -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Given another WorldTrace, compute the best fit rotation matrix R
-        that aligns this trace to the other trace.
-
-        It solves the Orthogonal Procrustes problem:
-        R = argmin_R sum_i || R @ A_i - B_i ||_F^2
-        
-        The solution is found via SVD of the matrix M = sum(B_i @ A_i.T).
-        """
-        assert len(self) == len(other_trace), "WorldTraces must have the same length to compute best fit rotation." 
-
-        # 1. Get pre-alignment error
-        error_before = self.get_rotation_errors_deg(other_trace)
-
-        # 2. Stack matrices
-        A = np.stack(self.rotations)  # shape (N, 3, 3)
-        B = np.stack(other_trace.rotations)  # shape (N, 3, 3)
-
-        # 3. Compute the matrix M = sum(B_i @ A_i.T)
-        # A.transpose(0, 2, 1) creates all A_i.T
-        # B @ ... performs N matrix multiplications
-        # np.sum(..., axis=0) sums the N resulting matrices
-        M = np.sum(B @ A.transpose(0, 2, 1), axis=0)
-
-        # 4. SVD
-        U, S, Vt = np.linalg.svd(M)
-
-        # 5. Calculate the optimal rotation R = V @ U.T
-        # Note: Vt is V.T, so V = Vt.T
-        R = Vt.T @ U.T
-
-        # 6. Ensure right-handedness (det(R) = +1)
-        if np.linalg.det(R) < 0:
-            # We are in the reflection case.
-            # Flip the sign of the 3rd column of V (or U)
-            # R = V @ diag(1, 1, -1) @ U.T
-            Vt_corr = Vt.copy()
-            Vt_corr[-1, :] *= -1
-            R = Vt_corr.T @ U.T
-            
-            # Double-check determinant, though it should be +1 now
-            # assert np.isclose(np.linalg.det(R), 1.0)
-
-        # 7. Get post-alignment error
-        # Apply R to self and check error against other_trace
-        error_after = self.get_rotation_errors_deg(other_trace.transform(rotate=R))
-
-        return R, error_before, error_after
