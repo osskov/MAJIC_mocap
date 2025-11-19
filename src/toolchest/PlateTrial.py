@@ -462,9 +462,10 @@ class PlateTrial:
         other: 'PlateTrial',
         initial_axis_parent: np.ndarray = None,
         initial_axis_child: np.ndarray = None,
-        max_iterations: int = 20,
+        max_iterations: int = 40,
         tolerance: float = 1e-6,
-        subsample_rate: int = 1
+        subsample_rate: int = 1,
+        verbose: bool = False # ⬅️ ADDED VERBOSE FLAG
     ) -> Dict[str, Union[np.ndarray, bool]]:
         r"""
         Estimates the two joint axes for a biaxial (2-DoF) joint, where each
@@ -497,6 +498,8 @@ class PlateTrial:
             max_iterations (int, optional): Max iterations for the optimization.
             tolerance (float, optional): Convergence tolerance.
             subsample_rate (int, optional): Rate to subsample data.
+            verbose (bool, optional): If True, prints status updates during the
+                                    optimization loop. ⬅️ ADDED DOC FOR VERBOSE
 
         Returns:
             Dict[str, Union[np.ndarray, bool]]: A dictionary containing:
@@ -509,9 +512,13 @@ class PlateTrial:
             self.imu_trace.timestamps, other.imu_trace.timestamps, decimal=5,
             err_msg="PlateTrial traces must be time-synchronized."
         )
-        indices = np.arange(0, len(self), subsample_rate)
+        indices = np.arange(0, len(self.imu_trace.timestamps), subsample_rate) # Use imu_trace length here
 
         # 2. --- Transform Gyro Data and Get Rotations ---
+        if verbose:
+            print("--- Joint Axis Estimation (Biaxial) ---")
+            print(f"Subsampling data to {len(indices)} points from {len(self.imu_trace.timestamps)} total.")
+            
         p_imu_trace = self.get_imu_trace_in_global_frame()
         g_p_world = np.array(p_imu_trace.gyro)[indices]
         R_wp = np.array(self.world_trace.rotations)[indices]
@@ -548,9 +555,12 @@ class PlateTrial:
             phi2, theta2 = cartesian_to_spherical(initial_axis_child/np.linalg.norm(initial_axis_child))
 
         x = np.array([phi1, theta1, phi2, theta2])
+        
+        if verbose:
+            print(f"Initial State Vector x: {x}")
 
         # 5. --- Gauss-Newton Optimization Loop ---
-        for _ in range(max_iterations):
+        for i in range(max_iterations): # Used 'i' for iteration number
             phi1, theta1, phi2, theta2 = x
             j1_p = spherical_to_cartesian(phi1, theta1)
             j2_c = spherical_to_cartesian(phi2, theta2)
@@ -566,13 +576,20 @@ class PlateTrial:
 
             # Avoid division by zero
             if np.any(norm_jn_t < 1e-9):
-                print("Warning: Joint axes became parallel during iteration. Stopping.")
+                if verbose:
+                    print(f"Iteration {i+1}: 🛑 Warning: Joint axes became parallel (angle ~0 or ~180). Stopping.")
                 break
             
             jn_w_norm_t = jn_w_t / norm_jn_t
-            e = np.einsum('ni,ni->n', w_rel_world, jn_w_norm_t) # Dot product for each row
+            e = np.einsum('ni,ni->n', w_rel_world, jn_w_norm_t) # Residual (Error vector)
 
-            # Jacobian 'J' (N, 4) using the chain rule
+            # Calculate Residual Norm for monitoring
+            residual_norm = np.linalg.norm(e)
+            if verbose:
+                print(f"Iteration {i+1}/{max_iterations}: Residual Norm (Cost): {residual_norm:.6e}", end="")
+
+
+            # Jacobian 'J' (N, 4) using the chain rule (Calculations remain the same)
             dj1w_dphi1 = np.einsum('nij,j->ni', R_wp, dj1p_dphi1)
             dj1w_dtheta1 = np.einsum('nij,j->ni', R_wp, dj1p_dtheta1)
             dj2w_dphi2 = np.einsum('nij,j->ni', R_wc, dj2c_dphi2)
@@ -593,22 +610,43 @@ class PlateTrial:
             J = np.column_stack((J0, J1, J2, J3))
             
             try:
+                # Solve for update vector
                 delta_x = -np.linalg.pinv(J) @ e
             except np.linalg.LinAlgError:
-                print("Warning: Singular matrix in pseudoinverse. Stopping.")
+                if verbose:
+                    print(f"Iteration {i+1}: 🛑 Warning: Singular matrix in pseudoinverse. Stopping.")
                 break
 
+            x_prev = x.copy()
             x += delta_x
-            if np.linalg.norm(delta_x) < tolerance:
+            update_norm = np.linalg.norm(delta_x)
+
+            if verbose:
+                print(f" | Update Norm: {update_norm:.6e}")
+                if i+1 == max_iterations:
+                    print("--- Optimization finished: Max iterations reached ---")
+
+            # Check for convergence
+            if update_norm < tolerance:
                 j1_res = spherical_to_cartesian(x[0], x[1])
                 j2_res = spherical_to_cartesian(x[2], x[3])
+                if verbose:
+                    print(f"\n✅ CONVERGENCE REACHED in {i+1} iterations.")
+                    print(f"Final Axis Parent (Local): {j1_res}")
+                    print(f"Final Axis Child (Local): {j2_res}")
                 return {'axis_parent_local': j1_res, 'axis_child_local': j2_res, 'converged': True}
 
         # 6. --- Return final (non-converged) estimate ---
         j1_res = spherical_to_cartesian(x[0], x[1])
         j2_res = spherical_to_cartesian(x[2], x[3])
-        return {'axis_parent_local': j1_res, 'axis_child_local': j2_res, 'converged': False}
+        
+        if verbose and update_norm >= tolerance:
+            print("\n❌ CONVERGENCE FAILED: Tolerance not met.")
+            print(f"Final Axis Parent (Local): {j1_res}")
+            print(f"Final Axis Child (Local): {j2_res}")
 
+        return {'axis_parent_local': j1_res, 'axis_child_local': j2_res, 'converged': False}
+        
     def generate_1dof_plate(
         self,
         joint_center_parent: np.ndarray,
@@ -661,60 +699,156 @@ class PlateTrial:
 
     def generate_2dof_plate(
         self,
-        joint_center_parent: np.ndarray,
-        joint_center_child: np.ndarray,
-        parent_to_joint_rotation: Rotation = None,
-        child_to_joint_rotation: Rotation = None,
+        j1_parent: np.ndarray,
+        j2_child: np.ndarray,
+        carrying_angle: float,
+        parent_offset: np.ndarray,
+        child_offset: np.ndarray,
         add_noise: bool = True,
         gyro_noise_std: float = 0.005,
         acc_noise_std: float = 0.05
     ) -> 'PlateTrial':
         """
-        Generates a child PlateTrial connected by a 2-DOF universal joint.
-        The kinematic chain is:
-        R_child = R_parent @ R_p2j @ R_c2j.inv()
-        """
-        if parent_to_joint_rotation is None: parent_to_joint_rotation = Rotation.random()
-        if child_to_joint_rotation is None: child_to_joint_rotation = Rotation.random()
+        Generates a child PlateTrial connected by a 2-DOF joint
+        with a fixed carrying angle.
 
+        The kinematic model is:
+        R_wc = R_wp @ R_pj1 @ R_j1j2 @ R_j2c
+
+        Where:
+        - R_wp: Parent's world rotation.
+        - R_pj1: Rotation aligning the parent-frame axis (j1_parent) to [0,0,1] (Z-axis).
+        - R_j1j2: The ZYX joint rotation [z_angle, carrying_angle, x_angle].
+        - R_j2c: Rotation aligning the child-frame axis (j2_child) to [1,0,0] (X-axis).
+        """
         parent_world_trace = self.world_trace
         num_samples = len(parent_world_trace)
         duration = parent_world_trace.timestamps[-1] - parent_world_trace.timestamps[0]
+        timestamps = parent_world_trace.timestamps
 
-        p_angles = _generate_smooth_motion_profile(num_samples, duration, max_amp=np.pi/2)
-        c_angles = _generate_smooth_motion_profile(num_samples, duration, max_amp=np.pi/2)
+        # === 1. Calculate Constant Alignment Rotations ===
+        
+        # Normalize input axes
+        j1_p_norm = j1_parent / np.linalg.norm(j1_parent)
+        j2_c_norm = j2_child / np.linalg.norm(j2_child)
 
-        R_parent_matrices = np.stack(self.world_trace.rotations)
-        parent_axis = parent_to_joint_rotation.as_rotvec() / np.linalg.norm(parent_to_joint_rotation.as_rotvec()) if parent_to_joint_rotation.as_rotvec().any() != 0 else np.array([1.0, 0.0, 0.0])
-        normalized_axis_stacked = np.tile(parent_axis, (num_samples, 1))
-        scaled_rotation_vectors = normalized_axis_stacked * p_angles[:, np.newaxis]
-        R_p2j_mat = Rotation.from_rotvec(scaled_rotation_vectors).as_matrix()
+        z_axis = np.array([0., 0., 1.])
+        x_axis = np.array([1., 0., 0.])
 
-        child_axis = child_to_joint_rotation.as_rotvec() / np.linalg.norm(child_to_joint_rotation.as_rotvec()) if child_to_joint_rotation.as_rotvec().any() != 0 else np.array([1.0, 0.0, 0.0])
-        normalized_axis_stacked_c = np.tile(child_axis, (num_samples, 1))
-        scaled_rotation_vectors_c = normalized_axis_stacked_c * c_angles[:, np.newaxis]
-        R_c2j_inv_mat = Rotation.from_rotvec(scaled_rotation_vectors_c).inv().as_matrix()
-        R_rel_total_matrices = R_p2j_mat @ R_c2j_inv_mat
-        R_child_matrices = R_parent_matrices @ R_rel_total_matrices
+        # R_pj1: "aligns [0,0,1] to j1_parent"
+        # This finds R such that R @ z_axis = j1_p_norm
+        # align_vectors(target, source)
+        R_pj1_rot = Rotation.align_vectors(j1_p_norm[np.newaxis, :], z_axis[np.newaxis, :])[0]
+        R_pj1_mat = R_pj1_rot.as_matrix()
 
+        # R_j2c: "aligns j2_child to [1,0,0]"
+        # This finds R such that R @ j2_c_norm = x_axis
+        R_j2c_rot = Rotation.align_vectors(x_axis[np.newaxis, :], j2_c_norm[np.newaxis, :])[0]
+        R_j2c_mat = R_j2c_rot.as_matrix()
+
+        # === 2. Generate Joint Motion Profile (R_j1j2) ===
+        
+        # Generate simple motion for the Z and X axes
+        z_angles = _generate_smooth_motion_profile(num_samples=num_samples,duration=duration, max_amp=np.pi/2) # Flexion/Extension
+        x_angles = _generate_smooth_motion_profile(num_samples=num_samples,duration=duration, max_amp=np.pi/6) # Abduction/Adduction
+        
+        # Convert to a (N, 3, 3) stack of rotation matrices
+        R_j1 = Rotation.from_euler('z', z_angles)
+        R_carrying = Rotation.from_euler('y', carrying_angle * np.ones(num_samples))
+        R_j2 = Rotation.from_euler('x', x_angles)
+
+        R_j1j2_mat = (R_j1 * R_carrying * R_j2).as_matrix()
+
+        # === 3. Calculate Child World Rotations ===
+        R_wp = np.stack(self.world_trace.rotations)
+        
+        # R_child = R_wp @ R_pj1 @ R_j1j2 @ R_j2c
+        # (N,3,3) = (N,3,3) @ (3,3) @ (N,3,3) @ (3,3)
+        R_wc = R_wp @ R_pj1_mat @ R_j1j2_mat @ R_j2c_mat
+
+        # === 4. Calculate Child World Positions ===
         P_parent = np.stack(self.world_trace.positions)
-        parent_offset_global = (R_parent_matrices @ joint_center_parent).squeeze()
-        child_offset_global = (R_child_matrices @ joint_center_child).squeeze()
+
+        # Apply parent rotation to parent offset vector (for all N samples)
+        # 'nij,j->ni' means: (N, 3, 3) @ (3,) -> (N, 3)
+        parent_offset_global = np.einsum('nij,j->ni', R_wp, parent_offset)
+        
+        # Apply child rotation to child offset vector (for all N samples)
+        child_offset_global = np.einsum('nij,j->ni', R_wc, child_offset)
+
+        # Child position = Parent pos + Parent offset - Child offset
         P_child = P_parent + parent_offset_global - child_offset_global
 
+        # === 5. Create Traces and Return PlateTrial ===
         child_world_trace = WorldTrace(
             timestamps=parent_world_trace.timestamps,
             positions=[row for row in P_child],
-            rotations=[mat for mat in R_child_matrices]
+            rotations=[mat for mat in R_wc]
         )
 
         gravity = np.array([0, 0, -9.81])
         child_imu_trace = child_world_trace.calculate_imu_trace(acc_from_gravity=gravity)
+        
         if add_noise:
             child_imu_trace = child_imu_trace.add_noise(gyro_noise_std, acc_noise_std)
 
-        return PlateTrial(f"{self.name}_child_dof2", child_imu_trace, child_world_trace)
+        # # === Verification of Relative Angular Velocity ===
+        
+        # # Get actual relative angular velocity from IMU data (in world frame)
+        # w_c_world = np.array([r @ g for r, g in zip(child_world_trace.rotations, child_imu_trace.gyro)])
+        # w_p_world = np.array([r @ g for r, g in zip(self.world_trace.rotations, self.imu_trace.gyro)])
+        # w_rel_actual = w_c_world - w_p_world
+        # print(w_rel_actual[50])
+        # # Calculate ideal relative angular velocity from joint angle derivatives
+        
+        # # Use np.gradient for a stable derivative that matches array length
+        # dt = np.mean(np.diff(timestamps))
+        # z_dot = (np.roll(z_angles, -1) - z_angles) / dt
+        # x_dot = (np.roll(x_angles, -1) - x_angles) / dt
 
+        # # Fix the last sample (which was wrapped around)
+        # z_dot[-1] = z_dot[-2]
+        # x_dot[-1] = x_dot[-2]
+
+        # # y_dot is zero, so we omit it
+        
+        # # --- Component 1: z_dot around parent's j1 axis (in world frame) ---
+        # # This is the Z-axis in the J1 frame ([0,0,1]), rotated by R_wp @ R_pj1
+        # # The axis in world frame is R_wp @ j1_p_norm
+        # w_axis_j1_world = np.einsum('nij,j->ni', R_wp, j1_p_norm)
+        # w_rel_1_world = z_dot[:, np.newaxis] * w_axis_j1_world
+        # print(w_axis_j1_world[50])
+        # # --- Component 2: x_dot around the ZYX sequence's X-axis (in world frame) ---
+        # # This is the X-axis ([1,0,0]) *after* the Rz and Ry rotations.
+        # # Its orientation in the world is:
+        # # R_wp @ R_pj1 @ R_z(t) @ R_y(t) @ [1,0,0]
+        
+        # w_axis_j2_world = np.einsum('nij,j->ni', R_wc, j2_c_norm)
+        # w_rel_2_world = x_dot[:, np.newaxis] * w_axis_j2_world
+        # print(w_axis_j2_world[50])
+        # # Ideal total relative velocity is the sum of the two components
+        # w_rel_ideal = w_rel_1_world + w_rel_2_world
+        
+        # # Compare the actual (from IMU) vs ideal (from joint angles)
+        # # We skip the first few samples to avoid gradient artifacts at edges
+        # skip = 5 
+        # error = np.linalg.norm(w_rel_actual[skip:-skip] - w_rel_ideal[skip:-skip], axis=1)
+        
+        # print(f"2-DOF Joint Gen: Mean w_rel (actual vs. ideal) error: {np.mean(error):.6f} rad/s")
+
+        # j3_world = np.cross(w_axis_j1_world, w_axis_j2_world)
+        # dot_products = np.einsum('ni,ni->n', w_rel_actual, j3_world)
+        # print(f"2-DOF Joint Gen: Mean dot(w_rel_actual, j1 x j2): {np.mean(dot_products):.6f} (should be near 0)")
+        # dot_products_ideal = np.einsum('ni,ni->n', w_rel_ideal, j3_world)
+        # print(f"2-DOF Joint Gen: Mean dot(w_rel_ideal, j1 x j2): {np.mean(dot_products_ideal):.6f} (should be near 0)")
+
+        # # The magnitude of the cross product of joint axes in the real world should also be constant
+        # j3 = np.cross(w_axis_j1_world, w_axis_j2_world)
+        # j3_magnitudes = np.linalg.norm(j3, axis=1)
+        # print(f"2-DOF Joint Gen: Joint axes cross-product magnitude (should be constant): "
+        #       f"mean={np.mean(j3_magnitudes):.6f}, std={np.std(j3_magnitudes):.6f}")
+        # # --- End of new code block --
+        return PlateTrial(f"{self.name}_child_dof2", child_imu_trace, child_world_trace)
 
     def generate_3dof_plate(
         self,
