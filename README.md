@@ -12,6 +12,8 @@ This repository provides all the necessary scripts to:
 4.  Perform statistical analysis to compare the performance of the different methods.
 5.  Generate all the figures presented in the publication.
 
+The data, adapted from Al Borno et al. 2022, can be found here: https://drive.google.com/drive/folders/1t5xS7Y1q29BTAcFl0IslfVBKy48U-WMY?usp=sharing.
+
 ## Repository Structure
 
 The repository is organized into several key Python scripts and a data directory:
@@ -82,7 +84,7 @@ To set up the environment and run the scripts, follow these steps:
 
 ## Data Setup
 
-The scripts expect a specific directory structure for the input data. You will need to populate the `data/data/` directory as follows:
+The scripts expect a specific directory structure for the input data. You will need to populate the `data/` directory as follows:
 ```
 data/
 ├── Subject01/
@@ -115,14 +117,14 @@ This step processes the raw data and runs the different orientation estimation a
 ```bash
 python generate_method_orientation_sto_files.py
 ```
-This will create .sto files for each method within each subject's trial directory (e.g., data/data/Subject01/walking/walking_orientations_mag_on.sto).
+This will create .sto files for each method within each subject's trial directory (e.g., data/Subject01/walking/walking_orientations_mag_on.sto).
 
 ### Step 2: Generate Data and Statistics .pkl Files
 This step calculates the joint angles from the .sto files and computes detailed error statistics, saving them in convenient .pkl files.
 ```bash
 python generate_method_data_and_stats_pkls.py
 ```
-This will produce three key files in the data/data/ directory:
+This will produce three key files in the data/ directory:
 
 -   `all_subject_data.pkl`: A large file containing the full time-series data for all joints, methods, and subjects.
 
