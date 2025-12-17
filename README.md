@@ -12,7 +12,7 @@ This repository provides all the necessary scripts to:
 4.  Perform statistical analysis to compare the performance of the different methods.
 5.  Generate all the figures presented in the publication.
 
-The data, adapted from Al Borno et al. 2022, can be found here: https://drive.google.com/drive/folders/1t5xS7Y1q29BTAcFl0IslfVBKy48U-WMY?usp=sharing.
+The data, adapted from Al Borno et al. 2022, can be found on Google Drive (https://drive.google.com/drive/folders/1t5xS7Y1q29BTAcFl0IslfVBKy48U-WMY?usp=sharing) or at SimTK (https://simtk.org/projects/majic_dataset).
 
 ## Repository Structure
 
