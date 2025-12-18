@@ -1134,7 +1134,7 @@ def main():
 
     # --- 2. Load Data ---
     if not os.path.exists(DATA_FILE_PATH.replace("statistics", "pearson_correlation")):
-        print(f"Error: Statistics file not found at {DATA_FILE_PATH.replace("statistics", "pearson_correlation")}")
+        print(f"Error: Statistics file not found at {DATA_FILE_PATH.replace('statistics', 'pearson_correlation')}")
         return
     else:
         print(f"Loading summary statistics from {DATA_FILE_PATH.replace("statistics", "pearson_correlation")}...")

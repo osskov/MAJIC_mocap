@@ -79,7 +79,7 @@ To set up the environment and run the scripts, follow these steps:
 
 3.  **Install the required libraries:** The necessary packages are listed in `requirements.txt`.
     ```bash
-    pip install numpy pandas matplotlib seaborn scipy
+    pip install -r requirements.txt
     ```
 
 ## Data Setup
