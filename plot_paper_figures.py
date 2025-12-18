@@ -1137,9 +1137,9 @@ def main():
         print(f"Error: Statistics file not found at {DATA_FILE_PATH.replace('statistics', 'pearson_correlation')}")
         return
     else:
-        print(f"Loading summary statistics from {DATA_FILE_PATH.replace("statistics", "pearson_correlation")}...")
+        print(f"Loading summary statistics from {DATA_FILE_PATH.replace('statistics', 'pearson_correlation')}...")
         try:
-            pearson_stats_df = pd.read_pickle(DATA_FILE_PATH.replace("statistics", "pearson_correlation"))
+            pearson_stats_df = pd.read_pickle(DATA_FILE_PATH.replace('statistics', 'pearson_correlation'))
         except Exception as e:
             print(f"Error loading pickle file: {e}")
             return
