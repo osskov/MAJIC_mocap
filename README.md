@@ -154,3 +154,9 @@ The main plotting script, plot_paper_figures.py, contains a global configuration
 -   `PLOT_STYLE`: Choose between 'strip' (strip plot with median/IQR) or 'bar' (bar plot with mean/CI).
 
 -   `SAVE_PLOTS` and `SHOW_PLOTS`: Control whether plots are saved to disk and/or displayed on screen.
+
+## Citation
+
+If you use the MAJIC filter in your research or wish to reference the results from our evaluation, please cite both the associated paper and this software implementation.
+
+The citation metadata for this repository is maintained in [`CITATION.cff`](./CITATION.cff). You can export the citation in your preferred format (BibTeX, APA, etc.) by clicking the **"Cite this repository"** button in the About section of the GitHub sidebar.
