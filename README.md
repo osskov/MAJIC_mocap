@@ -154,8 +154,3 @@ The main plotting script, plot_paper_figures.py, contains a global configuration
 -   `PLOT_STYLE`: Choose between 'strip' (strip plot with median/IQR) or 'bar' (bar plot with mean/CI).
 
 -   `SAVE_PLOTS` and `SHOW_PLOTS`: Control whether plots are saved to disk and/or displayed on screen.
-
-# Citation
-If you use this code or the Relative Filter in your research, please cite our publication:
-
-[Your Publication Citation Here - e.g., Author(s), "Title of Paper," Journal, Volume, Pages, Year.]
