@@ -1,0 +1,45 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: Skov
+    given-names: Six
+    affiliation: "Stanford University"
+    orcid: "https://orcid.org/0009-0002-3513-1185"
+  - family-names: Werling
+    given-names: Keenon
+    affiliation: "Stanford University"
+  - family-names: O'Day
+    given-names: Johanna
+    affiliation: "Stanford University"
+  - family-names: Hicks
+    given-names: Jennifer
+    affiliation: "Stanford University"
+  - family-names: Liu
+    given-names: C. Karen
+    affiliation: "Stanford University"
+  - family-names: Delp
+    given-names: Scott
+    affiliation: "Stanford University"
+title: "MAJIC Filter: Estimating Magnetic Field at Joint Centers Reduces Kinematic Errors"
+version: 1.0.0
+doi: 10.5281/zenodo.0000000 # TODO
+date-published: 2026-01-30
+url: "https://github.com/osskov/MAJIC_mocap"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Skov
+      given-names: Six
+    - family-names: Werling
+      given-names: Keenon
+    - family-names: O'Day
+      given-names: Johanna
+    - family-names: Hicks
+      given-names: Jennifer
+    - family-names: Liu
+      given-names: C. Karen
+    - family-names: Delp
+      given-names: Scott
+  title: "Estimating Magnetic Field at Joint Centers Reduces Kinematic Errors in Inertial Motion Capture"
+  year: 2026
+  status: "in submission"
