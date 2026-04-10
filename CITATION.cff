@@ -22,7 +22,7 @@ authors:
     affiliation: "Stanford University"
 title: "MAJIC Filter: Estimating Magnetic Field at Joint Centers Reduces Kinematic Errors"
 version: 1.0.0
-doi: 10.5281/zenodo.18437563
+doi: https://doi.org/10.21203/rs.3.rs-9337794/v1
 date-published: 2026-01-30
 url: "https://github.com/osskov/MAJIC_mocap"
 preferred-citation:
@@ -42,4 +42,4 @@ preferred-citation:
       given-names: Scott
   title: "Estimating Magnetic Field at Joint Centers Reduces Kinematic Errors in Inertial Motion Capture"
   year: 2026
-  status: "in submission"
+  status: "In Submission"
