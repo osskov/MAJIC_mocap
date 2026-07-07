@@ -13,3 +13,6 @@ venv/
 
 # Ignore plots folder
 plots/
+
+# Ignore .vscode folder
+.vscode/

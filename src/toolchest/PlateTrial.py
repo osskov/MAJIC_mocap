@@ -131,10 +131,11 @@ class PlateTrial:
         
         # 3. Apply this static rotation to all orientations in the world trace.
         #    new_R_world = old_R_world @ R_wt_it
-        new_world_rotations = [rot @ R_wt_it for rot in self.world_trace.rotations]
+        world_rots_np = np.array(self.world_trace.rotations)
+        new_world_rotations = np.matmul(world_rots_np, R_wt_it)
         
         # 4. Create a new WorldTrace and PlateTrial with the aligned data.
-        new_world_trace = WorldTrace(self.world_trace.timestamps, self.world_trace.positions, new_world_rotations)
+        new_world_trace = WorldTrace(self.world_trace.timestamps, self.world_trace.positions, list(new_world_rotations))
         return PlateTrial(self.name, self.imu_trace, new_world_trace)
 
     def project_imu_trace(self, local_offset: np.ndarray) -> IMUTrace:
@@ -368,8 +369,8 @@ class PlateTrial:
         a1 = np.pad(array1, (0, max_len - len(array1)), mode='constant')
         a2 = np.pad(array2, (0, max_len - len(array2)), mode='constant')
 
-        # Compute the full cross-correlation
-        correlation = signal.correlate(a1, a2, mode='full')
+        # Compute the full cross-correlation using FFT for speed
+        correlation = signal.correlate(a1, a2, mode='full', method='fft')
         
         # Find the index of the peak correlation.
         # The lag is this index offset by (max_len - 1)
@@ -399,9 +400,11 @@ class PlateTrial:
         """
         # R is the rotation from local-to-global (from world_trace)
         # v_global = R @ v_local
-        rotated_acc = [r @ a for r, a in zip(self.world_trace.rotations, self.imu_trace.acc)]
-        rotated_gyro = [r @ g for r, g in zip(self.world_trace.rotations, self.imu_trace.gyro)]
-        rotated_mag = [r @ m for r, m in zip(self.world_trace.rotations, self.imu_trace.mag)]
+        world_rots = np.array(self.world_trace.rotations)
+        
+        rotated_acc = np.einsum('nij,nj->ni', world_rots, np.array(self.imu_trace.acc))
+        rotated_gyro = np.einsum('nij,nj->ni', world_rots, np.array(self.imu_trace.gyro))
+        rotated_mag = np.einsum('nij,nj->ni', world_rots, np.array(self.imu_trace.mag))
         
         return IMUTrace(
             timestamps=self.imu_trace.timestamps,
@@ -462,7 +465,7 @@ class PlateTrial:
         other: 'PlateTrial',
         initial_axis_parent: np.ndarray = None,
         initial_axis_child: np.ndarray = None,
-        max_iterations: int = 40,
+        max_iterations: int = 100,
         tolerance: float = 1e-6,
         subsample_rate: int = 1,
         verbose: bool = False # ⬅️ ADDED VERBOSE FLAG

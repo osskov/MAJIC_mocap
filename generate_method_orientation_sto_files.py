@@ -101,7 +101,10 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
                                                condition: str = 'mag on',
                                                gyro_std: float = np.sqrt(0.01),
                                                acc_std: float = np.sqrt(0.05),
-                                               mag_std: float = np.sqrt(0.05)) -> List[np.ndarray]:
+                                               mag_std: float = np.sqrt(0.05),
+                                               mag_adapt_threshold: float = 150.0,
+                                               project_imu: bool = True,
+                                               precomputed_observability_metric: np.ndarray = None) -> List[np.ndarray]:
     """
     Estimates joint orientations between parent and child trials using specified filter conditions.
 
@@ -128,27 +131,31 @@ def _get_joint_orientations_from_plate_trials_(parent_trial: PlateTrial,
 
     # If we're going to need some projected information, we should generate it now.
     if condition != 'unprojected':
-        parent_joint_center_offset, child_joint_center_offset, error = parent_trial.world_trace.get_joint_center(
-            child_trial.world_trace)
-        
-        if np.mean(np.linalg.norm(error, axis=1)) > 0.05:
-            print(f"Warning: High joint center error ({np.mean(np.linalg.norm(error, axis=1))} m) between "
-                  f"{parent_trial.name} and {child_trial.name}. Check marker placement.")
+        if project_imu:
+            parent_joint_center_offset, child_joint_center_offset, error = parent_trial.world_trace.get_joint_center(
+                child_trial.world_trace)
+            
+            if np.mean(np.linalg.norm(error, axis=1)) > 0.05:
+                print(f"Warning: High joint center error ({np.mean(np.linalg.norm(error, axis=1))} m) between "
+                      f"{parent_trial.name} and {child_trial.name}. Check marker placement.")
 
-        parent_trial.imu_trace = parent_trial.project_imu_trace(parent_joint_center_offset)
-        child_trial.imu_trace = child_trial.project_imu_trace(child_joint_center_offset)
+            parent_trial.imu_trace = parent_trial.project_imu_trace(parent_joint_center_offset)
+            child_trial.imu_trace = child_trial.project_imu_trace(child_joint_center_offset)
 
         if condition == 'mag adapt':
-            da_parent = np.diff(parent_trial.imu_trace.acc, axis=0) + np.cross(parent_trial.imu_trace.gyro[1:], parent_trial.imu_trace.acc[1:])
-            da_child = np.diff(child_trial.imu_trace.acc, axis=0) + np.cross(child_trial.imu_trace.gyro[1:], child_trial.imu_trace.acc[1:])
-            o_parent = np.cross(parent_trial.imu_trace.acc[1:], da_parent)
-            o_child = np.cross(child_trial.imu_trace.acc[1:], da_child)
-            observability_metric = np.minimum(np.linalg.norm(o_parent, axis=1),
-                                            np.linalg.norm(o_child, axis=1))
-            observability_metric = np.concatenate(([0.0], observability_metric))
+            if precomputed_observability_metric is None:
+                da_parent = np.diff(parent_trial.imu_trace.acc, axis=0) + np.cross(parent_trial.imu_trace.gyro[1:], parent_trial.imu_trace.acc[1:])
+                da_child = np.diff(child_trial.imu_trace.acc, axis=0) + np.cross(child_trial.imu_trace.gyro[1:], child_trial.imu_trace.acc[1:])
+                o_parent = np.cross(parent_trial.imu_trace.acc[1:], da_parent)
+                o_child = np.cross(child_trial.imu_trace.acc[1:], da_child)
+                observability_metric = np.minimum(np.linalg.norm(o_parent, axis=1),
+                                                np.linalg.norm(o_child, axis=1))
+                observability_metric = np.concatenate(([0.0], observability_metric))
+            else:
+                observability_metric = precomputed_observability_metric
 
             # Set mag to 0 where observability is high
-            threshold = 150.0
+            threshold = mag_adapt_threshold
             high_indexes = observability_metric > threshold
             parent_trial.imu_trace.mag = [np.zeros(3) if high else mag for high, mag in
                                           zip(high_indexes, parent_trial.imu_trace.mag)]

@@ -12,33 +12,23 @@ def finite_difference_rotations(rotation_matrices: List[np.ndarray], timestamps:
     :param timestamps: Array of timestamps corresponding to the rotation matrices.
     :return: List of angular velocity vectors.
     """
-    angular_velocities = []
-    for i in range(1, len(rotation_matrices)):
-        # Relative rotation matrix. This assumes that R_rel is in the body frame, and is right multiplied by the
-        # previous rotation matrix to get the current rotation matrix.
-        #
-        # R_current = R_previous * R_rel
-        #
-        # Therefore:
-        #
-        # R_rel = R_previous.T * R_current
-        R_rel = np.dot(rotation_matrices[i - 1].T, rotation_matrices[i])
-
-        # Compute the time difference
-        dt: float = timestamps[i] - timestamps[i - 1]
-
-        # Compute the angular velocity
-        omega = rotation_matrix_to_angular_velocity(R_rel, dt)
-
-        assert not np.isnan(omega).any(), f"NaN in omega at index {i}"
-
-        angular_velocities.append(omega)
-
-    # Extend the angular velocities to the same length as the rotation matrices
-    if len(angular_velocities) == 0:
-        return [np.zeros(3)]
+    if len(rotation_matrices) < 2:
+        return [np.zeros(3)] * max(1, len(rotation_matrices))
+        
+    R = np.array(rotation_matrices)
+    R_prev_T = R[:-1].transpose((0, 2, 1))
+    R_curr = R[1:]
+    
+    R_rel = np.matmul(R_prev_T, R_curr)
+    dts = np.diff(timestamps)
+    
+    # Avoid divide by zero
+    dts = np.where(dts == 0, 1e-9, dts)
+    
+    omegas = Rotation.from_matrix(R_rel).as_rotvec() / dts[:, None]
+    
+    angular_velocities = list(omegas)
     angular_velocities.append(angular_velocities[-1])
-
     return angular_velocities
 
 

@@ -6,6 +6,39 @@ import scipy.stats as stats
 import seaborn as sns
 import numpy as np
 
+# --- Tufte Style Configuration ---
+tufte_style = {
+    'axes.facecolor': 'white',
+    'axes.edgecolor': 'black',
+    'axes.linewidth': 0.8,
+    'axes.spines.top': False,
+    'axes.spines.right': False,
+    'axes.spines.bottom': True,
+    'axes.spines.left': True,
+    'axes.grid': True,
+    'grid.color': '#EEEEEE',
+    'grid.linestyle': '-',
+    'grid.linewidth': 0.8,
+    'grid.alpha': 0.7,
+    'font.family': 'serif',
+    'font.serif': ['Times New Roman', 'Palatino', 'serif'],
+    'text.color': 'black',
+    'axes.labelcolor': 'black',
+    'xtick.color': 'black',
+    'ytick.color': 'black',
+    'xtick.direction': 'out',
+    'ytick.direction': 'out',
+    'legend.frameon': False,
+    'figure.facecolor': 'white',
+    'figure.edgecolor': 'white',
+    'axes.labelsize': 12,
+    'axes.titlesize': 14,
+    'xtick.labelsize': 10,
+    'ytick.labelsize': 10,
+    'legend.fontsize': 10
+}
+plt.rcParams.update(tufte_style)
+
 # --- Global Configuration ---
 # Subjects to plot can be "Subject01", "Subject02", ..., "Subject11"
 SUBJECTS_TO_PLOT = ['Subject01', 'Subject02', 'Subject03', 'Subject04', 'Subject05',

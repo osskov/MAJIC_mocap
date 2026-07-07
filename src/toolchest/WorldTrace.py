@@ -217,13 +217,15 @@ class WorldTrace:
         """
         This function computes the IMU trace from the world trace by finite differencing the positions and rotations.
         """
+        rotations_np = np.array(self.rotations)
         if not skip_lin_acc:
             world_acc = self.finite_difference_world_frame_accelerations(acc_from_gravity)
-            local_acc = [rot.T @ acc for rot, acc in zip(self.rotations, world_acc)]
+            world_acc_np = np.array(world_acc)
+            local_acc = np.einsum('nji,nj->ni', rotations_np, world_acc_np).tolist()
         else:
-            local_acc = [rot.T @ acc_from_gravity for rot in self.rotations]
+            local_acc = np.einsum('nji,j->ni', rotations_np, acc_from_gravity).tolist()
         assert isinstance(magnetic_field, np.ndarray)
-        local_mag = [rot.T @ magnetic_field for rot in self.rotations]
+        local_mag = np.einsum('nji,j->ni', rotations_np, magnetic_field).tolist()
         local_gyros = finite_difference_rotations(self.rotations, self.timestamps)
         return IMUTrace(self.timestamps, local_gyros, local_acc, local_mag)
 
@@ -721,9 +723,9 @@ class WorldTrace:
                 # Extract data
                 timestamps = 1 / freq * np.arange(len(df))
                 if df['Mat[3][3]'].isna().any():
-                    rotations = [np.array(row).reshape(3, 3) for row in df[['Mag_Z','Mat[3][1]', 'Mat[3][2]', 'Mat[1][1]', 'Mat[1][2]', 'Mat[1][3]', 'Mat[2][1]', 'Mat[2][2]', 'Mat[2][3]']].values]
+                    rotations = list(df[['Mag_Z','Mat[3][1]', 'Mat[3][2]', 'Mat[1][1]', 'Mat[1][2]', 'Mat[1][3]', 'Mat[2][1]', 'Mat[2][2]', 'Mat[2][3]']].values.reshape(-1, 3, 3))
                 else:
-                    rotations = [np.array(row).reshape(3, 3) for row in df[['Mat[1][1]', 'Mat[1][2]', 'Mat[1][3]', 'Mat[2][1]', 'Mat[2][2]', 'Mat[2][3]', 'Mat[3][1]', 'Mat[3][2]', 'Mat[3][3]']].values]
+                    rotations = list(df[['Mat[1][1]', 'Mat[1][2]', 'Mat[1][3]', 'Mat[2][1]', 'Mat[2][2]', 'Mat[2][3]', 'Mat[3][1]', 'Mat[3][2]', 'Mat[3][3]']].values.reshape(-1, 3, 3))
 
                 # Create WorldTrace objects
                 world_traces[name_in_model] = WorldTrace(timestamps=timestamps, positions=[np.zeros(3) for _ in range(len(timestamps))], rotations=rotations)

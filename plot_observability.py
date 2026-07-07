@@ -75,7 +75,7 @@ def plot_median_iqr(df_long):
     Figure 2: Custom Point Plot (Median + IQR)
     Includes Parent, Child, and the 'Min' intersection in grey.
     """
-    plt.figure(figsize=(8, 6))
+    plt.figure(figsize=(6, 6))
     sns.set_theme(style="white")
     
     # 1. Calculate Statistics
@@ -112,7 +112,7 @@ def plot_median_iqr(df_long):
     joint_order = [j for j in joint_order if j in stats['Joint'].unique()]
     x_map = {j: i for i, j in enumerate(joint_order)}
     
-    offset = 0.2
+    offset = 0.1
 
     # 3. Plot Manually
     for _, row in stats.iterrows():
@@ -157,7 +157,7 @@ def plot_median_iqr(df_long):
     plt.xlim(-0.5, len(joint_order) - 0.5)
     
     legend_patches = [mpatches.Patch(color=segment_palette[s], label=s) for s in unique_segments]
-    legend_patches.append(mpatches.Patch(color='grey', label='Minimum'))
+    # legend_patches.append(mpatches.Patch(color='grey', label='Minimum'))
     
     plt.legend(handles=legend_patches, title='Segment', loc='upper left', fontsize=14, title_fontsize=14)
 

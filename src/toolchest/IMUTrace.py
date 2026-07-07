@@ -519,9 +519,9 @@ class IMUTrace:
         timestamps = 1 / freq * np.arange(len(df))
         
         # Extract data columns and convert to the list-of-arrays format
-        acc = [np.array(row) for row in df[['Acc_X', 'Acc_Y', 'Acc_Z']].values]
-        gyro = [np.array(row) for row in df[['Gyr_X', 'Gyr_Y', 'Gyr_Z']].values]
-        mag = [np.array(row) for row in df[['Mag_X', 'Mag_Y', 'Mag_Z']].values]
+        acc = list(df[['Acc_X', 'Acc_Y', 'Acc_Z']].values)
+        gyro = list(df[['Gyr_X', 'Gyr_Y', 'Gyr_Z']].values)
+        mag = list(df[['Mag_X', 'Mag_Y', 'Mag_Z']].values)
 
         return IMUTrace(timestamps=timestamps, acc=acc, gyro=gyro, mag=mag)
 
