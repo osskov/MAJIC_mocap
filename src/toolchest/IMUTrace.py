@@ -21,38 +21,38 @@ class IMUTrace:
 
     Attributes:
         timestamps (np.ndarray): A 1D array of N timestamps, typically in seconds.
-        gyro (List[np.ndarray]): A list of N, 3-element numpy arrays representing
+        gyro (np.ndarray): An (N, 3) numpy array representing
             angular velocity (e.g., in rad/s) at each timestamp.
-        acc (List[np.ndarray]): A list of N, 3-element numpy arrays representing
+        acc (np.ndarray): An (N, 3) numpy array representing
             linear acceleration (e.g., in m/s^2) at each timestamp.
-        mag (List[np.ndarray]): A list of N, 3-element numpy arrays representing
+        mag (np.ndarray): An (N, 3) numpy array representing
             magnetic field data (e.g., in arbitrary units or Gauss) at each timestamp.
     """
     timestamps: np.ndarray
-    gyro: List[np.ndarray]
-    acc: List[np.ndarray]
-    mag: List[np.ndarray]
+    gyro: np.ndarray
+    acc: np.ndarray
+    mag: np.ndarray
 
-    def __init__(self, timestamps: np.ndarray, gyro: List[np.ndarray], acc: List[np.ndarray], mag: List[np.ndarray]):
+    def __init__(self, timestamps: np.ndarray, gyro: Union[List[np.ndarray], np.ndarray], acc: Union[List[np.ndarray], np.ndarray], mag: Union[List[np.ndarray], np.ndarray]):
         """
         Initializes the IMUTrace object.
 
         Args:
             timestamps (np.ndarray): 1D array of timestamps.
-            gyro (List[np.ndarray]): List of 3-element gyro data arrays.
-            acc (List[np.ndarray]): List of 3-element accelerometer data arrays.
-            mag (List[np.ndarray]): List of 3-element magnetometer data arrays.
+            gyro (Union[List[np.ndarray], np.ndarray]): Gyro data array of shape (N, 3).
+            acc (Union[List[np.ndarray], np.ndarray]): Accelerometer data array of shape (N, 3).
+            mag (Union[List[np.ndarray], np.ndarray]): Magnetometer data array of shape (N, 3).
 
         Raises:
             AssertionError: If the lengths of timestamps, gyro, acc, and mag
-            lists do not all match.
+            do not all match.
         """
         assert (len(timestamps) == len(gyro) == len(acc) == len(mag)), \
             "All data streams (timestamps, gyro, acc, mag) must have the same length."
         self.timestamps = timestamps
-        self.gyro = gyro
-        self.acc = acc
-        self.mag = mag
+        self.gyro = np.asarray(gyro)
+        self.acc = np.asarray(acc)
+        self.mag = np.asarray(mag)
 
     def __len__(self):
         """
@@ -82,7 +82,7 @@ class IMUTrace:
         else:
             # If key is an integer, wrap it in a new IMUTrace of length 1
             # This ensures that the return type is always an IMUTrace
-            return IMUTrace(np.array([self.timestamps[key]]), [self.gyro[key]], [self.acc[key]], [self.mag[key]])
+            return IMUTrace(np.array([self.timestamps[key]]), self.gyro[key:key+1], self.acc[key:key+1], self.mag[key:key+1])
 
     def __eq__(self, other):
         """
@@ -103,10 +103,10 @@ class IMUTrace:
             return False
             
         # Perform element-wise comparison for all data
-        return ((self.timestamps == other.timestamps).all() and
-                all(np.all(self.gyro[i] == other.gyro[i]) for i in range(len(self.gyro))) and
-                all(np.all(self.acc[i] == other.acc[i]) for i in range(len(self.acc))) and
-                all(np.all(self.mag[i] == other.mag[i]) for i in range(len(self.mag))))
+        return (np.array_equal(self.timestamps, other.timestamps) and
+                np.array_equal(self.gyro, other.gyro) and
+                np.array_equal(self.acc, other.acc) and
+                np.array_equal(self.mag, other.mag))
 
     def __sub__(self, other):
         """
@@ -133,9 +133,9 @@ class IMUTrace:
                                              err_msg="IMUTraces must have the same timestamps to subtract.")
 
         # Subtract sensor data element-wise
-        gyro = [gyro1 - gyro2 for gyro1, gyro2 in zip(self.gyro, other.gyro)]
-        acc = [acc1 - acc2 for acc1, acc2 in zip(self.acc, other.acc)]
-        mag = [mag1 - mag2 for mag1, mag2 in zip(self.mag, other.mag)]
+        gyro = self.gyro - other.gyro
+        acc = self.acc - other.acc
+        mag = self.mag - other.mag
         
         # Return new trace with subtracted data and original timestamps
         return IMUTrace(self.timestamps, gyro, acc, mag)
@@ -158,7 +158,7 @@ class IMUTrace:
             return False
         if len(self) != len(other):
             return False
-        if len(self.gyro) != len(other.gyro) or len(self.acc) != len(other.acc) or len(self.mag) != len(other.mag):
+        if self.gyro.shape[0] != other.gyro.shape[0] or self.acc.shape[0] != other.acc.shape[0] or self.mag.shape[0] != other.mag.shape[0]:
             return False
             
         # Check for empty traces (which are considered close)
@@ -166,15 +166,14 @@ class IMUTrace:
             return True
             
         # Check that the shape of the first element matches
-        if self.gyro[0].shape != other.gyro[0].shape or self.acc[0].shape != other.acc[0].shape or self.mag[0].shape != \
-                other.mag[0].shape:
+        if self.gyro.shape[1:] != other.gyro.shape[1:] or self.acc.shape[1:] != other.acc.shape[1:] or self.mag.shape[1:] != other.mag.shape[1:]:
             return False
             
         # Use np.allclose for floating-point comparisons
         return (np.allclose(self.timestamps, other.timestamps, atol=atol) and
-                all(np.allclose(self.gyro[i], other.gyro[i], atol=atol) for i in range(len(self.gyro))) and
-                all(np.allclose(self.acc[i], other.acc[i], atol=atol) for i in range(len(self.acc))) and
-                all(np.allclose(self.mag[i], other.mag[i], atol=atol) for i in range(len(self.mag))))
+                np.allclose(self.gyro, other.gyro, atol=atol) and
+                np.allclose(self.acc, other.acc, atol=atol) and
+                np.allclose(self.mag, other.mag, atol=atol))
 
     def copy(self) -> 'IMUTrace':
         """
@@ -189,13 +188,13 @@ class IMUTrace:
         """
         return IMUTrace(
             timestamps=self.timestamps.copy(),
-            # Create new lists containing copies of each numpy array
-            gyro=[g.copy() for g in self.gyro],
-            acc=[a.copy() for a in self.acc],
-            mag=[m.copy() for m in self.mag]
+            # Create new arrays containing copies of each numpy array
+            gyro=self.gyro.copy(),
+            acc=self.acc.copy(),
+            mag=self.mag.copy()
         )
 
-    def _finite_difference_gyros(self, method='polyfit') -> List[np.ndarray]:
+    def _finite_difference_gyros(self, method='polyfit') -> np.ndarray:
         r"""
         Private method to compute the angular acceleration (derivative of gyro).
         
@@ -209,31 +208,20 @@ class IMUTrace:
                 Defaults to 'polyfit'.
 
         Returns:
-            List[np.ndarray]: A list of N, 3-element numpy arrays representing
+            np.ndarray: An (N, 3) numpy array representing
             angular acceleration ($\dot{\omega}$) at each timestamp.
         """
-        derivates: List[np.ndarray] = []
+        derivates = []
         
         # Calculate derivatives for each axis (x, y, z) separately
         if method == 'central':
-            # 1. Unzip: Create a (N,) array for each axis
-            # 2. Differentiate: Pass (N,) array to central_difference
-            # 3. Result: List of 3 (N,) arrays [deriv_x, deriv_y, deriv_z]
-            derivates = [central_difference(np.array([gyro[axis] for gyro in self.gyro]), self.timestamps) for axis in
-                         range(3)]
+            derivates = [central_difference(self.gyro[:, axis], self.timestamps) for axis in range(3)]
         elif method == 'first_order':
-            derivates = [forward_difference(np.array([gyro[axis] for gyro in self.gyro]), self.timestamps) for axis in
-                         range(3)]
+            derivates = [forward_difference(self.gyro[:, axis], self.timestamps) for axis in range(3)]
         elif method == 'polyfit':
-            derivates = [
-                polynomial_fit_derivative(np.array([gyro[axis] for gyro in self.gyro]), self.timestamps, order=2) for
-                axis in range(3)]
+            derivates = [polynomial_fit_derivative(self.gyro[:, axis], self.timestamps, order=2) for axis in range(3)]
                 
-        # Now we need to "zip" the data back up
-        # 1. Iterate i from 0 to N-1
-        # 2. For each i, create an array [deriv_x[i], deriv_y[i], deriv_z[i]]
-        # 3. Result: List of N (3,) arrays
-        return [np.array([derivate[i] for derivate in derivates]) for i in range(len(self.timestamps))]
+        return np.column_stack(derivates)
 
     def project_acc(self, local_offset: Union[np.ndarray, List[np.ndarray]],
                     finite_difference_gyro_method='polyfit') -> 'IMUTrace':
@@ -272,14 +260,14 @@ class IMUTrace:
         gyro_derivative = self._finite_difference_gyros(finite_difference_gyro_method)
         
         # Apply the rigid body acceleration equation for each time step
-        acc_projected = []
-        for a, g, dg, r in zip(self.acc, self.gyro, gyro_derivative, local_offset):
-            # a_p = a_o + (d_gyro x r) + (gyro x (gyro x r))
-            # a_o: Original acceleration (a)
-            # d_gyro x r: Tangential acceleration (np.cross(dg, r))
-            # gyro x (gyro x r): Centripetal acceleration (np.cross(g, np.cross(g, r)))
-            a_p = a + np.cross(dg, r) + np.cross(g, np.cross(g, r))
-            acc_projected.append(a_p)
+        # a_p = a_o + (d_gyro x r) + (gyro x (gyro x r))
+        # a_o: Original acceleration (a)
+        # d_gyro x r: Tangential acceleration (np.cross(dg, r))
+        # gyro x (gyro x r): Centripetal acceleration (np.cross(g, np.cross(g, r)))
+        
+        tangential_acc = np.cross(gyro_derivative, local_offset)
+        centripetal_acc = np.cross(self.gyro, np.cross(self.gyro, local_offset))
+        acc_projected = self.acc + tangential_acc + centripetal_acc
             
         return IMUTrace(self.timestamps, self.gyro.copy(), acc_projected, self.mag.copy())
 
@@ -313,18 +301,18 @@ class IMUTrace:
 
         # Add gyroscope noise if a non-zero standard deviation is provided
         if gyro_noise_std > 0:
-            gyro_noise = np.random.normal(0, gyro_noise_std, size=(num_samples, 3))
-            noisy_trace.gyro = [g + n for g, n in zip(noisy_trace.gyro, gyro_noise)]
+            gyro_noise = np.random.normal(0, gyro_noise_std, size=noisy_trace.gyro.shape)
+            noisy_trace.gyro = noisy_trace.gyro + gyro_noise
 
         # Add accelerometer noise
         if acc_noise_std > 0:
-            acc_noise = np.random.normal(0, acc_noise_std, size=(num_samples, 3))
-            noisy_trace.acc = [a + n for a, n in zip(noisy_trace.acc, acc_noise)]
+            acc_noise = np.random.normal(0, acc_noise_std, size=noisy_trace.acc.shape)
+            noisy_trace.acc = noisy_trace.acc + acc_noise
 
         # Add magnetometer noise
         if mag_noise_std > 0:
-            mag_noise = np.random.normal(0, mag_noise_std, size=(num_samples, 3))
-            noisy_trace.mag = [m + n for m, n in zip(noisy_trace.mag, mag_noise)]
+            mag_noise = np.random.normal(0, mag_noise_std, size=noisy_trace.mag.shape)
+            noisy_trace.mag = noisy_trace.mag + mag_noise
 
         return noisy_trace
     
@@ -362,26 +350,29 @@ class IMUTrace:
         assert isinstance(other, IMUTrace), "Angle error can only be calculated between two IMUTraces."
         assert len(self) == len(other), "IMUTraces must have the same length to calculate angle error."
 
+        norm_self = np.linalg.norm(self.gyro, axis=1)
+        norm_other = np.linalg.norm(other.gyro, axis=1)
+        
+        # Calculate dot product where possible
+        dot_product = np.sum(self.gyro * other.gyro, axis=1)
+        
         angle_error = np.zeros(len(self))
-        for i in range(len(self)):
-            self_gyro = self.gyro[i]
-            other_gyro = other.gyro[i]
-            
-            norm_self = np.linalg.norm(self_gyro)
-            norm_other = np.linalg.norm(other_gyro)
-            
-            # Case 1: Both vectors have significant magnitude
-            if norm_self > 1e-8 and norm_other > 1e-8:
-                dot_product = np.dot(self_gyro, other_gyro) / (norm_self * norm_other)
-                # Clip to prevent numerical errors from arccos
-                dot_product = np.clip(dot_product, -1.0, 1.0)
-                angle_error[i] = np.arccos(dot_product)
-            # Case 2: Both vectors are near-zero (angle error is zero)
-            elif norm_self < 1e-8 and norm_other < 1e-8:
-                angle_error[i] = 0.0
-            # Case 3: Only one vector is zero (angle is undefined)
-            else:
-                angle_error[i] = np.nan
+        
+        # Avoid division by zero
+        valid_mask = (norm_self > 1e-8) & (norm_other > 1e-8)
+        zero_mask = (norm_self < 1e-8) & (norm_other < 1e-8)
+        
+        # Case 1: Both vectors have significant magnitude
+        cos_theta = dot_product[valid_mask] / (norm_self[valid_mask] * norm_other[valid_mask])
+        cos_theta = np.clip(cos_theta, -1.0, 1.0)
+        angle_error[valid_mask] = np.arccos(cos_theta)
+        
+        # Case 2: Both vectors are near-zero
+        angle_error[zero_mask] = 0.0
+        
+        # Case 3: Only one vector is zero (angle is undefined)
+        invalid_mask = ~(valid_mask | zero_mask)
+        angle_error[invalid_mask] = np.nan
                 
         return angle_error
 
@@ -456,174 +447,22 @@ class IMUTrace:
         stop_time = self.timestamps[-1] + min(old_dt, new_dt)
         new_timestamps = np.arange(start=self.timestamps[0], stop=stop_time, step=new_dt)
         
-        # Convert list of (3,) arrays to (N, 3) arrays for efficient interpolation
-        gyro_data = np.vstack(self.gyro)
-        acc_data = np.vstack(self.acc)
-        mag_data = np.vstack(self.mag)
-
         # Create linear interpolators for each data type
         # 'extrapolate' is used to handle requests slightly outside the original time range
-        gyro_interpolator = interp1d(self.timestamps, gyro_data, axis=0, kind='linear',
+        gyro_interpolator = interp1d(self.timestamps, self.gyro, axis=0, kind='linear',
                                      fill_value='extrapolate')
-        acc_interpolator = interp1d(self.timestamps, acc_data, axis=0, kind='linear',
+        acc_interpolator = interp1d(self.timestamps, self.acc, axis=0, kind='linear',
                                     fill_value='extrapolate')
-        mag_interpolator = interp1d(self.timestamps, mag_data, axis=0, kind='linear',
+        mag_interpolator = interp1d(self.timestamps, self.mag, axis=0, kind='linear',
                                     fill_value='extrapolate')
 
         # Get new resampled data as monolithic (N_new, 3) arrays
-        new_gyro_data = gyro_interpolator(new_timestamps)
-        new_acc_data = acc_interpolator(new_timestamps)
-        new_mag_data = mag_interpolator(new_timestamps)
-
-        # Convert back to the class's standard list of (3,) arrays
-        new_gyro = [row for row in new_gyro_data]
-        new_acc = [row for row in new_acc_data]
-        new_mag = [row for row in new_mag_data]
+        new_gyro = gyro_interpolator(new_timestamps)
+        new_acc = acc_interpolator(new_timestamps)
+        new_mag = mag_interpolator(new_timestamps)
 
         return IMUTrace(new_timestamps, new_gyro, new_acc, new_mag)
 
-    @staticmethod
-    def _parse_imu_txt_file(file_path: str) -> 'IMUTrace':
-        """
-        Parses a single Xsens-formatted IMU .txt file into an IMUTrace object.
-        
-        Assumes a specific format with a header containing "// Update Rate"
-        and 5 rows of header before the tab-delimited data.
-
-        Args:
-            file_path (str): The full path to the .txt file.
-
-        Returns:
-            IMUTrace: An IMUTrace object containing the data from the file.
-
-        Raises:
-            FileNotFoundError: If the file_path does not exist.
-        """
-        # Extract update rate from the file header
-        freq = 100.0  # Default fallback frequency
-        with open(file_path, "r") as f:
-            for line in f:
-                if line.startswith("// Update Rate"):
-                    try:
-                        freq = float(line.split(":")[1].split("Hz")[0])
-                    except (IndexError, ValueError):
-                        # Use default if parsing fails
-                        pass
-                    break
-
-        # Read the file into a DataFrame, skipping the metadata header
-        df = pd.read_csv(file_path, delimiter='\t', skiprows=5)
-        df = df.apply(pd.to_numeric)
-
-        # Generate timestamps, as they are not in the file
-        timestamps = 1 / freq * np.arange(len(df))
-        
-        # Extract data columns and convert to the list-of-arrays format
-        acc = list(df[['Acc_X', 'Acc_Y', 'Acc_Z']].values)
-        gyro = list(df[['Gyr_X', 'Gyr_Y', 'Gyr_Z']].values)
-        mag = list(df[['Mag_X', 'Mag_Y', 'Mag_Z']].values)
-
-        return IMUTrace(timestamps=timestamps, acc=acc, gyro=gyro, mag=mag)
-
-    @staticmethod
-    def _load_imu_traces_from_structure(
-        imu_folder_path: str, 
-        data_subdirectory_parts: List[str]
-    ) -> Dict[str, 'IMUTrace']:
-        """
-        Generic helper to load IMU traces based on a common XML mapping
-        and a specific data subdirectory.
-
-        This function expects to find one .xml file in `imu_folder_path`
-        that maps sensor names (e.g., "00B42341") to model names
-        (e.g., "pelvis"). It then looks for the corresponding .txt files
-        in a subdirectory specified by `data_subdirectory_parts`.
-
-        Args:
-            imu_folder_path (str): The path to the root folder of a specific trial.
-            data_subdirectory_parts (List[str]): A list of path components
-                that form the subdirectory from the root to the data files
-                (e.g., ['xsens', 'LowerExtremity'] or ['imu data']).
-
-        Returns:
-            Dict[str, 'IMUTrace']: A dictionary mapping 'name_in_model' to its IMUTrace.
-            
-        Raises:
-            FileNotFoundError: If no .xml mapping file is found in `imu_folder_path`.
-        """
-        imu_traces = {}
-
-        # Find the first .xml file in the directory to use as the mapping
-        mapping_file = next((f for f in os.listdir(imu_folder_path) if f.endswith('.xml')), None)
-        if mapping_file is None:
-            raise FileNotFoundError(f"No mapping file (.xml) found in IMU folder: {imu_folder_path}")
-
-        # Parse the XML mapping file
-        tree = ET.parse(os.path.join(imu_folder_path, mapping_file))
-        root = tree.getroot()
-        trial_prefix_element = root.find('.//trial_prefix')
-        
-        # Handle cases where trial_prefix might be missing or empty
-        trial_prefix = trial_prefix_element.text if trial_prefix_element is not None else ""
-
-        # Iterate over each ExperimentalSensor element and load its IMUTrace
-        for sensor in root.findall('.//ExperimentalSensor'):
-            sensor_name = sensor.get('name').strip()       # e.g., "00B42341"
-            name_in_model = sensor.find('name_in_model').text.strip() # e.g., "pelvis"
-
-            file_name = f"{trial_prefix}{sensor_name}.txt"
-            
-            # Use the * operator to unpack the list of subdirectory parts
-            # e.g., os.path.join(imu_folder_path, 'xsens', 'LowerExtremity', 'file.txt')
-            file_path = os.path.join(imu_folder_path, *data_subdirectory_parts, file_name)
-            
-            try:
-                # Call the dedicated parser
-                imu_traces[name_in_model] = IMUTrace._parse_imu_txt_file(file_path)
-            except FileNotFoundError:
-                print(f"Warning: File {file_path} not found. Skipping sensor {sensor_name} ('{name_in_model}').")
-        
-        return imu_traces
-    
-    @staticmethod
-    def load_IMUTraces_from_Al_Borno_folder(imu_folder_path: str) -> Dict[str, 'IMUTrace']:
-        """
-        Loads IMU traces from a folder structured like the Al Borno et al (2022) dataset.
-
-        This is a convenience wrapper for `_load_imu_traces_from_structure`
-        with the subdirectory path hard-coded to `['xsens', 'LowerExtremity']`.
-
-        Args:
-            imu_folder_path (str): The path to the root folder of a specific trial.
-
-        Returns:
-            Dict[str, 'IMUTrace']: A dictionary mapping 'name_in_model' to its IMUTrace.
-        """
-        # Define the specific subdirectory path for this dataset
-        subdir_parts = ['xsens', 'LowerExtremity']
-        return IMUTrace._load_imu_traces_from_structure(imu_folder_path, subdir_parts)
-
-    @staticmethod
-    def load_IMUTraces_from_Skov_folder(imu_folder_path: str) -> Dict[str, 'IMUTrace']:
-        """
-        Loads IMU traces from a folder structured for the dataset presented in Skov et al (2025).
-
-        This is a convenience wrapper for `_load_imu_traces_from_structure`
-        with the subdirectory path hard-coded to `['imu data']`.
-
-        Args:
-            imu_folder_path (str): The path to the root folder of a specific trial.
-
-        Returns:
-            Dict[str, 'IMUTrace']: A dictionary mapping 'name_in_model' to its IMUTrace.
-        """
-        # Note: I renamed this from 'load_IMUTraces_from_folder' to
-        # 'load_IMUTraces_from_Skov_folder' to be more specific,
-        # matching its docstring and the Al_Borno function.
-        
-        # Define the specific subdirectory path for this dataset
-        subdir_parts = ['imu data']
-        return IMUTrace._load_imu_traces_from_structure(imu_folder_path, subdir_parts)
     
     def find_spheroidal_joint_offset(self,
                                      other: 'IMUTrace',
@@ -671,16 +510,15 @@ class IMUTrace:
 
         # Pre-compute gyro derivatives (angular acceleration) for all samples
         # This returns (N_full, 3) NumPy arrays
-        g1_dot_full = np.array(self._finite_difference_gyros())
-        g2_dot_full = np.array(other._finite_difference_gyros())
+        g1_dot_full = self._finite_difference_gyros()
+        g2_dot_full = other._finite_difference_gyros()
 
         # Subsample data to speed up computation.
-        # This converts from List[np.ndarray] to a single (N, 3) np.ndarray
         indices = np.arange(0, len(self), subsample_rate)
-        g1 = np.array(self.gyro)[indices]    # (N, 3)
-        g2 = np.array(other.gyro)[indices]   # (N, 3)
-        a1 = np.array(self.acc)[indices]     # (N, 3)
-        a2 = np.array(other.acc)[indices]     # (N, 3)
+        g1 = self.gyro[indices]    # (N, 3)
+        g2 = other.gyro[indices]   # (N, 3)
+        a1 = self.acc[indices]     # (N, 3)
+        a2 = other.acc[indices]    # (N, 3)
         g1_dot = g1_dot_full[indices]        # (N, 3)
         g2_dot = g2_dot_full[indices]        # (N, 3)
 

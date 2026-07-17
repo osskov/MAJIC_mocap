@@ -4,16 +4,16 @@ from scipy.linalg import logm, expm
 from scipy.spatial.transform import Rotation
 
 
-def finite_difference_rotations(rotation_matrices: List[np.ndarray], timestamps: np.ndarray) -> List[np.ndarray]:
+def finite_difference_rotations(rotation_matrices: List[np.ndarray], timestamps: np.ndarray) -> np.ndarray:
     """
     Computes the rotation rate (angular velocity) from a list of rotation matrices over time using finite differencing.
     :param rotation_matrices: List of 3x3 rotation matrices. These are assumed to all be in the same static frame, such
     as the world frame. So they're all R_wb, where w is the world frame and b is the body frame.
     :param timestamps: Array of timestamps corresponding to the rotation matrices.
-    :return: List of angular velocity vectors.
+    :return: Array of angular velocity vectors.
     """
     if len(rotation_matrices) < 2:
-        return [np.zeros(3)] * max(1, len(rotation_matrices))
+        return np.zeros((max(1, len(rotation_matrices)), 3))
         
     R = np.array(rotation_matrices)
     R_prev_T = R[:-1].transpose((0, 2, 1))
@@ -27,8 +27,7 @@ def finite_difference_rotations(rotation_matrices: List[np.ndarray], timestamps:
     
     omegas = Rotation.from_matrix(R_rel).as_rotvec() / dts[:, None]
     
-    angular_velocities = list(omegas)
-    angular_velocities.append(angular_velocities[-1])
+    angular_velocities = np.vstack([omegas, omegas[-1:]])
     return angular_velocities
 
 
@@ -139,9 +138,8 @@ def calculate_best_fit_rotation(parent_vectors: List[np.ndarray], child_vectors:
     if len(parent_vectors) != len(child_vectors):
         raise ValueError("Parent and child vectors must be the same length.")
 
-    X_pc = np.zeros((3, 3))
-    for parent, child in zip(parent_vectors, child_vectors):
-        X_pc += np.outer(parent, child)
+    # Vectorized sum of outer products: P.T @ C (shape: 3x3)
+    X_pc = np.asarray(parent_vectors).T @ np.asarray(child_vectors)
 
     u, s, vh = np.linalg.svd(X_pc, full_matrices=True)
     scales = np.eye(3)

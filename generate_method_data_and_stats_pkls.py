@@ -1,3 +1,5 @@
+from src.toolchest.dataset_loaders import parse_sto_file
+from src.toolchest.dataset_loaders import load_trial_from_folder
 from src.toolchest.PlateTrial import PlateTrial
 from src.toolchest.WorldTrace import WorldTrace
 from scipy.spatial.transform import Rotation
@@ -6,6 +8,7 @@ import numpy as np
 import pandas as pd
 import os
 from generate_method_orientation_sto_files import JOINT_SEGMENT_DICT
+from concurrent.futures import ProcessPoolExecutor
 
 
 ALL_SUBJECTS = ["Subject01", "Subject02", "Subject03", "Subject04", "Subject05", "Subject06",
@@ -22,9 +25,7 @@ ALL_TRIAL_TYPES = ['walking', 'complexTasks']
 REGENERATE_FILES = True
 BASE_DATA_PATH = os.path.abspath(os.path.join("data"))
 
-# ------------------------------------------------
-
-# --- Data Loading Functions (Refactored) ---
+# --- [Original Data Loading and Calculation Functions remain the same] ---
 
 def get_joint_traces_df(plate_trials: List['PlateTrial']) -> pd.DataFrame:
     """
@@ -84,6 +85,14 @@ def get_joint_traces_df(plate_trials: List['PlateTrial']) -> pd.DataFrame:
     
     return final_df
 
+def load_WorldTraces_from_folder(folder_path: str) -> Dict[str, WorldTrace]:
+    from src.toolchest.dataset_loaders import _load_world_traces_from_mapping_file_and_folder
+    parent_dir = os.path.dirname(folder_path)
+    mapping_file = next((os.path.join(parent_dir, f) for f in os.listdir(parent_dir) if f.endswith('.xml')), None)
+    if mapping_file is None:
+        raise FileNotFoundError(f"No mapping file (.xml) found in parent directory: {parent_dir}")
+    return _load_world_traces_from_mapping_file_and_folder(folder_path, mapping_file)
+
 def load_joint_traces_for_subject_df(subject_id: str, 
                                      trial_type: str,
                                      methods: List[str] = ['Marker', 'Madgwick', 'Mag Free', 'Never Project']
@@ -94,7 +103,7 @@ def load_joint_traces_for_subject_df(subject_id: str,
     """
     try:
         plate_trials_by_method: Dict[str, List['PlateTrial']] = {}
-        plate_trials_by_method['Marker'] = PlateTrial.load_trial_from_folder(
+        plate_trials_by_method['Marker'] = load_trial_from_folder(
                         os.path.join("data", subject_id, trial_type)
                     )
         imu_traces = {trial.name: trial.imu_trace.copy() for trial in plate_trials_by_method['Marker']}
@@ -105,11 +114,11 @@ def load_joint_traces_for_subject_df(subject_id: str,
                 continue
             else:
                 if method == 'Madgwick (Al Borno)':
-                    world_traces = WorldTrace.load_WorldTraces_from_folder(
+                    world_traces = load_WorldTraces_from_folder(
                         os.path.abspath(os.path.join("data", subject_id, trial_type, "madgwick (al borno)"))
                     )
                 else:
-                    world_traces = WorldTrace.load_from_sto_file(
+                    world_traces = parse_sto_file(
                         os.path.abspath(os.path.join("data", subject_id, trial_type, f"{trial_type}_orientations_{method.replace(' ', '_').lower()}.sto"))
                     )
                 plate_trials_by_method[method] = PlateTrial.generate_plate_from_traces(imu_traces, world_traces, align_plate_trials=False)
@@ -162,7 +171,7 @@ def load_joint_traces_for_subject_df(subject_id: str,
     print(f"Final DataFrame for {subject_id} has {len(final_df)} rows and columns: {final_df.columns.tolist()}")
     return final_df
 
-# --- Calculation Functions (Refactored) ---
+
 def get_summary_statistics(all_data_df: pd.DataFrame, 
                            group_by: List[str]) -> pd.DataFrame:
     """
@@ -425,63 +434,163 @@ def get_pearson_correlation_summary(all_data_df: pd.DataFrame, group_by: List[st
     print("--- [get_pearson_correlation_summary] Finished. Returning correlation DataFrame. ---")
     return correlation_df
 
+
+# --- NEW FUNCTION FOR UPDATING A SINGLE METHOD ---
+
+def load_single_subject_trial(subject_id: str, trial_type: str, methods: List[str]):
+    print(f"--- Loading and processing {subject_id} - {trial_type} ---")
+    try:
+        subject_df = load_joint_traces_for_subject_df(
+            subject_id=subject_id,
+            methods=methods,
+            trial_type=trial_type
+        )
+        return subject_df
+    except Exception as e:
+        print(f"Error processing {subject_id} - {trial_type}: {e}")
+        return pd.DataFrame()
+
+def update_specific_method(method_to_update: str, 
+                           subjects: List[str] = ALL_SUBJECTS, 
+                           trial_types: List[str] = ALL_TRIAL_TYPES):
+    """
+    Regenerates data for a single specified method and updates the main data files.
+
+    This function loads the existing main DataFrame, removes all entries for
+    the specified method, regenerates the data for that method from the source
+    .sto file for all subjects and trial types, and then merges it back into
+    the main DataFrame. Finally, it re-calculates and saves the summary
+    statistics and correlation files.
+
+    Args:
+        method_to_update (str): The name of the method to update (e.g., 'Mag Adapt').
+        subjects (List[str]): A list of subject IDs to process.
+        trial_types (List[str]): A list of trial types to process.
+    """
+    print(f"--- Starting update process for method: '{method_to_update}' ---")
+    
+    main_data_path = os.path.join(BASE_DATA_PATH, "all_subject_data.pkl")
+    
+    # 1. Load existing main DataFrame
+    if not os.path.exists(main_data_path):
+        print(f"Error: Main data file not found at {main_data_path}. Please run the full regeneration first.")
+        return
+
+    print(f"Loading existing data from {main_data_path}...")
+    all_data_df = pd.read_pickle(main_data_path)
+    
+    # 2. Remove the old data for the specified method
+    # Ensure the index is what we expect before trying to access levels
+    if 'method' not in all_data_df.index.names:
+        print("Error: 'method' is not a level in the DataFrame's index. Aborting.")
+        return
+
+    original_rows = len(all_data_df)
+    # Use a boolean mask to filter out the method to update
+    data_to_keep = all_data_df[all_data_df.index.get_level_values('method') != method_to_update]
+    removed_rows = original_rows - len(data_to_keep)
+    print(f"Removed {removed_rows} rows corresponding to method '{method_to_update}'.")
+
+    # 3. Loop, regenerate, and collect new data for the method in parallel
+    tasks = []
+    for trial_type in trial_types:
+        for subject_id in subjects:
+            methods_to_process = ['Marker', method_to_update]
+            tasks.append((subject_id, trial_type, methods_to_process))
+
+    newly_generated_dfs = []
+    print(f"Starting parallel load for {len(tasks)} tasks...")
+    with ProcessPoolExecutor() as executor:
+        futures = [executor.submit(load_single_subject_trial, *task) for task in tasks]
+        for future in futures:
+            subject_df = future.result()
+            if not subject_df.empty:
+                # Filter to get only the data for the method we are updating
+                method_specific_df = subject_df[subject_df.index.get_level_values('method') == method_to_update]
+                if not method_specific_df.empty:
+                    newly_generated_dfs.append(method_specific_df)
+                    print(f"Successfully regenerated rows for '{method_to_update}'.")
+
+    if not newly_generated_dfs:
+        print(f"Update failed: No new data could be generated for method '{method_to_update}'.")
+        return
+
+
+    # 4. Concatenate old data with the newly generated data
+    print("Combining existing data with newly generated data...")
+    updated_all_data_df = pd.concat([data_to_keep] + newly_generated_dfs).sort_index()
+
+    # 5. Save the updated main DataFrame
+    updated_all_data_df.to_pickle(main_data_path)
+    print(f"Successfully updated and saved main data to {main_data_path}. Total rows: {len(updated_all_data_df)}")
+
+    # 6. Recalculate and save summary statistics and correlations
+    print("\n--- Recalculating summary statistics... ---")
+    stats_file_path = os.path.join(BASE_DATA_PATH, "all_subject_statistics.pkl")
+    summary_stats_df = get_summary_statistics(
+        updated_all_data_df,
+        group_by=['trial_type', 'method', 'joint_name', 'subject']
+    )
+    summary_stats_df.to_pickle(stats_file_path)
+    summary_stats_df.to_csv(os.path.join(BASE_DATA_PATH, "all_subject_statistics.csv"))
+    print("Updated summary statistics have been saved.")
+
+    print("\n--- Recalculating Pearson correlation... ---")
+    pearson_corr_file_path = os.path.join(BASE_DATA_PATH, "all_subject_pearson_correlation.pkl")
+    pearson_corr_df = get_pearson_correlation_summary(
+        updated_all_data_df,
+        group_by=['trial_type', 'method', 'joint_name', 'subject']
+    )
+    pearson_corr_df.to_pickle(pearson_corr_file_path)
+    pearson_corr_df.to_csv(os.path.join(BASE_DATA_PATH, "all_subject_pearson_correlation.csv"))
+    print("Updated Pearson correlation data have been saved.")
+    
+    print(f"\n--- Update complete for method: '{method_to_update}' ---")
+
+
 # --- Main Execution ---
 
 if __name__ == "__main__":
     
-    # ------------------ CONTROL FLAG ------------------
+    # ------------------ CONTROL FLAGS ------------------
     # Set to True to force regeneration of all data files from source.
-    # Set to False to load existing .pkl files if they are available.
+    REGENERATE_ALL = True
+    # Set to True to update only one specific method. REGENERATE_ALL should be False.
+    UPDATE_ONE_METHOD = False
+    METHOD_TO_UPDATE = 'Mag Adapt'
     # ----------------------------------------------------
-
-    # 1. Define the parameters
-    SUBJECT_IDS: List[str] = ALL_SUBJECTS
-    METHODS: List[str] = ALL_METHODS
-    JOINTS = ALL_JOINTS
-    TRIAL_TYPES = ALL_TRIAL_TYPES
-
-    # Create directories if they don't exist
-    os.makedirs("plots", exist_ok=True)
-    os.makedirs(os.path.join("data"), exist_ok=True)
-
-    data_file_path = os.path.join(BASE_DATA_PATH, f"all_subject_data.pkl")
     
-    if not REGENERATE_FILES and os.path.exists(data_file_path):
-        print(f"Loading existing DataFrame from {data_file_path}...")
-        all_data_df = pd.read_pickle(data_file_path)
-    else:
-        if REGENERATE_FILES:
-            print("--- REGENERATE_FILES is True. Forcing regeneration of all data. ---")
+    if UPDATE_ONE_METHOD and not REGENERATE_ALL:
+        # Call the new update function
+        update_specific_method(method_to_update=METHOD_TO_UPDATE)
+
+    elif REGENERATE_ALL:
+        # This block contains the original full regeneration logic
+        SUBJECT_IDS: List[str] = ALL_SUBJECTS
+        METHODS: List[str] = ALL_METHODS
+        TRIAL_TYPES = ALL_TRIAL_TYPES
+
+        os.makedirs("plots", exist_ok=True)
+        os.makedirs(os.path.join("data"), exist_ok=True)
+
+        data_file_path = os.path.join(BASE_DATA_PATH, f"all_subject_data.pkl")
         
-        # 2. Loop, load, and collect
-        all_subject_dfs = []
+        # This part of the logic is now inside the REGENERATE_ALL flag
+        print("--- REGENERATE_ALL is True. Forcing regeneration of all data. ---")
+        
+        tasks = []
         for trial_type in TRIAL_TYPES:
             for subject_id in SUBJECT_IDS:
-                subject_pkl_path = os.path.abspath(os.path.join("data", subject_id, trial_type, f"{subject_id}_{trial_type}_data.pkl"))
-                print(f"--- Processing {subject_id} - {trial_type} ---")
+                tasks.append((subject_id, trial_type, METHODS))
 
-                if not REGENERATE_FILES and os.path.exists(subject_pkl_path):
-                    print(f"Data for {subject_id} - {trial_type} already exists. Loading from pickle...")
-                    subject_df = pd.read_pickle(subject_pkl_path)
-                else:
-                    print(f"Loading and processing from source for {subject_id} - {trial_type}...")
-                    try:
-                        # Call refactored function (no euler_order)
-                        subject_df = load_joint_traces_for_subject_df(
-                            subject_id=subject_id,
-                            methods=METHODS,
-                            trial_type=trial_type
-                        )
-                        if not subject_df.empty:
-                            subject_df.to_pickle(subject_pkl_path)
-                    except Exception as e:
-                        print(f"Error processing {subject_id}: {e}. Skipping subject.")
-                        continue
-                
+        all_subject_dfs = []
+        print(f"Starting parallel load for {len(tasks)} tasks...")
+        with ProcessPoolExecutor() as executor:
+            futures = [executor.submit(load_single_subject_trial, *task) for task in tasks]
+            for future in futures:
+                subject_df = future.result()
                 if not subject_df.empty:
                     all_subject_dfs.append(subject_df)
-                else:
-                    print(f"No data returned for {subject_id}, skipping.")
 
         if not all_subject_dfs:
             print("No data was loaded for any subject. Exiting.")
@@ -491,50 +600,34 @@ if __name__ == "__main__":
         all_data_df = pd.concat(all_subject_dfs)
         all_data_df.to_pickle(data_file_path)
         print(f"DataFrame saved to {data_file_path}")  
-    
-    print("Data loading and concatenation complete.")
-    print("\nDataFrame Info:")
-    all_data_df.info()
-    print(f"\nDataFrame Columns: {all_data_df.columns.tolist()}")
-    print(f"DataFrame Index: {all_data_df.index.names}")
-
-
-    # --- Get Summary Statistics ---
-    stats_file_path = os.path.join(BASE_DATA_PATH, f"all_subject_statistics.pkl")
-    if not REGENERATE_FILES and os.path.exists(stats_file_path):
-        print(f"Loading existing summary statistics from {stats_file_path}...")
-        summary_stats_df = pd.read_pickle(stats_file_path)
-    else:
-        if REGENERATE_FILES:
-            print("--- REGENERATE_FILES is True. Forcing regeneration of summary statistics. ---")
+        
+        print("Data loading and concatenation complete.")
+        print("\nDataFrame Info:")
+        all_data_df.info()
+        
+        # --- Get Summary Statistics ---
+        print("\n--- Generating summary statistics... ---")
+        stats_file_path = os.path.join(BASE_DATA_PATH, f"all_subject_statistics.pkl")
         summary_stats_df = get_summary_statistics(
             all_data_df,
-            # Note: 'subject_id' in the index is renamed to 'subject' by the function
             group_by=['trial_type', 'method', 'joint_name', 'subject']
         )
         summary_stats_df.to_pickle(stats_file_path)
+        summary_stats_df.to_csv(os.path.join(BASE_DATA_PATH, f"all_subject_statistics.csv"))
+        print("\nSummary Statistics Head:")
+        print(summary_stats_df.head())
 
-    print("Summary statistics calculation complete.")
-    summary_stats_df.to_csv(os.path.join(BASE_DATA_PATH, f"all_subject_statistics.csv"))
-    print("\nSummary Statistics Head:")
-    print(summary_stats_df.head())
-
-    # --- Get Pearson Correlation Summary ---
-    pearson_corr_file_path = os.path.join(BASE_DATA_PATH, f"all_subject_pearson_correlation.pkl")
-    if not REGENERATE_FILES and os.path.exists(pearson_corr_file_path):
-        print(f"Loading existing Pearson correlation data from {pearson_corr_file_path}...")
-        pearson_corr_df = pd.read_pickle(pearson_corr_file_path)
-    else:
-        if REGENERATE_FILES:
-            print("--- REGENERATE_FILES is True. Forcing regeneration of Pearson correlation. ---")
+        # --- Get Pearson Correlation Summary ---
+        print("\n--- Generating Pearson correlation summary... ---")
+        pearson_corr_file_path = os.path.join(BASE_DATA_PATH, f"all_subject_pearson_correlation.pkl")
         pearson_corr_df = get_pearson_correlation_summary(
             all_data_df,
-            # Note: 'subject_id' in the index is renamed to 'subject' by the function
             group_by=['trial_type', 'method', 'joint_name', 'subject']
         )
         pearson_corr_df.to_pickle(pearson_corr_file_path)
+        pearson_corr_df.to_csv(os.path.join(BASE_DATA_PATH, f"all_subject_pearson_correlation.csv"))
+        print("\nPearson Correlation Head:")
+        print(pearson_corr_df.head())
 
-    print("Pearson correlation calculation complete.")
-    pearson_corr_df.to_csv(os.path.join(BASE_DATA_PATH, f"all_subject_pearson_correlation.csv"))
-    print("\nPearson Correlation Head:")
-    print(pearson_corr_df.head())
+    else:
+        print("No action taken. Set either REGENERATE_ALL or UPDATE_ONE_METHOD to True.")

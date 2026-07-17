@@ -9,11 +9,7 @@ from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 from tqdm.auto import tqdm  # Import tqdm for progress bars
 
-IMU_TO_TRC_NAME_MAP = {
-    'pelvis_imu': 'Pelvis_IMU', 'femur_r_imu': 'R.Femur_IMU', 'femur_l_imu': 'L.Femur_IMU',
-    'tibia_r_imu': 'R.Tibia_IMU', 'tibia_l_imu': 'L.Tibia_IMU', 'calcn_r_imu': 'R.Foot_IMU',
-    'calcn_l_imu': 'L.Foot_IMU', 'torso_imu': 'Back_IMU'
-}
+
 
 class PlateTrial:
     """
@@ -131,11 +127,11 @@ class PlateTrial:
         
         # 3. Apply this static rotation to all orientations in the world trace.
         #    new_R_world = old_R_world @ R_wt_it
-        world_rots_np = np.array(self.world_trace.rotations)
+        world_rots_np = self.world_trace.rotations
         new_world_rotations = np.matmul(world_rots_np, R_wt_it)
         
         # 4. Create a new WorldTrace and PlateTrial with the aligned data.
-        new_world_trace = WorldTrace(self.world_trace.timestamps, self.world_trace.positions, list(new_world_rotations))
+        new_world_trace = WorldTrace(self.world_trace.timestamps, self.world_trace.positions, new_world_rotations)
         return PlateTrial(self.name, self.imu_trace, new_world_trace)
 
     def project_imu_trace(self, local_offset: np.ndarray) -> IMUTrace:
@@ -177,7 +173,7 @@ class PlateTrial:
         Factory method to create a list of PlateTrial objects from raw data.
 
         This function performs the key "data wrangling" steps:
-        1.  Finds matching pairs of IMU and World traces (using IMU_TO_TRC_NAME_MAP).
+        1.  Finds matching pairs of IMU and World traces.
         2.  Resamples IMU data if its frequency doesn't match the World trace.
         3.  Synchronizes the traces in time using cross-correlation of gyro norms.
         4.  (Optionally) Aligns the coordinate frames.
@@ -207,9 +203,8 @@ class PlateTrial:
         print("Processing and synchronizing traces...")
         for imu_name, imu_trace in tqdm(imu_traces.items(), desc="Generating PlateTrials"):
             try:
-                # Find the corresponding world_trace, using the name map as a fallback
-                world_trace = world_traces[imu_name] if imu_name in world_traces \
-                    else world_traces[IMU_TO_TRC_NAME_MAP[imu_name]]
+                # Find the corresponding world_trace using the exact name
+                world_trace = world_traces[imu_name]
             except KeyError:
                 print(f"IMU {imu_name} not found in world traces. Skipping.")
                 continue
@@ -246,76 +241,7 @@ class PlateTrial:
         print(f"Successfully generated {len(plate_trials)} PlateTrials.")
         return plate_trials
 
-    @staticmethod
-    def load_trial_from_Al_Borno_folder(folder_path: str, align_plate_trials=True) -> List['PlateTrial']:
-        """
-        Loads a trial from the "Al Borno" dataset structure.
 
-        Expected folder structure:
-        - [folder_path]/IMU/ (Contains IMU .csv files)
-        - [folder_path]/Mocap/ (Contains motion capture .trc file)
-
-        Args:
-            folder_path (str): The root path to the trial folder.
-            align_plate_trials (bool): If True, aligns sensor and segment frames.
-
-        Returns:
-            List['PlateTrial']: A list of processed PlateTrial objects.
-        """
-        # 1. Load IMU Traces
-        imu_folder = os.path.join(folder_path, 'IMU')
-        imu_traces = IMUTrace.load_IMUTraces_from_Al_Borno_folder(imu_folder)
-
-        # 2. Load World Traces
-        mocap_folder = os.path.join(folder_path, 'Mocap/')
-        # Find the first .trc file that is not a 'static' file
-        trc_file_path = [file for file in os.listdir(mocap_folder) if file.endswith('.trc') and 'static' not in file][0]
-        trc_file_path = os.path.abspath(os.path.join(mocap_folder, trc_file_path))
-        world_traces = WorldTrace.load_from_trc_file(trc_file_path)
-
-        print(f"Loaded {len(imu_traces)} IMU traces and {len(world_traces)} World traces.")
-
-        # 3. Process all traces using the main generation function
-        #    (Progress bar will be shown inside this function)
-        plate_trials = PlateTrial.generate_plate_from_traces(
-            imu_traces, world_traces, align_plate_trials
-        )
-
-        return plate_trials
-    
-    @staticmethod
-    def load_trial_from_folder(folder_path: str, align_plate_trials=True) -> List['PlateTrial']:
-        """
-        Loads a trial from the "Skov" dataset structure (inferred name).
-
-        Expected folder structure:
-        - [folder_path]/imu data/ (Contains IMU files)
-        - [folder_path]/ (Contains motion capture .trc file in the root)
-
-        Args:
-            folder_path (str): The root path to the trial folder.
-            align_plate_trials (bool): If True, aligns sensor and segment frames.
-
-        Returns:
-            List['PlateTrial']: A list of processed PlateTrial objects.
-        """
-        # 1. Load IMU Traces
-        imu_traces = IMUTrace.load_IMUTraces_from_Skov_folder(folder_path)
-
-        # 2. Load World Traces
-        trc_file_path = [file for file in os.listdir(folder_path) if file.endswith('.trc')][0]
-        trc_file_path = os.path.abspath(os.path.join(folder_path, trc_file_path))
-        world_traces = WorldTrace.load_from_trc_file(trc_file_path)
-
-        print(f"Loaded {len(imu_traces)} IMU traces and {len(world_traces)} World traces.")
-
-        # 3. Process all traces using the main generation function
-        #    (Progress bar will be shown inside this function)
-        plate_trials = PlateTrial.generate_plate_from_traces(
-            imu_traces, world_traces, align_plate_trials
-        )
-        
-        return plate_trials
     
     @staticmethod
     def _sync_traces(imu_trace: IMUTrace, world_trace: WorldTrace) -> Tuple[slice, slice]:
@@ -400,11 +326,11 @@ class PlateTrial:
         """
         # R is the rotation from local-to-global (from world_trace)
         # v_global = R @ v_local
-        world_rots = np.array(self.world_trace.rotations)
+        world_rots = self.world_trace.rotations
         
-        rotated_acc = np.einsum('nij,nj->ni', world_rots, np.array(self.imu_trace.acc))
-        rotated_gyro = np.einsum('nij,nj->ni', world_rots, np.array(self.imu_trace.gyro))
-        rotated_mag = np.einsum('nij,nj->ni', world_rots, np.array(self.imu_trace.mag))
+        rotated_acc = np.einsum('nij,nj->ni', world_rots, self.imu_trace.acc)
+        rotated_gyro = np.einsum('nij,nj->ni', world_rots, self.imu_trace.gyro)
+        rotated_mag = np.einsum('nij,nj->ni', world_rots, self.imu_trace.mag)
         
         return IMUTrace(
             timestamps=self.imu_trace.timestamps,
@@ -523,12 +449,12 @@ class PlateTrial:
             print(f"Subsampling data to {len(indices)} points from {len(self.imu_trace.timestamps)} total.")
             
         p_imu_trace = self.get_imu_trace_in_global_frame()
-        g_p_world = np.array(p_imu_trace.gyro)[indices]
-        R_wp = np.array(self.world_trace.rotations)[indices]
+        g_p_world = p_imu_trace.gyro[indices]
+        R_wp = self.world_trace.rotations[indices]
 
         c_imu_trace = other.get_imu_trace_in_global_frame()
-        g_c_world = np.array(c_imu_trace.gyro)[indices]
-        R_wc = np.array(other.world_trace.rotations)[indices]
+        g_c_world = c_imu_trace.gyro[indices]
+        R_wc = other.world_trace.rotations[indices]
 
         w_rel_world = g_c_world - g_p_world
 
@@ -675,13 +601,13 @@ class PlateTrial:
         angle = _generate_smooth_motion_profile(num_samples, duration, max_amp=np.pi)
         R_joint_motion = Rotation.from_euler('z', angle)
 
-        R_parent_matrices = np.stack(self.world_trace.rotations)
+        R_parent_matrices = self.world_trace.rotations
         R_p2j_mat = parent_to_joint_rotation.as_matrix()
         R_c2j_inv_mat = child_to_joint_rotation.as_matrix().T
         R_rel_total_matrices = R_p2j_mat @ R_joint_motion.as_matrix() @ R_c2j_inv_mat
         R_child_matrices = R_parent_matrices @ R_rel_total_matrices
 
-        P_parent = np.stack(self.world_trace.positions)
+        P_parent = self.world_trace.positions
         parent_offset_global = (R_parent_matrices @ joint_center_parent).squeeze()
         child_offset_global = (R_child_matrices @ joint_center_child).squeeze()
         P_child = P_parent + parent_offset_global - child_offset_global
@@ -763,14 +689,14 @@ class PlateTrial:
         R_j1j2_mat = (R_j1 * R_carrying * R_j2).as_matrix()
 
         # === 3. Calculate Child World Rotations ===
-        R_wp = np.stack(self.world_trace.rotations)
+        R_wp = self.world_trace.rotations
         
         # R_child = R_wp @ R_pj1 @ R_j1j2 @ R_j2c
         # (N,3,3) = (N,3,3) @ (3,3) @ (N,3,3) @ (3,3)
         R_wc = R_wp @ R_pj1_mat @ R_j1j2_mat @ R_j2c_mat
 
         # === 4. Calculate Child World Positions ===
-        P_parent = np.stack(self.world_trace.positions)
+        P_parent = self.world_trace.positions
 
         # Apply parent rotation to parent offset vector (for all N samples)
         # 'nij,j->ni' means: (N, 3, 3) @ (3,) -> (N, 3)
@@ -878,13 +804,13 @@ class PlateTrial:
         angles = [_generate_smooth_motion_profile(num_samples, duration, max_amp=np.pi/2) for _ in range(3)]
         R_joint_motion = Rotation.from_euler('zyx', np.vstack(angles).T)
 
-        R_parent_matrices = np.stack(self.world_trace.rotations)
+        R_parent_matrices = self.world_trace.rotations
         R_p2j_mat = parent_to_joint_rotation.as_matrix()
         R_c2j_inv_mat = child_to_joint_rotation.as_matrix().T
         R_rel_total_matrices = R_p2j_mat @ R_joint_motion.as_matrix() @ R_c2j_inv_mat
         R_child_matrices = R_parent_matrices @ R_rel_total_matrices
 
-        P_parent = np.stack(self.world_trace.positions)
+        P_parent = self.world_trace.positions
         parent_offset_global = (R_parent_matrices @ joint_center_parent).squeeze()
         child_offset_global = (R_child_matrices @ joint_center_child).squeeze()
         P_child = P_parent + parent_offset_global - child_offset_global

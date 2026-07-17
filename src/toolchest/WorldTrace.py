@@ -1,6 +1,6 @@
 import os
 from .IMUTrace import IMUTrace
-from typing import List, Tuple
+from typing import List, Tuple, Union
 import numpy as np
 from .finite_difference_utils import central_difference
 from .gyro_utils import finite_difference_rotations
@@ -43,10 +43,10 @@ class WorldTrace:
     Or, it can generate a synthetic trace by finite differencing the world frames over time.
     """
 
-    def __init__(self, timestamps: np.ndarray, positions: List[np.ndarray], rotations: List[np.ndarray]):
+    def __init__(self, timestamps: np.ndarray, positions: Union[List[np.ndarray], np.ndarray], rotations: Union[List[np.ndarray], np.ndarray]):
         self.timestamps = timestamps
-        self.positions = positions
-        self.rotations = rotations
+        self.positions = np.asarray(positions)
+        self.rotations = np.asarray(rotations)
 
     def __len__(self):
         """
@@ -62,8 +62,8 @@ class WorldTrace:
             raise ValueError(f"WorldTraces must have the same length to subtract them. Got self {len(self)} and other {len(other)}.")
         assert np.array_equal(self.timestamps[0],
                               other.timestamps[0]), "WorldTraces must have the same start time to subtract them."
-        return WorldTrace(self.timestamps, [np.array(pos1) - np.array(pos2) for pos1, pos2 in zip(self.positions, other.positions)],
-                          [rot1 @ rot2.T for rot1, rot2 in zip(self.rotations, other.rotations)])
+        return WorldTrace(self.timestamps, self.positions - other.positions,
+                          np.matmul(self.rotations, other.rotations.transpose(0, 2, 1)))
 
     def __getitem__(self, key) -> 'WorldTrace':
         """
@@ -75,8 +75,8 @@ class WorldTrace:
             # If key is a slice object, return a new WorldTrace instance with the sliced items
             return WorldTrace(self.timestamps[key], self.positions[key], self.rotations[key])
         else:
-            # If key is an integer, return the corresponding item as a solo list
-            return WorldTrace(np.array([self.timestamps[key]]), [self.positions[key]], [self.rotations[key]])
+            # If key is an integer, return the corresponding item as a length 1 trace
+            return WorldTrace(np.array([self.timestamps[key]]), self.positions[key:key+1], self.rotations[key:key+1])
 
     def __eq__(self, other):
         """
@@ -87,19 +87,19 @@ class WorldTrace:
             return False
         if len(self) != len(other):
             return False
-        if self.positions[0].shape != other.positions[0].shape or self.rotations[0].shape != other.rotations[0].shape:
+        if self.positions.shape[0] != other.positions.shape[0] or self.rotations.shape[0] != other.rotations.shape[0]:
             return False
-        return ((self.timestamps == other.timestamps).all() and
-                all(np.all(self.positions[i] == other.positions[i]) for i in range(len(self.positions))) and
-                all(np.all(self.rotations[i] == other.rotations[i]) for i in range(len(self.rotations))))
+        return (np.array_equal(self.timestamps, other.timestamps) and
+                np.array_equal(self.positions, other.positions) and
+                np.array_equal(self.rotations, other.rotations))
 
     def transform(self, rotate: np.ndarray = np.eye(3), translate: np.ndarray = np.zeros(3)) -> 'WorldTrace':
         """
         This function transforms the WorldTrace by rotating and translating the positions and rotations.
         """
         return WorldTrace(self.timestamps,
-                          [rotate @ pos + translate for pos in self.positions],
-                          [rotate @ rot for rot in self.rotations])
+                          np.einsum('ij,nj->ni', rotate, self.positions) + translate,
+                          np.matmul(rotate, self.rotations))
 
     def allclose(self, other, atol=1e-6):
         """
@@ -110,12 +110,11 @@ class WorldTrace:
             return False
         if len(self) != len(other):
             return False
-        if self.positions[0].shape != other.positions[0].shape or self.rotations[0].shape != other.rotations[0].shape:
+        if self.positions.shape[0] != other.positions.shape[0] or self.rotations.shape[0] != other.rotations.shape[0]:
             return False
         return (np.allclose(self.timestamps, other.timestamps, atol=atol) and
-                all(np.allclose(self.positions[i], other.positions[i], atol=atol) for i in
-                    range(len(self.positions))) and
-                all(np.allclose(self.rotations[i], other.rotations[i], atol=atol) for i in range(len(self.rotations))))
+                np.allclose(self.positions, other.positions, atol=atol) and
+                np.allclose(self.rotations, other.rotations, atol=atol))
     
     def copy(self) -> 'WorldTrace':
         """
@@ -123,8 +122,8 @@ class WorldTrace:
         """
         return WorldTrace(
             self.timestamps.copy(),
-            [pos.copy() for pos in self.positions],
-            [rot.copy() for rot in self.rotations]
+            self.positions.copy(),
+            self.rotations.copy()
         )
     
     def resample(self, new_frequency: float) -> 'WorldTrace':
@@ -167,16 +166,13 @@ class WorldTrace:
                                    step=new_dt)
 
         # 2. Interpolate Positions (Linear Interpolation)
-        # Convert list of 3-vectors to a (N, 3) NumPy array for interpolation
-        original_positions_np = np.array(self.positions)
-
         # Create interpolation functions for each dimension (x, y, z)
-        interp_x = np.interp(new_timestamps, original_timestamps, original_positions_np[:, 0])
-        interp_y = np.interp(new_timestamps, original_timestamps, original_positions_np[:, 1])
-        interp_z = np.interp(new_timestamps, original_timestamps, original_positions_np[:, 2])
+        interp_x = np.interp(new_timestamps, original_timestamps, self.positions[:, 0])
+        interp_y = np.interp(new_timestamps, original_timestamps, self.positions[:, 1])
+        interp_z = np.interp(new_timestamps, original_timestamps, self.positions[:, 2])
 
-        # Combine interpolated axes back into a list of 3-vectors
-        new_positions = [np.array([x, y, z]) for x, y, z in zip(interp_x, interp_y, interp_z)]
+        # Combine interpolated axes back into a single array
+        new_positions = np.column_stack((interp_x, interp_y, interp_z))
 
         # 3. Interpolate Rotations (SLERP via Quaternions)
         # Convert 3x3 rotation matrices to quaternions (x, y, z, w)
@@ -191,24 +187,21 @@ class WorldTrace:
         slerp = Slerp(original_timestamps, original_rotations)
         new_rotations_obj = slerp(new_timestamps)
 
-        # Convert interpolated Rotation objects back to a list of 3x3 matrices
-        new_rotations = [rot.copy() for rot in new_rotations_obj.as_matrix()]
+        # Convert interpolated Rotation objects back to an array of 3x3 matrices
+        new_rotations = new_rotations_obj.as_matrix().copy()
 
         # 4. Return the new WorldTrace
         return WorldTrace(new_timestamps, new_positions, new_rotations)
 
-    def finite_difference_world_frame_accelerations(self, acc_from_gravity: np.ndarray = np.zeros(3)) -> List[
-        np.ndarray]:
+    def finite_difference_world_frame_accelerations(self, acc_from_gravity: np.ndarray = np.zeros(3)) -> np.ndarray:
         """
         This function computes the acceleration of the world frame by finite differencing the positions.
         """
         acc_axis = []
         for axis in range(3):
-            vel_axis = central_difference(np.array([pos[axis] for pos in self.positions]), self.timestamps)
-            acc_axis.append(central_difference(np.array(vel_axis), self.timestamps))
-        # Convert back to a list of 3-vectors
-        return [np.array([acc_axis[0][i], acc_axis[1][i], acc_axis[2][i]]) + acc_from_gravity for i in
-                range(len(acc_axis[0]))]
+            vel_axis = central_difference(self.positions[:, axis], self.timestamps)
+            acc_axis.append(central_difference(vel_axis, self.timestamps))
+        return np.column_stack(acc_axis) + acc_from_gravity
 
     def calculate_imu_trace(self,
                             acc_from_gravity: np.ndarray = np.zeros(3),
@@ -221,11 +214,11 @@ class WorldTrace:
         if not skip_lin_acc:
             world_acc = self.finite_difference_world_frame_accelerations(acc_from_gravity)
             world_acc_np = np.array(world_acc)
-            local_acc = np.einsum('nji,nj->ni', rotations_np, world_acc_np).tolist()
+            local_acc = np.einsum('nji,nj->ni', rotations_np, world_acc_np)
         else:
-            local_acc = np.einsum('nji,j->ni', rotations_np, acc_from_gravity).tolist()
+            local_acc = np.einsum('nji,j->ni', rotations_np, acc_from_gravity)
         assert isinstance(magnetic_field, np.ndarray)
-        local_mag = np.einsum('nji,j->ni', rotations_np, magnetic_field).tolist()
+        local_mag = np.einsum('nji,j->ni', rotations_np, magnetic_field)
         local_gyros = finite_difference_rotations(self.rotations, self.timestamps)
         return IMUTrace(self.timestamps, local_gyros, local_acc, local_mag)
 
@@ -235,91 +228,6 @@ class WorldTrace:
         """
         return WorldTrace(self.timestamps - self.timestamps[0], self.positions, self.rotations)
 
-    @staticmethod
-    def load_from_trc_file(trc_file: str, max_trc_timestamp=-1.0) -> dict[str, 'WorldTrace']:
-        """
-        This function loads a list of WorldTrace instances from a folder. Each file in the folder should contain a
-        WorldTrace instance saved with numpy.savez.
-        """
-        if trc_file is None or os.path.isfile(trc_file) is False or not trc_file.endswith('.trc'):
-            raise FileNotFoundError("No TRC file found.")
-
-        with open(trc_file, 'r') as file:
-            lines = file.readlines()
-
-        headers = lines[3].strip().split('\t')
-        imu_headers = [header for header in headers if ('_O' in header or '_3' in header)]
-        data = [line.strip().split('\t') for line in lines[6:]]  # Skip empty line and read the data
-        data = np.array(data, dtype=float)
-        timestamps = data[:, 1]
-
-        if max_trc_timestamp > 0.0:
-            first_exceeding_timestamp = np.argmax(timestamps > max_trc_timestamp)
-            if first_exceeding_timestamp > 0:
-                print(f"Trimming TRC data to {first_exceeding_timestamp} samples in order to stay below the cutoff timestamp of {max_trc_timestamp}")
-                data = data[:first_exceeding_timestamp]
-                timestamps = timestamps[:first_exceeding_timestamp]
-
-        # assert each timestamp is unique
-        assert len(np.unique(timestamps)) == len(timestamps), "Timestamps must be unique."
-
-        world_traces = {}
-
-        for i, imu_o_name in enumerate(imu_headers):
-            if '_O' in imu_o_name:
-                imu_o_idx = headers.index(imu_o_name)
-                imu_x_idx = headers.index(imu_o_name.replace('_O', '_X'))
-                imu_y_idx = headers.index(imu_o_name.replace('_O', '_Y'))
-                imu_d_idx = headers.index(imu_o_name.replace('_O', '_D'))
-            else:
-                assert '_3' in imu_o_name
-                imu_o_idx = headers.index(imu_o_name)
-                imu_x_idx = headers.index(imu_o_name.replace('_3', '_2'))
-                imu_y_idx = headers.index(imu_o_name.replace('_3', '_4'))
-                imu_d_idx = headers.index(imu_o_name.replace('_3', '_1'))
-
-            # Extracting marker locations
-            imu_o_loc = data[:, imu_o_idx: imu_o_idx + 3]
-            imu_x_loc = data[:, imu_x_idx: imu_x_idx + 3]
-            imu_y_loc = data[:, imu_y_idx: imu_y_idx + 3]
-            imu_d_loc = data[:, imu_d_idx: imu_d_idx + 3]
-
-            if "Foot" in imu_o_name:
-                imu_o_copy = imu_o_loc.copy()
-                imu_o_loc = imu_d_loc
-                imu_d_loc = imu_o_copy
-
-                if "R" in imu_o_name:
-                    imu_x_copy = imu_x_loc.copy()
-                    imu_x_loc = imu_d_loc
-                    imu_d_loc = imu_x_copy
-
-                    imu_y_copy = imu_y_loc.copy()
-                    imu_y_loc = imu_o_loc
-                    imu_o_loc = imu_y_copy
-
-            if "L" in imu_o_name:
-                imu_y_copy = imu_y_loc.copy()
-                imu_y_loc = imu_d_loc
-                imu_d_loc = imu_y_copy
-
-                imu_x_copy = imu_x_loc.copy()
-                imu_x_loc = imu_o_loc
-                imu_o_loc = imu_x_copy
-
-            # Attempt to auto-detect units
-            if np.max(np.abs(imu_o_loc)) > 1000:
-                imu_o_loc /= 1000
-                imu_x_loc /= 1000
-                imu_y_loc /= 1000
-                imu_d_loc /= 1000
-
-            world_traces[imu_o_name.replace('_O', '').replace('_3', '')] = WorldTrace.construct_from_markers(timestamps,
-                                                                                                             imu_o_loc,
-                                                                                                             imu_d_loc,
-                                                                                                             imu_x_loc,
-                                                                                                             imu_y_loc)
-        return world_traces
 
     @staticmethod
     def construct_from_markers(timestamps: np.ndarray, marker_o: np.ndarray, marker_d: np.ndarray, marker_x: np.ndarray,
@@ -365,7 +273,7 @@ class WorldTrace:
 
         error_y = np.linalg.norm(y_axis - y_axis_temp_1, axis=1)
         angle_error = np.arccos(np.clip(np.sum(y_axis * y_axis_temp_1, axis=1), -1, 1)) * 180 / np.pi
-        if np.mean(error_y) > 0.015 or np.mean(angle_error) > 1.0:
+        if np.mean(angle_error) > 1.0:
             # import matplotlib.pyplot as plt
             # fig, ax = plt.subplots(1, 5)
             # ax[0].plot(angle_error)
@@ -390,9 +298,143 @@ class WorldTrace:
 
         # Saving the location of the marker
         loc = (marker_o + marker_d + marker_x + marker_y) / 4
-        loc_list = loc.tolist()
-        R_list = [np.array([x, y, z]).T for x, y, z in zip(x_axis, y_axis, z_axis)]
-        return WorldTrace(timestamps, loc_list, R_list)
+        R_list = np.stack([x_axis, y_axis, z_axis], axis=-1)
+        return WorldTrace(timestamps, loc, R_list)
+
+    @staticmethod
+    def construct_from_markers_robust(timestamps: np.ndarray, marker_o: np.ndarray, marker_d: np.ndarray, marker_x: np.ndarray,
+                                      marker_y: np.ndarray, threshold: float = 5.0) -> 'WorldTrace':
+        """
+        Robust version of construct_from_markers that detects when one of the 4 markers
+        is faulty (e.g. flipped, occluded) using the Marker Fault Isolation Metric, and
+        reconstructs the rigid body coordinate system using only the remaining 3 healthy markers.
+        Fully vectorized via NumPy for high-performance execution.
+        """
+        N = len(timestamps)
+        
+        pos = [marker_o, marker_d, marker_x, marker_y]
+        d = {}
+        bar_d = {}
+        pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+        for i, j in pairs:
+            d[(i, j)] = np.linalg.norm(pos[i] - pos[j], axis=1)
+            bar_d[(i, j)] = np.median(d[(i, j)])
+            
+        e = {}
+        for i, j in pairs:
+            e[(i, j)] = np.abs(d[(i, j)] - bar_d[(i, j)])
+            
+        epsilon = 0.001 # 1mm regularization
+        fault_scores = np.zeros((4, N))
+        for i in range(4):
+            num_pairs = [p for p in pairs if i in p]
+            numerator = np.sum([e[p] for p in num_pairs], axis=0)
+            den_pairs = [p for p in pairs if i not in p]
+            denominator = np.sum([e[p] for p in den_pairs], axis=0)
+            fault_scores[i] = numerator / (denominator + epsilon)
+            
+        # Nominal plate dimensions (medians over the whole trial)
+        w = (bar_d[(1, 2)] + bar_d[(0, 3)]) / 2.0  # (||X-D|| + ||O-Y||) / 2
+        h = (bar_d[(0, 2)] + bar_d[(1, 3)]) / 2.0  # (||O-X|| + ||Y-D||) / 2
+
+        # Precompute Case 0 (O is faulty)
+        x_0 = marker_x - marker_d
+        x_0 = x_0 / np.linalg.norm(x_0, axis=1)[:, None]
+        yt_0 = marker_y - marker_d
+        yt_0 = yt_0 / np.linalg.norm(yt_0, axis=1)[:, None]
+        z_0 = np.cross(x_0, yt_0)
+        z_0 = z_0 / np.linalg.norm(z_0, axis=1)[:, None]
+        y_0 = np.cross(z_0, x_0)
+        # Estimate O: O_est = D + w*x + h*y
+        o_est = marker_d + w * x_0 + h * y_0
+        loc_0 = (o_est + marker_d + marker_x + marker_y) / 4.0
+        rot_0 = np.stack((x_0, y_0, z_0), axis=2)
+
+        # Precompute Case 1 (D is faulty)
+        x_1 = marker_o - marker_y
+        x_1 = x_1 / np.linalg.norm(x_1, axis=1)[:, None]
+        yt_1 = marker_o - marker_x
+        yt_1 = yt_1 / np.linalg.norm(yt_1, axis=1)[:, None]
+        z_1 = np.cross(x_1, yt_1)
+        z_1 = z_1 / np.linalg.norm(z_1, axis=1)[:, None]
+        y_1 = np.cross(z_1, x_1)
+        # Estimate D: D_est = O - w*x - h*y
+        d_est = marker_o - w * x_1 - h * y_1
+        loc_1 = (marker_o + d_est + marker_x + marker_y) / 4.0
+        rot_1 = np.stack((x_1, y_1, z_1), axis=2)
+
+        # Precompute Case 2 (X is faulty)
+        x_2 = marker_o - marker_y
+        x_2 = x_2 / np.linalg.norm(x_2, axis=1)[:, None]
+        yt_2 = marker_y - marker_d
+        yt_2 = yt_2 / np.linalg.norm(yt_2, axis=1)[:, None]
+        z_2 = np.cross(x_2, yt_2)
+        z_2 = z_2 / np.linalg.norm(z_2, axis=1)[:, None]
+        y_2 = np.cross(z_2, x_2)
+        # Estimate X: X_est = Y + w*x - h*y
+        x_est = marker_y + w * x_2 - h * y_2
+        loc_2 = (marker_o + marker_d + x_est + marker_y) / 4.0
+        rot_2 = np.stack((x_2, y_2, z_2), axis=2)
+
+        # Precompute Case 3 (Y is faulty)
+        x_3 = marker_x - marker_d
+        x_3 = x_3 / np.linalg.norm(x_3, axis=1)[:, None]
+        yt_3 = marker_o - marker_x
+        yt_3 = yt_3 / np.linalg.norm(yt_3, axis=1)[:, None]
+        z_3 = np.cross(x_3, yt_3)
+        z_3 = z_3 / np.linalg.norm(z_3, axis=1)[:, None]
+        y_3 = np.cross(z_3, x_3)
+        # Estimate Y: Y_est = X - w*x + h*y
+        y_est = marker_x - w * x_3 + h * y_3
+        loc_3 = (marker_o + marker_d + marker_x + y_est) / 4.0
+        rot_3 = np.stack((x_3, y_3, z_3), axis=2)
+
+        # Precompute Case 4 (Normal - all 4 markers)
+        x_4_1 = marker_x - marker_d
+        x_4_1 = x_4_1 / np.linalg.norm(x_4_1, axis=1)[:, None]
+        x_4_2 = marker_o - marker_y
+        x_4_2 = x_4_2 / np.linalg.norm(x_4_2, axis=1)[:, None]
+        x_4 = (x_4_1 + x_4_2) / 2.0
+        x_4 = x_4 / np.linalg.norm(x_4, axis=1)[:, None]
+        
+        y_4_1 = marker_o - marker_x
+        y_4_1 = y_4_1 / np.linalg.norm(y_4_1, axis=1)[:, None]
+        y_4_2 = marker_y - marker_d
+        y_4_2 = y_4_2 / np.linalg.norm(y_4_2, axis=1)[:, None]
+        yt_4 = (y_4_1 + y_4_2) / 2.0
+        yt_4 = yt_4 / np.linalg.norm(yt_4, axis=1)[:, None]
+        
+        z_4 = np.cross(x_4, yt_4)
+        z_4 = z_4 / np.linalg.norm(z_4, axis=1)[:, None]
+        y_4 = np.cross(z_4, x_4)
+        loc_4 = (marker_o + marker_d + marker_x + marker_y) / 4.0
+        rot_4 = np.stack((x_4, y_4, z_4), axis=2)
+
+        # Determine Case for each timestep
+        max_idx = np.argmax(fault_scores, axis=0)
+        is_faulty = np.max(fault_scores, axis=0) > threshold
+        case_indices = np.where(is_faulty, max_idx, 4)
+
+        # advanced index to select correct cases
+        all_rotations = np.stack((rot_0, rot_1, rot_2, rot_3, rot_4), axis=0)
+        all_positions = np.stack((loc_0, loc_1, loc_2, loc_3, loc_4), axis=0)
+        
+        rotations = all_rotations[case_indices, np.arange(N)]
+        positions = all_positions[case_indices, np.arange(N)]
+        
+        # Alignment warnings (same check as standard construction)
+        y_axis = rotations[:, :, 1]
+        y_axis_temp_1 = marker_o - marker_x
+        y_axis_temp_1 = y_axis_temp_1 / np.linalg.norm(y_axis_temp_1, axis=1)[:, None]
+        
+        error_y = np.linalg.norm(y_axis - y_axis_temp_1, axis=1)
+        angle_error = np.arccos(np.clip(np.sum(y_axis * y_axis_temp_1, axis=1), -1, 1)) * 180 / np.pi
+        
+        if np.mean(angle_error) > 1.0:
+            print(f"Mean angle error: {np.mean(angle_error)}")
+            print(f"Mean norm of y-y_temp: {np.mean(error_y)}")
+            
+        return WorldTrace(timestamps, positions, rotations)
 
         
     @staticmethod
@@ -414,7 +456,7 @@ class WorldTrace:
         pos_x = _generate_smooth_motion_profile(num_samples, duration, max_amp=0.5)
         pos_y = _generate_smooth_motion_profile(num_samples, duration, max_amp=0.3)
         pos_z = _generate_smooth_motion_profile(num_samples, duration, max_amp=0.5)
-        positions = [np.array(p) for p in zip(pos_x, pos_y, pos_z)]
+        positions = np.column_stack((pos_x, pos_y, pos_z))
 
         # --- Generate smooth random orientation ---
         # Create motion profiles for Euler angles
@@ -424,7 +466,7 @@ class WorldTrace:
 
         # Convert Euler angles to a stack of rotation matrices
         rotations_obj = Rotation.from_euler('zyx', np.vstack([rot_z, rot_y, rot_x]).T)
-        rotations = [r.as_matrix() for r in rotations_obj]
+        rotations = rotations_obj.as_matrix()
 
         return WorldTrace(timestamps, positions, rotations)
     
@@ -442,10 +484,10 @@ class WorldTrace:
         nyquist_freq = 0.5 * sample_freq
         cutoff = cutoff_freq / nyquist_freq
         b, a = butter(order, cutoff, btype='low') # type: ignore
-        positions = filtfilt(b, a, self.positions, axis=0).tolist()
+        positions = filtfilt(b, a, self.positions, axis=0)
         angle_axis = Rotation.from_matrix(self.rotations).as_rotvec()
         angle_axis = filtfilt(b, a, angle_axis, axis=0)
-        rotations = Rotation.from_rotvec(angle_axis).as_matrix().tolist()
+        rotations = Rotation.from_rotvec(angle_axis).as_matrix()
         return WorldTrace(self.timestamps, positions, rotations)
 
     def get_rotation_errors_deg(self, other_trace: 'WorldTrace') -> np.ndarray:
@@ -454,7 +496,7 @@ class WorldTrace:
         """
         assert len(self) == len(other_trace), "WorldTraces must have the same length to compare them."
         
-        errors = Rotation.from_matrix([rot1.T @ rot2 for rot1, rot2 in zip(self.rotations, other_trace.rotations)])
+        errors = Rotation.from_matrix(np.matmul(self.rotations.transpose(0, 2, 1), other_trace.rotations))
         angle_axis = errors.as_rotvec()
         angle_deg = np.linalg.norm(angle_axis, axis=1) * 180.0 / np.pi
         return angle_deg
@@ -466,14 +508,14 @@ class WorldTrace:
         assert isinstance(other_world_trace, WorldTrace), "Must pass a WorldTrace instance to compare."
         assert len(self) == len(other_world_trace), "WorldTraces must have the same length to compare them."
 
-        parent_loc = np.array(self.positions)
-        child_loc = np.array(other_world_trace.positions)
+        parent_loc = self.positions
+        child_loc = other_world_trace.positions
 
         r_c_p = parent_loc - child_loc
         r_c_p = r_c_p.flatten()
 
-        R_w_parent = np.concatenate(self.rotations, axis=0)
-        R_w_child = np.concatenate(other_world_trace.rotations, axis=0)
+        R_w_parent = self.rotations.reshape(-1, 3)
+        R_w_child = other_world_trace.rotations.reshape(-1, 3)
         R_w = np.hstack((-R_w_parent, R_w_child))
 
         offsets, res, rank, S = np.linalg.lstsq(R_w, r_c_p, rcond=None)
@@ -551,8 +593,8 @@ class WorldTrace:
             return mean_axis / np.linalg.norm(mean_axis)
 
         # --- Step 1: Get Relative Rotations from both perspectives ---
-        R_wp_stack = Rotation.from_matrix(np.stack(self.rotations))
-        R_wc_stack = Rotation.from_matrix(np.stack(other_world_trace.rotations))
+        R_wp_stack = Rotation.from_matrix(self.rotations)
+        R_wc_stack = Rotation.from_matrix(other_world_trace.rotations)
 
         # --- Step 2: Calculate axis in the 'self' (parent) frame ---
         # Use R_pc = R_parent.inv() * R_child
@@ -566,171 +608,3 @@ class WorldTrace:
 
         return axis_in_self, axis_in_other
     
-    @staticmethod
-    def load_from_sto_file(sto_file: str) -> 'Dict[str, WorldTrace]':
-        """
-        This function loads a dictionary of WorldTrace objects from an OpenSim .sto file.
-
-        The file is expected to contain quaternion orientation data for multiple bodies.
-        Each body's trace will have its position set to the origin [0,0,0] at all times,
-        as this information is not present in the .sto orientation file.
-        
-        Args:
-            sto_file: The full path to the .sto file.
-
-        Returns:
-            A dictionary where keys are the body names (e.g., 'torso', 'pelvis') and
-            values are the corresponding WorldTrace objects.
-        """
-        # --- 1. Validate file existence and extension ---
-        if not os.path.isfile(sto_file) or not sto_file.lower().endswith('.sto'):
-            raise FileNotFoundError(f"No valid .sto file found at path: {sto_file}")
-
-        # --- 2. Read file and locate the end of the header ---
-        with open(sto_file, 'r') as f:
-            lines = f.readlines()
-
-        try:
-            # Find the line number where the header definition ends
-            header_end_index = next(i for i, line in enumerate(lines) if 'endheader' in line)
-        except StopIteration:
-            raise ValueError("'.sto' file is missing the 'endheader' line.")
-
-        # --- 3. Parse column headers ---
-        # The line immediately following 'endheader' contains the column names
-        column_headers = lines[header_end_index + 1].strip().split('\t')
-        try:
-            time_col_idx = column_headers.index('time')
-        except ValueError:
-            raise ValueError("'.sto' file is missing the 'time' column.")
-        
-        imu_headers = [h for h in column_headers if h != 'time']
-        if not imu_headers:
-            raise ValueError("No data columns found in the .sto file besides 'time'.")
-
-        # --- 4. Parse the data section ---
-        data_lines = lines[header_end_index + 2:]
-        
-        timestamps = []
-        # Initialize a dictionary to hold lists of quaternions for each IMU sensor
-        imu_quat_data = {header: [] for header in imu_headers}
-
-        for line in data_lines:
-            # Skip any blank lines, which can appear at the end of the file
-            if not line.strip():
-                continue
-            
-            parts = line.strip().split('\t')
-            timestamps.append(float(parts[time_col_idx]))
-            
-            for header in imu_headers:
-                header_idx = column_headers.index(header)
-                quat_str = parts[header_idx]
-                
-                # The .sto file format for quaternions is typically (w, x, y, z)
-                w, x, y, z = [float(v) for v in quat_str.split(',')]
-                
-                # scipy.spatial.transform.Rotation.from_quat expects the format (x, y, z, w)
-                imu_quat_data[header].append([x, y, z, w])
-
-        # --- 5. Construct WorldTrace objects for each IMU ---
-        world_traces: Dict[str, 'WorldTrace'] = {}
-        timestamps_np = np.array(timestamps)
-        num_frames = len(timestamps_np)
-        
-        # Since .sto orientation files do not contain position data, we use a zero vector for all frames.
-        positions = [np.zeros(3) for _ in range(num_frames)]
-
-        for header, quats in imu_quat_data.items():
-            # Convert the list of quaternions into a list of 3x3 rotation matrices
-            rotation_matrices = Rotation.from_quat(quats).as_matrix()
-            
-            world_traces[header] = WorldTrace(timestamps=timestamps_np, 
-                                              positions=positions, 
-                                              rotations=[rot for rot in rotation_matrices])
-        return world_traces
-    
-    @staticmethod
-    def load_WorldTraces_from_AlBorno_folder(imu_folder_path: str) -> Dict[str, 'WorldTrace']:
-        # Find the mapping xml file
-        mapping_file = next((f for f in os.listdir(imu_folder_path) if f.endswith('.xml')), None)
-        mapping_file_path = os.path.join(imu_folder_path, mapping_file) if mapping_file else None
-        if mapping_file_path is None:
-            raise FileNotFoundError("No mapping file found in IMU folder")
-
-        file_path = os.path.join(imu_folder_path, 'madgwick', 'LowerExtremity')
-        if not os.path.isdir(file_path):
-            raise FileNotFoundError(f"Expected folder not found: {file_path}")
-        return WorldTrace._load_WorldTraces_from_mapping_file_and_folder(file_path, mapping_file_path)
-    
-    @staticmethod
-    def load_WorldTraces_from_folder(folder_path: str) -> Dict[str, 'WorldTrace']:
-        parent_folder = os.path.dirname(os.path.abspath(folder_path))
-        mapping_file = next((os.path.join(parent_folder, f) for f in os.listdir(parent_folder) if f.endswith('.xml')), None)
-        mapping_file_path = os.path.join(parent_folder, mapping_file) if mapping_file else None
-        if mapping_file_path is None:
-            raise FileNotFoundError(f"No mapping file found at {os.path.join(parent_folder)}")
-
-        file_path = os.path.abspath(folder_path)
-        if not os.path.isdir(file_path):
-            raise FileNotFoundError(f"Expected folder not found: {file_path}")
-        return WorldTrace._load_WorldTraces_from_mapping_file_and_folder(file_path, mapping_file_path)
-    
-    @staticmethod
-    def _load_WorldTraces_from_mapping_file_and_folder(folder_path: str, mapping_file: str) -> Dict[str, 'WorldTrace']:
-        world_traces = {}
-
-        # Parse the XML file
-        tree = ET.parse(mapping_file)
-        root = tree.getroot()
-        trial_prefix_elem = root.find('.//trial_prefix')
-        if trial_prefix_elem is None or trial_prefix_elem.text is None:
-            raise ValueError("Mapping XML missing 'trial_prefix' element or its text.")
-        trial_prefix = trial_prefix_elem.text.strip()
-
-        # Iterate over each ExperimentalSensor element and load its IMUTrace
-        for sensor in root.findall('.//ExperimentalSensor'):
-            # Safely get the 'name' attribute; skip this sensor if it's missing
-            name_attr = sensor.get('name')
-            if name_attr is None:
-                print("ExperimentalSensor missing 'name' attribute; skipping.")
-                continue
-            sensor_name = name_attr.strip()
-
-            # Safely get the name_in_model element and its text; skip if missing
-            name_in_model_elem = sensor.find('name_in_model')
-            if name_in_model_elem is None or name_in_model_elem.text is None:
-                print(f"ExperimentalSensor '{sensor_name}' missing 'name_in_model'; skipping.")
-                continue
-            name_in_model = name_in_model_elem.text.strip()
-
-            file_name = f"{trial_prefix}{sensor_name}.txt"
-            file_path = os.path.join(folder_path, file_name)
-            freq = 100.0  # Default frequency
-            try:
-                # Extract update rate
-                with open(file_path, "r") as f:
-                    for line in f:
-                        if line.startswith("// Update Rate"):
-                            freq = float(line.split(":")[1].split("Hz")[0])
-                            if "Subject06" in folder_path or "Subject10" in folder_path:
-                                freq = 40.0  # Fix for known incorrect frequency in these subjects madgwick files specifically
-                            break
-
-                # Read the file into a DataFrame
-                df = pd.read_csv(file_path, delimiter='\t', skiprows=5)
-                df = df.apply(pd.to_numeric)
-                # Extract data
-                timestamps = 1 / freq * np.arange(len(df))
-                if df['Mat[3][3]'].isna().any():
-                    rotations = list(df[['Mag_Z','Mat[3][1]', 'Mat[3][2]', 'Mat[1][1]', 'Mat[1][2]', 'Mat[1][3]', 'Mat[2][1]', 'Mat[2][2]', 'Mat[2][3]']].values.reshape(-1, 3, 3))
-                else:
-                    rotations = list(df[['Mat[1][1]', 'Mat[1][2]', 'Mat[1][3]', 'Mat[2][1]', 'Mat[2][2]', 'Mat[2][3]', 'Mat[3][1]', 'Mat[3][2]', 'Mat[3][3]']].values.reshape(-1, 3, 3))
-
-                # Create WorldTrace objects
-                world_traces[name_in_model] = WorldTrace(timestamps=timestamps, positions=[np.zeros(3) for _ in range(len(timestamps))], rotations=rotations)
-                if freq < 100.0:
-                    world_traces[name_in_model] = world_traces[name_in_model].resample(100.0)
-            except FileNotFoundError:
-                print(f"File {file_path} not found. Skipping sensor {sensor_name}.")
-        return world_traces
