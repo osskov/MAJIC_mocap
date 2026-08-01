@@ -50,7 +50,7 @@ METHODS_TO_PLOT = ['EKF', 'Mag Off', 'Mag On', 'Mag Adapt']
 
 # Which summary metrics to plot from: RMSE, MAE, Mean, STD, Kurtosis, Skewness, Pearson, Median, Q25, Q75, MAD.
 # Default is in radians, for degrees use '_deg' suffix, e.g., 'RMSE_deg'.
-METRIC_TO_PLOT = 'RMSE_deg' 
+METRIC_TO_PLOT = 'Median_deg' 
 
 # If you do not want data to be combined across left/right sides, you can specify them individually as R_{joint} and L_{joint}
 # in both RENAME_JOINTS.
@@ -65,7 +65,7 @@ RENAME_JOINTS = {
 JOINT_PLOT_ORDER = ['Lumbar', 'Hip', 'Knee', 'Ankle']
 
 # Plot style can be 'strip' (strip + box-whisker for median + iqr), 'bar' (mean + std error bars), or 'box' (standard boxplot + strip)
-PLOT_STYLE = 'bar'
+PLOT_STYLE = 'strip'
 
 
 DATA_FILE_PATH = os.path.join("data", "all_subject_statistics.pkl")
@@ -1151,7 +1151,7 @@ def main():
     
     plot_summary_data(
         summary_df=summary_stats_df,
-        group_cols=['joint_name'],  # You can add more grouping columns as needed
+        group_cols=[],  # You can add more grouping columns as needed
         plot_type=PLOT_STYLE,  # 'bar', 'strip', or 'box'
         metric=METRIC_TO_PLOT,  # e.g., 'rmse_deg'
         method_order=METHODS_TO_PLOT,

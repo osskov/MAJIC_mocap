@@ -1,3 +1,4 @@
+from src.toolchest.dataset_loaders import load_trial_from_folder
 import unittest
 import os
 
@@ -15,7 +16,7 @@ class TestPlateTrial(unittest.TestCase):
     def test_load_trace(self):
         test_directory = os.getcwd()
         test_osim_file = os.path.join('..', 'data', 'ODay_Data', 'Subject02', 'complexTasks')
-        plates = PlateTrial.load_trial_from_folder(test_osim_file)
+        plates = load_trial_from_folder(test_osim_file)
         self.assertIsNotNone(plates)
 
     def test_identical_arrays(self):
