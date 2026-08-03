@@ -45,16 +45,14 @@ The repository is organized into several key Python scripts and a data directory
 │   │   └── AHRSFilter.py
 │   └── RelativeFilterPlus.py
 │
-├── generate_method_orientation_sto_files.py
-├── generate_method_data_and_stats_pkls.py
+├── generate_method_data_and_stats.py
 ├── plot_paper_figures.py
 ├── plot_imu_data_in_world_frame.py
 └── README.md
 ```
 -   **`src/RelativeFilterPlus.py`**: The core implementation of the Relative Filter.
 -   **`src/toolchest/`**: A collection of utility classes for handling IMU data (`IMUTrace`), motion capture data (`WorldTrace`), and synchronized trial data (`PlateTrial`).
--   **`generate_method_orientation_sto_files.py`**: This script processes the raw data for each subject and trial, runs various orientation estimation methods (including the Relative Filter variants), and saves the resulting segment orientations as `.sto` files.
--   **`generate_method_data_and_stats_pkls.py`**: This script loads the generated `.sto` files, calculates joint kinematics, computes error metrics against the "Marker" ground truth, and saves the comprehensive time-series data and summary statistics into `.pkl` files for efficient access.
+-   **`generate_method_data_and_stats.py`**: The unified pipeline script that processes raw data, runs orientation estimation filters, outputs intermediate compressed `.npz` files (which store the root orientation and joint angles directly), aggregates the trials across subjects, and calculates the summary statistics/Pearson correlations.
 -   **`plot_paper_figures.py`**: The main script for generating the statistical comparison plots presented in the paper. It loads the `all_subject_statistics.pkl` file and creates detailed figures comparing the different estimation methods.
 -   **`plot_imu_data_in_world_frame.py`**: A script to visualize the raw IMU data in the world frame, useful for initial data exploration and validation.
 -   **`data/`**: This directory is intended to hold the input data and the generated `.pkl` files.
@@ -88,16 +86,16 @@ The scripts expect a specific directory structure for the input data. You will n
 ```
 data/
 ├── Subject01/
-│ ├── walking/
-│ │ ├── subject01_walking.trc
-│ │ └── imu data/
-│ │ └── ... (IMU .txt files)
-│ └── complexTasks/
-│ ├── subject01_complextasks.trc
-│ └── imu data/
-│ └── ... (IMU .txt files)
+│   ├── walking/
+│   │   ├── subject01_walking.trc
+│   │   └── imu data/
+│   │       └── ... (IMU .txt files)
+│   └── complexTasks/
+│       ├── subject01_complextasks.trc
+│       └── imu data/
+│           └── ... (IMU .txt files)
 ├── Subject02/
-│ └── ...
+│   └── ...
 └── ...
 ```
 -   Each subject should have their own directory (e.g., `Subject01`, `Subject02`).
@@ -110,21 +108,21 @@ data/
 
 To reproduce the results from the publication, run the scripts in the following order.
 
-### Step 1: Generate Segment Orientation `.sto` Files
+### Step 1: Run Unified Pipeline
 
-This step processes the raw data and runs the different orientation estimation algorithms.
+This step runs orientation estimation filters, writes the precalculated joint angles into intermediate `.npz` files, and generates final statistics `.pkl`/`.csv` files.
 
 ```bash
-python generate_method_orientation_sto_files.py
+python generate_method_data_and_stats.py
 ```
-This will create .sto files for each method within each subject's trial directory (e.g., data/Subject01/walking/walking_orientations_mag_on.sto).
+This will create `.npz` files for each method within each subject's trial directory (e.g., `data/Subject01/walking/walking_orientations_mag_on.npz`).
 
-### Step 2: Generate Data and Statistics .pkl Files
-This step calculates the joint angles from the .sto files and computes detailed error statistics, saving them in convenient .pkl files.
+If intermediate `.npz` files already exist and you only want to quickly re-run the aggregation phase and regenerate summary statistics, run:
 ```bash
-python generate_method_data_and_stats_pkls.py
+python generate_method_data_and_stats.py --stats-only
 ```
-This will produce three key files in the data/ directory:
+
+This step produces three key files in the `data/` directory:
 
 -   `all_subject_data.pkl`: A large file containing the full time-series data for all joints, methods, and subjects.
 

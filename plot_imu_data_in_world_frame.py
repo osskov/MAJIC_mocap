@@ -1,3 +1,4 @@
+from src.toolchest.dataset_loaders import load_trial_from_folder
 import os
 from typing import Dict, List, Any
 import pandas as pd
@@ -38,7 +39,7 @@ def load_and_process_imu_data(subject_num: str, trial_type: str, max_frames: int
         data_folder_path = os.path.join("data", subject_id, trial_type)
         data_folder_path = os.path.abspath(data_folder_path)
         
-        plate_trials = PlateTrial.load_trial_from_folder(data_folder_path)
+        plate_trials = load_trial_from_folder(data_folder_path)
 
         if len(plate_trials[0]) > max_frames:
             print(f"Trimming trials to {max_frames} frames for manageability.")

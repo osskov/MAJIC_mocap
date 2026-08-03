@@ -1151,7 +1151,7 @@ def main():
     
     plot_summary_data(
         summary_df=summary_stats_df,
-        group_cols=[],  # You can add more grouping columns as needed
+        group_cols=['subject'],  # You can add more grouping columns as needed
         plot_type=PLOT_STYLE,  # 'bar', 'strip', or 'box'
         metric=METRIC_TO_PLOT,  # e.g., 'rmse_deg'
         method_order=METHODS_TO_PLOT,

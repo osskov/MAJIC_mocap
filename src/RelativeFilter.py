@@ -79,15 +79,7 @@ class RelativeFilter:
                                 q_lin_wc: Rotation,
                                 acc_jc_p: np.ndarray, acc_jc_c: np.ndarray,
                                 mag_jc_p: np.ndarray, mag_jc_c: np.ndarray) -> Tuple[Rotation, Rotation]:
-        # Normalize accelerometers to isolate direction
-        acc_jc_p = acc_jc_p / np.linalg.norm(acc_jc_p) if np.linalg.norm(acc_jc_p) != 0 else acc_jc_p
-        acc_jc_c = acc_jc_c / np.linalg.norm(acc_jc_c) if np.linalg.norm(acc_jc_c) != 0 else acc_jc_c
-
-        #Normalize magnetometers to isolate direction
-        if np.linalg.norm(mag_jc_c) != 0 or np.linalg.norm(mag_jc_p) != 0:
-            mag_jc_p = mag_jc_p / np.linalg.norm(mag_jc_p) if np.linalg.norm(mag_jc_p) != 0 else mag_jc_p
-            mag_jc_c = mag_jc_c / np.linalg.norm(mag_jc_c) if np.linalg.norm(mag_jc_c) != 0 else mag_jc_c
-
+                                
         # Get rotation matrices from quaternions
         R_wp = q_lin_wp.as_matrix()
         R_wc = q_lin_wc.as_matrix()

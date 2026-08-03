@@ -30,8 +30,6 @@ def parse_imu_txt_file(file_path: str) -> IMUTrace:
     mag = df[['Mag_X', 'Mag_Y', 'Mag_Z']].values
     return IMUTrace(timestamps=timestamps, acc=acc, gyro=gyro, mag=mag)
 
-
-
 def parse_trc_file(trc_file: str, max_trc_timestamp=-1.0, robust=True) -> Dict[str, WorldTrace]:
     """Parses a TRC file and extracts marker data into WorldTraces."""
     if trc_file is None or os.path.isfile(trc_file) is False or not trc_file.endswith('.trc'):
@@ -157,6 +155,23 @@ def parse_sto_file(sto_file: str) -> Dict[str, WorldTrace]:
     
     return world_traces
 
+def parse_npz_file(npz_file: str) -> Dict[str, WorldTrace]:
+    """Parses a NumPy .npz file containing segment orientations."""
+    if not os.path.isfile(npz_file) or not npz_file.lower().endswith('.npz'):
+        raise FileNotFoundError(f"No valid .npz file found at path: {npz_file}")
+
+    data = np.load(npz_file)
+    timestamps = data['timestamps']
+    positions = np.zeros((len(timestamps), 3))
+    
+    world_traces = {}
+    for key in data.files:
+        if key == 'timestamps':
+            continue
+        world_traces[key] = WorldTrace(timestamps=timestamps, positions=positions, rotations=data[key])
+    
+    return world_traces
+
 def _load_imu_traces_from_structure(imu_folder_path: str, data_subdirectory_parts: List[str]) -> Dict[str, IMUTrace]:
     """Generic helper to load IMU traces based on XML mapping."""
     imu_traces = {}
@@ -228,20 +243,22 @@ def _load_world_traces_from_mapping_file_and_folder(folder_path: str, mapping_fi
 
 # --- Loaders ---
 
-class BaseDatasetLoader:
-
+class DataLoader:
     def __init__(self, folder_path: str, robust: bool = True):
         self.folder_path = folder_path
         self.robust = robust
 
     def load_imu_traces(self) -> Dict[str, IMUTrace]:
-        raise NotImplementedError
+        return _load_imu_traces_from_structure(self.folder_path, ['imu data'])
 
     def load_world_traces(self) -> Dict[str, WorldTrace]:
-        raise NotImplementedError
+        trc_files = [file for file in os.listdir(self.folder_path) if file.endswith('.trc')]
+        if not trc_files:
+            raise FileNotFoundError(f"No .trc file found in {self.folder_path}")
+        trc_file_path = os.path.abspath(os.path.join(self.folder_path, trc_files[0]))
+        return parse_trc_file(trc_file_path, robust=self.robust)
 
     def load_plate_trials(self, align_plate_trials: bool = True) -> List[PlateTrial]:
-        # Standard name map for many of the datasets
         IMU_TO_TRC_NAME_MAP = {
             'pelvis_imu': 'Pelvis_IMU', 'femur_r_imu': 'R.Femur_IMU', 'femur_l_imu': 'L.Femur_IMU',
             'tibia_r_imu': 'R.Tibia_IMU', 'tibia_l_imu': 'L.Tibia_IMU', 'calcn_r_imu': 'R.Foot_IMU',
@@ -251,9 +268,7 @@ class BaseDatasetLoader:
         imu_traces = self.load_imu_traces()
         world_traces = self.load_world_traces()
         
-        # Rename world traces to match IMU traces based on the name map
         renamed_world_traces = {}
-        # Create a reverse map to go from TRC name to IMU name
         trc_to_imu_map = {v: k for k, v in IMU_TO_TRC_NAME_MAP.items()}
         
         for k, v in world_traces.items():
@@ -266,40 +281,6 @@ class BaseDatasetLoader:
             imu_traces, renamed_world_traces, align_plate_trials
         )
 
-class AlBornoLoader(BaseDatasetLoader):
-    def load_imu_traces(self) -> Dict[str, IMUTrace]:
-        return _load_imu_traces_from_structure(self.folder_path, ['xsens', 'LowerExtremity'])
-
-    def load_world_traces(self) -> Dict[str, WorldTrace]:
-        # Tries to load from TRC or Madgwick depending on what was historically done.
-        mocap_folder = os.path.join(self.folder_path, 'Mocap/')
-        if os.path.isdir(mocap_folder):
-            trc_files = [file for file in os.listdir(mocap_folder) if file.endswith('.trc') and 'static' not in file]
-            if trc_files:
-                trc_file_path = os.path.abspath(os.path.join(mocap_folder, trc_files[0]))
-                return parse_trc_file(trc_file_path, robust=self.robust)
-
-        # Fallback to Madgwick loader if no TRC
-        mapping_file = next((f for f in os.listdir(self.folder_path) if f.endswith('.xml')), None)
-        mapping_file_path = os.path.join(self.folder_path, mapping_file) if mapping_file else None
-        madgwick_path = os.path.join(self.folder_path, 'madgwick', 'LowerExtremity')
-        if mapping_file_path and os.path.isdir(madgwick_path):
-            return _load_world_traces_from_mapping_file_and_folder(madgwick_path, mapping_file_path)
-            
-        raise FileNotFoundError("Could not find valid TRC or Madgwick data in Al Borno folder.")
-
-class SkovLoader(BaseDatasetLoader):
-    def load_imu_traces(self) -> Dict[str, IMUTrace]:
-        return _load_imu_traces_from_structure(self.folder_path, ['imu data'])
-
-    def load_world_traces(self) -> Dict[str, WorldTrace]:
-        trc_files = [file for file in os.listdir(self.folder_path) if file.endswith('.trc')]
-        if not trc_files:
-            raise FileNotFoundError(f"No .trc file found in {self.folder_path}")
-        trc_file_path = os.path.abspath(os.path.join(self.folder_path, trc_files[0]))
-        return parse_trc_file(trc_file_path, robust=self.robust)
-
 # Backwards compatibility helper
 def load_trial_from_folder(folder_path: str, align_plate_trials=True, robust=True) -> List[PlateTrial]:
-    # Use SkovLoader as the default for the old load_trial_from_folder
-    return SkovLoader(folder_path, robust=robust).load_plate_trials(align_plate_trials=align_plate_trials)
+    return DataLoader(folder_path, robust=robust).load_plate_trials(align_plate_trials=align_plate_trials)

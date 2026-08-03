@@ -191,15 +191,12 @@ class RelativeFilter:
                                 vector_sensor_data_p: List[np.ndarray], 
                                 vector_sensor_data_c: List[np.ndarray]) -> Tuple[Rotation, Rotation]:
         """Corrects the state prediction using sensor measurements."""
-        normalized_sensor_data_p = [data / np.linalg.norm(data) if np.linalg.norm(data) != 0 else data for data in vector_sensor_data_p]
-        normalized_sensor_data_c = [data / np.linalg.norm(data) if np.linalg.norm(data) != 0 else data for data in vector_sensor_data_c]
-
         R_wp = q_lin_wp.as_matrix()
         R_wc = q_lin_wc.as_matrix()
 
         # Get Jacobians and residual, evaluated at eta = 0
-        H = self.get_H_jacobian(R_wp, R_wc, normalized_sensor_data_p, normalized_sensor_data_c)
-        e = self.get_h(R_wp, R_wc, normalized_sensor_data_p, normalized_sensor_data_c)
+        H = self.get_H_jacobian(R_wp, R_wc, vector_sensor_data_p, vector_sensor_data_c)
+        e = self.get_h(R_wp, R_wc, vector_sensor_data_p, vector_sensor_data_c)
         M = self.get_M_jacobian(R_wp, R_wc)
         
         # Kalman gain calculation
