@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import numpy as np
 from typing import List, Dict, Union
 import xml.etree.ElementTree as ET
@@ -53,6 +54,51 @@ class IMUTrace:
         self.gyro = np.asarray(gyro)
         self.acc = np.asarray(acc)
         self.mag = np.asarray(mag)
+
+    @classmethod
+    def from_txt(cls, file_path: Union[str, Path]) -> 'IMUTrace':
+        """Parses a single Xsens-formatted IMU .txt file."""
+        file_path = Path(file_path)
+        freq = 100.0
+        
+        with open(file_path, "r", encoding="utf-8") as f:
+            for _ in range(10):
+                line = f.readline()
+                if line.startswith("// Update Rate"):
+                    try:
+                        freq = float(line.split(":")[1].split("Hz")[0].strip())
+                    except (IndexError, ValueError):
+                        pass
+                    break
+
+        df = pd.read_csv(
+            file_path,
+            delimiter='\t',
+            skiprows=5,
+            engine='c',
+            usecols=['Acc_X', 'Acc_Y', 'Acc_Z', 'Gyr_X', 'Gyr_Y', 'Gyr_Z', 'Mag_X', 'Mag_Y', 'Mag_Z']
+        )
+        
+        timestamps = np.arange(len(df), dtype=np.float64) / freq
+        acc = df[['Acc_X', 'Acc_Y', 'Acc_Z']].to_numpy(dtype=np.float64)
+        gyro = df[['Gyr_X', 'Gyr_Y', 'Gyr_Z']].to_numpy(dtype=np.float64)
+        mag = df[['Mag_X', 'Mag_Y', 'Mag_Z']].to_numpy(dtype=np.float64)
+
+        return cls(timestamps=timestamps, gyro=gyro, acc=acc, mag=mag)
+
+    @classmethod
+    def from_folder(cls, folder_path: Union[str, Path]) -> Dict[str, 'IMUTrace']:
+        """Loads all IMU .txt files in a folder directly by their segment names."""
+        folder = Path(folder_path)
+        imu_dir = folder / 'imu data' if (folder / 'imu data').is_dir() else folder
+
+        imu_files = list(imu_dir.glob("*.txt"))
+        imu_traces = {f.name.replace('.txt', ''): cls.from_txt(f) for f in imu_files}
+
+        if not imu_traces:
+            raise FileNotFoundError(f"No IMU .txt files found in: {imu_dir}")
+
+        return imu_traces
 
     def __len__(self):
         """

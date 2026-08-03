@@ -542,6 +542,34 @@ class TestIMUTrace(unittest.TestCase):
         # Assert that the calculated radius is equal to the overridden radius
         self.assertEqual(radius, override_radius)
 
+    def test_from_txt(self):
+        import tempfile
+        import os
+        # Create a dummy IMU .txt file
+        dummy_content = (
+            "// Update Rate: 100.0Hz\n"
+            "// Some metadata\n"
+            "// Some metadata\n"
+            "// Some metadata\n"
+            "// Some metadata\n"
+            "Acc_X\tAcc_Y\tAcc_Z\tGyr_X\tGyr_Y\tGyr_Z\tMag_X\tMag_Y\tMag_Z\n"
+            "1.0\t2.0\t3.0\t4.0\t5.0\t6.0\t7.0\t8.0\t9.0\n"
+            "1.1\t2.1\t3.1\t4.1\t5.1\t6.1\t7.1\t8.1\t9.1\n"
+        )
+        with tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False, encoding='utf-8') as temp_file:
+            temp_file.write(dummy_content)
+            temp_file_path = temp_file.name
+
+        try:
+            trace = IMUTrace.from_txt(temp_file_path)
+            self.assertEqual(len(trace), 2)
+            np.testing.assert_allclose(trace.timestamps, [0.0, 0.01])
+            np.testing.assert_allclose(trace.acc, [[1.0, 2.0, 3.0], [1.1, 2.1, 3.1]])
+            np.testing.assert_allclose(trace.gyro, [[4.0, 5.0, 6.0], [4.1, 5.1, 6.1]])
+            np.testing.assert_allclose(trace.mag, [[7.0, 8.0, 9.0], [7.1, 8.1, 9.1]])
+        finally:
+            os.remove(temp_file_path)
+
 
 
 if __name__ == '__main__':

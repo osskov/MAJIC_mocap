@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+import pandas as pd
 from .IMUTrace import IMUTrace
 from typing import List, Tuple, Union
 import numpy as np
@@ -7,8 +9,6 @@ from .gyro_utils import finite_difference_rotations
 from scipy.signal import butter, filtfilt
 from scipy.spatial.transform import Rotation, Slerp
 from typing import Dict
-import xml.etree.ElementTree as ET
-import pandas as pd
 
 def _generate_smooth_motion_profile(
         num_samples: int,
@@ -36,6 +36,104 @@ def _generate_smooth_motion_profile(
             phase = np.random.uniform(0, 2 * np.pi)
             motion += amplitude * np.sin(2 * np.pi * frequency * t + phase)
         return motion
+
+def _compute_case(m_o, m_d, m_x, m_y, w, h, faulty_idx=None):
+    """Computes coordinate frame orientation/location for a specific fault case."""
+    if faulty_idx == 0:  # O is faulty
+        x_v = (m_x - m_d) / np.linalg.norm(m_x - m_d, axis=1)[:, None]
+        yt = (m_y - m_d) / np.linalg.norm(m_y - m_d, axis=1)[:, None]
+        z_v = np.cross(x_v, yt) / np.linalg.norm(np.cross(x_v, yt), axis=1)[:, None]
+        y_v = np.cross(z_v, x_v)
+        o_est = m_d + w * x_v + h * y_v
+        loc = (o_est + m_d + m_x + m_y) / 4.0
+    elif faulty_idx == 1:  # D is faulty
+        x_v = (m_o - m_y) / np.linalg.norm(m_o - m_y, axis=1)[:, None]
+        yt = (m_o - m_x) / np.linalg.norm(m_o - m_x, axis=1)[:, None]
+        z_v = np.cross(x_v, yt) / np.linalg.norm(np.cross(x_v, yt), axis=1)[:, None]
+        y_v = np.cross(z_v, x_v)
+        d_est = m_o - w * x_v - h * y_v
+        loc = (m_o + d_est + m_x + m_y) / 4.0
+    elif faulty_idx == 2:  # X is faulty
+        x_v = (m_o - m_y) / np.linalg.norm(m_o - m_y, axis=1)[:, None]
+        yt = (m_y - m_d) / np.linalg.norm(m_y - m_d, axis=1)[:, None]
+        z_v = np.cross(x_v, yt) / np.linalg.norm(np.cross(x_v, yt), axis=1)[:, None]
+        y_v = np.cross(z_v, x_v)
+        x_est = m_y + w * x_v - h * y_v
+        loc = (m_o + m_d + x_est + m_y) / 4.0
+    elif faulty_idx == 3:  # Y is faulty
+        x_v = (m_x - m_d) / np.linalg.norm(m_x - m_d, axis=1)[:, None]
+        yt = (m_o - m_x) / np.linalg.norm(m_o - m_x, axis=1)[:, None]
+        z_v = np.cross(x_v, yt) / np.linalg.norm(np.cross(x_v, yt), axis=1)[:, None]
+        y_v = np.cross(z_v, x_v)
+        y_est = m_x - w * x_v + h * y_v
+        loc = (m_o + m_d + m_x + y_est) / 4.0
+    else:  # Nominal
+        x1 = (m_x - m_d) / np.linalg.norm(m_x - m_d, axis=1)[:, None]
+        x2 = (m_o - m_y) / np.linalg.norm(m_o - m_y, axis=1)[:, None]
+        x_v = (x1 + x2) / 2.0
+        x_v /= np.linalg.norm(x_v, axis=1)[:, None]
+        
+        y1 = (m_o - m_x) / np.linalg.norm(m_o - m_x, axis=1)[:, None]
+        y2 = (m_y - m_d) / np.linalg.norm(m_y - m_d, axis=1)[:, None]
+        yt = (y1 + y2) / 2.0
+        yt /= np.linalg.norm(yt, axis=1)[:, None]
+        
+        z_v = np.cross(x_v, yt) / np.linalg.norm(np.cross(x_v, yt), axis=1)[:, None]
+        y_v = np.cross(z_v, x_v)
+        loc = (m_o + m_d + m_x + m_y) / 4.0
+
+    rot = np.stack((x_v, y_v, z_v), axis=2)
+    return loc, rot
+
+
+def _reconstruct_from_markers(
+    marker_o: np.ndarray, 
+    marker_d: np.ndarray, 
+    marker_x: np.ndarray, 
+    marker_y: np.ndarray, 
+    threshold: float = 2.0
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Reconstructs rigid body coordinate frames with fault isolation."""
+    N = len(marker_o)
+    pos = [marker_o, marker_d, marker_x, marker_y]
+    
+    pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+    d = {pair: np.linalg.norm(pos[pair[0]] - pos[pair[1]], axis=1) for pair in pairs}
+    bar_d = {pair: np.median(d[pair]) for pair in pairs}
+    e = {pair: np.abs(d[pair] - bar_d[pair]) for pair in pairs}
+    
+    epsilon = 1e-3  # 1mm standard scale
+    fault_scores = np.zeros((4, N))
+    for i in range(4):
+        num_pairs = [p for p in pairs if i in p]
+        den_pairs = [p for p in pairs if i not in p]
+        numerator = np.sum([e[p] for p in num_pairs], axis=0)
+        denominator = np.sum([e[p] for p in den_pairs], axis=0)
+        fault_scores[i] = numerator / (denominator + epsilon)
+        
+    w = (bar_d[(1, 2)] + bar_d[(0, 3)]) / 2.0
+    h = (bar_d[(0, 2)] + bar_d[(1, 3)]) / 2.0
+
+    # Evaluate nominal case
+    loc_4, rot_4 = _compute_case(marker_o, marker_d, marker_x, marker_y, w, h, faulty_idx=None)
+    
+    max_idx = np.argmax(fault_scores, axis=0)
+    is_faulty = np.max(fault_scores, axis=0) > threshold
+    case_indices = np.where(is_faulty, max_idx, 4)
+
+    positions = loc_4.copy()
+    rotations = rot_4.copy()
+
+    for c in range(4):
+        mask = (case_indices == c)
+        if np.any(mask):
+            loc_c, rot_c = _compute_case(
+                marker_o[mask], marker_d[mask], marker_x[mask], marker_y[mask], w, h, faulty_idx=c
+            )
+            positions[mask] = loc_c
+            rotations[mask] = rot_c
+
+    return positions, rotations
 
 class WorldTrace:
     """
@@ -92,6 +190,48 @@ class WorldTrace:
         return (np.array_equal(self.timestamps, other.timestamps) and
                 np.array_equal(self.positions, other.positions) and
                 np.array_equal(self.rotations, other.rotations))
+
+    @classmethod
+    def from_trc(cls, trc_path: Union[str, Path]) -> Dict[str, 'WorldTrace']:
+        """Parses a TRC file and extracts marker data into WorldTraces."""
+        trc_path = Path(trc_path)
+        if not trc_path.is_file():
+            raise FileNotFoundError(f"No valid TRC file found at: {trc_path}")
+
+        with open(trc_path, 'r', encoding='utf-8') as f:
+            lines = [f.readline() for _ in range(6)]
+
+        headers = lines[3].strip().split('\t')
+        imu_headers = [h for h in headers if ('_o' in h.lower())]
+
+        df = pd.read_csv(trc_path, delimiter='\t', skiprows=6, header=None, engine='c')
+        timestamps = df.iloc[:, 1].to_numpy(dtype=np.float64)
+
+        world_traces = {}
+        for imu_o_name in imu_headers:
+            o_idx = headers.index(imu_o_name)
+            x_idx = headers.index(imu_o_name.replace('_o', '_x'))
+            y_idx = headers.index(imu_o_name.replace('_o', '_y'))
+            d_idx = headers.index(imu_o_name.replace('_o', '_d'))
+
+            o_loc = df.iloc[:, o_idx: o_idx + 3].to_numpy(dtype=np.float64)
+            x_loc = df.iloc[:, x_idx: x_idx + 3].to_numpy(dtype=np.float64)
+            y_loc = df.iloc[:, y_idx: y_idx + 3].to_numpy(dtype=np.float64)
+            d_loc = df.iloc[:, d_idx: d_idx + 3].to_numpy(dtype=np.float64)
+
+            # Convert mm to meters if necessary
+            if np.max(np.abs(o_loc)) > 1000.0:
+                o_loc /= 1000.0
+                x_loc /= 1000.0
+                y_loc /= 1000.0
+                d_loc /= 1000.0
+
+            clean_name = imu_o_name.lower().replace('_o', '')
+            positions, rotations = _reconstruct_from_markers(
+                o_loc, d_loc, x_loc, y_loc, threshold=2.0
+            )
+            world_traces[clean_name] = WorldTrace(timestamps, positions, rotations)
+        return world_traces
 
     def transform(self, rotate: np.ndarray = np.eye(3), translate: np.ndarray = np.zeros(3)) -> 'WorldTrace':
         """
@@ -227,215 +367,6 @@ class WorldTrace:
         Start timestamps at 0
         """
         return WorldTrace(self.timestamps - self.timestamps[0], self.positions, self.rotations)
-
-
-    @staticmethod
-    def construct_from_markers(timestamps: np.ndarray, marker_o: np.ndarray, marker_d: np.ndarray, marker_x: np.ndarray,
-                               marker_y: np.ndarray):
-        """
-        This function constructs a WorldTrace from three markers. This is useful for generating synthetic data.
-        """
-
-        assert not np.isnan(marker_o).any(), "NaN in marker_o"
-        assert not np.isnan(marker_d).any(), "NaN in marker_d"
-        assert not np.isnan(marker_x).any(), "NaN in marker_x"
-        assert not np.isnan(marker_y).any(), "NaN in marker_y"
-
-        # Constructing axis and orientation components
-        x_axis_1 = marker_x - marker_d
-        x_axis_1 = x_axis_1 / np.linalg.norm(x_axis_1, axis=1)[:, None]
-        assert not np.isnan(x_axis_1).any(), "NaN in x_axis_1"
-        x_axis_2 = marker_o - marker_y
-        x_axis_2 = x_axis_2 / np.linalg.norm(x_axis_2, axis=1)[:, None]
-        if np.isnan(x_axis_2).any():
-            x_axis = x_axis_1
-        else:
-            x_axis = (x_axis_1 + x_axis_2) / 2
-        x_axis = x_axis / np.linalg.norm(x_axis, axis=1)[:, None]
-        assert not np.isnan(x_axis).any(), "NaN in x_axis"
-
-        y_axis_temp_1 = marker_o - marker_x
-        y_axis_temp_1 = y_axis_temp_1 / np.linalg.norm(y_axis_temp_1, axis=1)[:, None]
-        assert not np.isnan(y_axis_temp_1).any(), "NaN in y_axis_temp_1"
-        y_axis_temp_2 = marker_y - marker_d
-        y_axis_temp_2 = y_axis_temp_2 / np.linalg.norm(y_axis_temp_2, axis=1)[:, None]
-        assert not np.isnan(y_axis_temp_2).any(), "NaN in y_axis_temp_2"
-        y_axis_temp = (y_axis_temp_1 + y_axis_temp_2) / 2
-        y_axis_temp = y_axis_temp / np.linalg.norm(y_axis_temp, axis=1)[:, None]
-        assert not np.isnan(y_axis_temp).any(), "NaN in y_axis_temp"
-
-        z_axis = np.cross(x_axis, y_axis_temp)
-        assert not np.isnan(z_axis).any(), "NaN in z_axis"
-        z_axis = z_axis / np.linalg.norm(z_axis, axis=1)[:, None]
-        assert not np.isnan(z_axis).any(), "NaN in z_axis"
-        y_axis = np.cross(z_axis, x_axis)
-        assert not np.isnan(y_axis).any(), "NaN in y_axis"
-
-        error_y = np.linalg.norm(y_axis - y_axis_temp_1, axis=1)
-        angle_error = np.arccos(np.clip(np.sum(y_axis * y_axis_temp_1, axis=1), -1, 1)) * 180 / np.pi
-        if np.mean(angle_error) > 1.0:
-            # import matplotlib.pyplot as plt
-            # fig, ax = plt.subplots(1, 5)
-            # ax[0].plot(angle_error)
-            # ax[0].set_title("Angle Error (deg)")
-            # ax[1].plot(np.linalg.norm(marker_o - marker_x, axis=1), label='o-x')
-            # ax[1].plot(np.linalg.norm(marker_o - marker_y, axis=1), label='o-y')
-            # ax[1].plot(np.linalg.norm(marker_o - marker_d, axis=1), label='o-d')
-            # ax[2].plot(np.linalg.norm(marker_x - marker_y, axis=1), label='x-y')
-            # ax[2].plot(np.linalg.norm(marker_x - marker_d, axis=1), label='x-d')
-            # ax[3].plot(np.linalg.norm(marker_y - marker_d, axis=1), label='y-d')
-            # ax[1].set_title("Marker Distances from O")
-            # ax[1].legend()
-            # ax[2].set_title("Marker Distances from X")
-            # ax[2].legend()
-            # ax[3].set_title("Marker Distances from Y")
-            # ax[3].legend()
-            # ax[4].plot(timestamps, error_y, label='y-y_temp')
-            # plt.show()
-
-            print(f"Mean angle error: {np.mean(angle_error)}")
-            print(f"Mean norm of y-y_temp: {np.mean(error_y)}")
-
-        # Saving the location of the marker
-        loc = (marker_o + marker_d + marker_x + marker_y) / 4
-        R_list = np.stack([x_axis, y_axis, z_axis], axis=-1)
-        return WorldTrace(timestamps, loc, R_list)
-
-    @staticmethod
-    def construct_from_markers_robust(timestamps: np.ndarray, marker_o: np.ndarray, marker_d: np.ndarray, marker_x: np.ndarray,
-                                      marker_y: np.ndarray, threshold: float = 5.0) -> 'WorldTrace':
-        """
-        Robust version of construct_from_markers that detects when one of the 4 markers
-        is faulty (e.g. flipped, occluded) using the Marker Fault Isolation Metric, and
-        reconstructs the rigid body coordinate system using only the remaining 3 healthy markers.
-        Fully vectorized via NumPy for high-performance execution.
-        """
-        N = len(timestamps)
-        
-        pos = [marker_o, marker_d, marker_x, marker_y]
-        d = {}
-        bar_d = {}
-        pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
-        for i, j in pairs:
-            d[(i, j)] = np.linalg.norm(pos[i] - pos[j], axis=1)
-            bar_d[(i, j)] = np.median(d[(i, j)])
-            
-        e = {}
-        for i, j in pairs:
-            e[(i, j)] = np.abs(d[(i, j)] - bar_d[(i, j)])
-            
-        epsilon = 0.001 # 1mm regularization
-        fault_scores = np.zeros((4, N))
-        for i in range(4):
-            num_pairs = [p for p in pairs if i in p]
-            numerator = np.sum([e[p] for p in num_pairs], axis=0)
-            den_pairs = [p for p in pairs if i not in p]
-            denominator = np.sum([e[p] for p in den_pairs], axis=0)
-            fault_scores[i] = numerator / (denominator + epsilon)
-            
-        # Nominal plate dimensions (medians over the whole trial)
-        w = (bar_d[(1, 2)] + bar_d[(0, 3)]) / 2.0  # (||X-D|| + ||O-Y||) / 2
-        h = (bar_d[(0, 2)] + bar_d[(1, 3)]) / 2.0  # (||O-X|| + ||Y-D||) / 2
-
-        # Precompute Case 0 (O is faulty)
-        x_0 = marker_x - marker_d
-        x_0 = x_0 / np.linalg.norm(x_0, axis=1)[:, None]
-        yt_0 = marker_y - marker_d
-        yt_0 = yt_0 / np.linalg.norm(yt_0, axis=1)[:, None]
-        z_0 = np.cross(x_0, yt_0)
-        z_0 = z_0 / np.linalg.norm(z_0, axis=1)[:, None]
-        y_0 = np.cross(z_0, x_0)
-        # Estimate O: O_est = D + w*x + h*y
-        o_est = marker_d + w * x_0 + h * y_0
-        loc_0 = (o_est + marker_d + marker_x + marker_y) / 4.0
-        rot_0 = np.stack((x_0, y_0, z_0), axis=2)
-
-        # Precompute Case 1 (D is faulty)
-        x_1 = marker_o - marker_y
-        x_1 = x_1 / np.linalg.norm(x_1, axis=1)[:, None]
-        yt_1 = marker_o - marker_x
-        yt_1 = yt_1 / np.linalg.norm(yt_1, axis=1)[:, None]
-        z_1 = np.cross(x_1, yt_1)
-        z_1 = z_1 / np.linalg.norm(z_1, axis=1)[:, None]
-        y_1 = np.cross(z_1, x_1)
-        # Estimate D: D_est = O - w*x - h*y
-        d_est = marker_o - w * x_1 - h * y_1
-        loc_1 = (marker_o + d_est + marker_x + marker_y) / 4.0
-        rot_1 = np.stack((x_1, y_1, z_1), axis=2)
-
-        # Precompute Case 2 (X is faulty)
-        x_2 = marker_o - marker_y
-        x_2 = x_2 / np.linalg.norm(x_2, axis=1)[:, None]
-        yt_2 = marker_y - marker_d
-        yt_2 = yt_2 / np.linalg.norm(yt_2, axis=1)[:, None]
-        z_2 = np.cross(x_2, yt_2)
-        z_2 = z_2 / np.linalg.norm(z_2, axis=1)[:, None]
-        y_2 = np.cross(z_2, x_2)
-        # Estimate X: X_est = Y + w*x - h*y
-        x_est = marker_y + w * x_2 - h * y_2
-        loc_2 = (marker_o + marker_d + x_est + marker_y) / 4.0
-        rot_2 = np.stack((x_2, y_2, z_2), axis=2)
-
-        # Precompute Case 3 (Y is faulty)
-        x_3 = marker_x - marker_d
-        x_3 = x_3 / np.linalg.norm(x_3, axis=1)[:, None]
-        yt_3 = marker_o - marker_x
-        yt_3 = yt_3 / np.linalg.norm(yt_3, axis=1)[:, None]
-        z_3 = np.cross(x_3, yt_3)
-        z_3 = z_3 / np.linalg.norm(z_3, axis=1)[:, None]
-        y_3 = np.cross(z_3, x_3)
-        # Estimate Y: Y_est = X - w*x + h*y
-        y_est = marker_x - w * x_3 + h * y_3
-        loc_3 = (marker_o + marker_d + marker_x + y_est) / 4.0
-        rot_3 = np.stack((x_3, y_3, z_3), axis=2)
-
-        # Precompute Case 4 (Normal - all 4 markers)
-        x_4_1 = marker_x - marker_d
-        x_4_1 = x_4_1 / np.linalg.norm(x_4_1, axis=1)[:, None]
-        x_4_2 = marker_o - marker_y
-        x_4_2 = x_4_2 / np.linalg.norm(x_4_2, axis=1)[:, None]
-        x_4 = (x_4_1 + x_4_2) / 2.0
-        x_4 = x_4 / np.linalg.norm(x_4, axis=1)[:, None]
-        
-        y_4_1 = marker_o - marker_x
-        y_4_1 = y_4_1 / np.linalg.norm(y_4_1, axis=1)[:, None]
-        y_4_2 = marker_y - marker_d
-        y_4_2 = y_4_2 / np.linalg.norm(y_4_2, axis=1)[:, None]
-        yt_4 = (y_4_1 + y_4_2) / 2.0
-        yt_4 = yt_4 / np.linalg.norm(yt_4, axis=1)[:, None]
-        
-        z_4 = np.cross(x_4, yt_4)
-        z_4 = z_4 / np.linalg.norm(z_4, axis=1)[:, None]
-        y_4 = np.cross(z_4, x_4)
-        loc_4 = (marker_o + marker_d + marker_x + marker_y) / 4.0
-        rot_4 = np.stack((x_4, y_4, z_4), axis=2)
-
-        # Determine Case for each timestep
-        max_idx = np.argmax(fault_scores, axis=0)
-        is_faulty = np.max(fault_scores, axis=0) > threshold
-        case_indices = np.where(is_faulty, max_idx, 4)
-
-        # advanced index to select correct cases
-        all_rotations = np.stack((rot_0, rot_1, rot_2, rot_3, rot_4), axis=0)
-        all_positions = np.stack((loc_0, loc_1, loc_2, loc_3, loc_4), axis=0)
-        
-        rotations = all_rotations[case_indices, np.arange(N)]
-        positions = all_positions[case_indices, np.arange(N)]
-        
-        # Alignment warnings (same check as standard construction)
-        y_axis = rotations[:, :, 1]
-        y_axis_temp_1 = marker_o - marker_x
-        y_axis_temp_1 = y_axis_temp_1 / np.linalg.norm(y_axis_temp_1, axis=1)[:, None]
-        
-        error_y = np.linalg.norm(y_axis - y_axis_temp_1, axis=1)
-        angle_error = np.arccos(np.clip(np.sum(y_axis * y_axis_temp_1, axis=1), -1, 1)) * 180 / np.pi
-        
-        if np.mean(angle_error) > 1.0:
-            print(f"Mean angle error: {np.mean(angle_error)}")
-            print(f"Mean norm of y-y_temp: {np.mean(error_y)}")
-            
-        return WorldTrace(timestamps, positions, rotations)
-
         
     @staticmethod
     def generate_random_world_trace(duration: float = 10.0, fs: float = 100.0) -> 'WorldTrace':

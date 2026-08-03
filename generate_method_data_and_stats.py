@@ -1,47 +1,74 @@
 import os
+from pathlib import Path
+os.environ["DISABLE_TQDM"] = "True"
 import argparse
-from typing import List, Tuple, Dict, Any
+import itertools
+import time
+import multiprocessing
+from typing import List, Tuple, Dict, Any, Optional
 import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation
-from src.toolchest.dataset_loaders import DataLoader, parse_sto_file, parse_npz_file
 from src.toolchest.PlateTrial import PlateTrial
-from src.toolchest.WorldTrace import WorldTrace
 from src.RelativeFilterPlus import RelativeFilter
 from concurrent.futures import ProcessPoolExecutor
-
-JOINT_SEGMENT_DICT = {'Lumbar': ('pelvis_imu', 'torso_imu'),
-                      'R_Hip': ('pelvis_imu', 'femur_r_imu'),
-                      'R_Knee': ('femur_r_imu', 'tibia_r_imu'),
-                      'R_Ankle': ('tibia_r_imu', 'calcn_r_imu'),
-                      'L_Hip': ('pelvis_imu', 'femur_l_imu'),
-                      'L_Knee': ('femur_l_imu', 'tibia_l_imu'),
-                      'L_Ankle': ('tibia_l_imu', 'calcn_l_imu'),
-                      }
-
-SUBJECTS = ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11']
-METHODS = ['Marker', 'Mag On', 'Mag Adapt', 'Mag Off', 'Unprojected', 'EKF']
-TRIALS = ['walking', 'complexTasks']
-BASE_DATA_PATH = os.path.abspath("data")
+from rich.live import Live
+from rich.table import Table
 
 # ==============================================================================
-# PART 1: Orientation Estimation and NPZ Generation
+# CONFIGURATION
+# ==============================================================================
+
+JOINTS = {
+    'Lumbar': ('pelvis_imu', 'torso_imu'),
+    'R_Hip':  ('pelvis_imu', 'femur_r_imu'),
+    'R_Knee': ('femur_r_imu', 'tibia_r_imu'),
+    'R_Ankle':('tibia_r_imu', 'calcn_r_imu'),
+    'L_Hip':  ('pelvis_imu', 'femur_l_imu'),
+    'L_Knee': ('femur_l_imu', 'tibia_l_imu'),
+    'L_Ankle':('tibia_l_imu', 'calcn_l_imu'),
+}
+
+METHODS = {
+    'marker':      {'kind': 'marker'},
+    'mag_on':      {'kind': 'filter', 'project': True,  'mag_mode': 'on'},
+    'mag_off':     {'kind': 'filter', 'project': True,  'mag_mode': 'off'},
+    'mag_adapt':   {'kind': 'filter', 'project': True,  'mag_mode': 'adapt'},
+    'unprojected': {'kind': 'filter', 'project': False, 'mag_mode': 'on'},
+    'ekf':         {'kind': 'ekf'},
+}
+
+SUBJECTS = [f'{i:02d}' for i in range(1, 2)]
+ACTIVITIES = ['walking', 'complexTasks']
+BASE_DATA_PATH = Path("data").resolve()
+
+# ==============================================================================
+# STAGE 1 — Load raw subject sensor data
+# ==============================================================================
+
+def load_raw_data(subject: str, activity: str) -> Dict[str, PlateTrial]:
+    folder = BASE_DATA_PATH / f"Subject{subject}" / activity
+    plates = PlateTrial.from_folder(folder)
+    return plates
+
+# ==============================================================================
+# STAGE 2 — Compute joint angles for a method
 # ==============================================================================
 
 def _setup_ekf_ground_plate_(plate_trials: List[PlateTrial]) -> PlateTrial:
     """Precomputes global expected gravity and magnetic field to build a virtual parent ground plate."""
     base_plate = plate_trials[0]
-    expected_gravity = np.array([0.0, 9.81, 0.0]) # Expected gravity in Z-axis
+    expected_gravity = np.array([0.0, 9.81, 0.0])  # Expected gravity in Z-axis
     
     # Precompute expected magnetic field as the median of all global magnetic field readings
     all_global_mags = [
-        np.einsum('tij,tj->ti', plate.world_trace.rotations, plate.imu_trace.mag)
+        (plate.world_trace.rotations @ plate.imu_trace.mag[..., None])[..., 0]
         for plate in plate_trials
     ]
     expected_mag = np.median(np.concatenate(all_global_mags, axis=0), axis=0)
     
     ground_plate = base_plate.copy()
-    ground_plate.name = "ground_virtual_parent"
+    ground_plate.name = "ground"
     ground_plate.world_trace.rotations = np.tile(np.eye(3), (len(base_plate), 1, 1))
     ground_plate.imu_trace.gyro = np.zeros_like(base_plate.imu_trace.gyro)
     ground_plate.imu_trace.acc = np.tile(expected_gravity, (len(base_plate), 1))
@@ -58,41 +85,43 @@ def _calculate_observability_metric_(parent_trial: PlateTrial, child_trial: Plat
                                       np.linalg.norm(o_child, axis=1))
     return np.concatenate(([0.0], observability_metric))
 
-def calculate_joint_angle_from_segments(parent_trial: PlateTrial,
-                                        child_trial: PlateTrial,
-                                        condition: str = 'mag on',
-                                        gyro_std_parent: float = np.sqrt(0.01),
-                                        acc_std_parent: float = np.sqrt(0.05),
-                                        mag_std_parent: float = np.sqrt(0.05),
-                                        gyro_std_child: float = np.sqrt(0.01),
-                                        acc_std_child: float = np.sqrt(0.05),
-                                        mag_std_child: float = np.sqrt(0.05),
-                                        mag_adapt_threshold: float = 150.0,
-                                        warmup_steps: int = 0) -> List[np.ndarray]:
-    """Estimates joint orientations between parent and child trials using specified filter conditions."""
+def _run_relative_filter(parent_trial: PlateTrial,
+                         child_trial: PlateTrial,
+                         project: bool,
+                         mag_mode: str,
+                         gyro_std_parent: float = np.sqrt(0.01),
+                         acc_std_parent: float = np.sqrt(0.05),
+                         mag_std_parent: float = np.sqrt(0.05),
+                         gyro_std_child: float = np.sqrt(0.01),
+                         acc_std_child: float = np.sqrt(0.05),
+                         mag_std_child: float = np.sqrt(0.05),
+                         mag_adapt_threshold: float = 150.0,
+                         warmup_steps: int = 0) -> List[np.ndarray]:
+    """Estimates joint orientations between parent and child trials using specified filter configurations."""
     parent_trial = parent_trial.copy()
     child_trial = child_trial.copy()
     
     # 1. IMU projection
-    if condition not in ['unprojected', 'ekf']:
+    if project:
         parent_offset, child_offset, error = parent_trial.world_trace.get_joint_center(child_trial.world_trace)
         if np.mean(np.linalg.norm(error, axis=1)) > 0.05:
-            print(f"Warning: High joint center error ({np.mean(np.linalg.norm(error, axis=1))} m) "
-                  f"between {parent_trial.name} and {child_trial.name}. Check marker placement.")
+            if os.environ.get("DISABLE_TQDM") != "True":
+                print(f"Warning: High joint center error ({np.mean(np.linalg.norm(error, axis=1))} m) "
+                      f"between {parent_trial.name} and {child_trial.name}. Check marker placement.")
         parent_trial.imu_trace = parent_trial.project_imu_trace(parent_offset)
         child_trial.imu_trace = child_trial.project_imu_trace(child_offset)
 
     # 2. Magnetometer modifications
-    if condition == 'mag adapt':
+    if mag_mode == 'adapt':
         obs = _calculate_observability_metric_(parent_trial, child_trial)
         high_idx = obs > mag_adapt_threshold
         parent_trial.imu_trace.mag[high_idx] = 0.0
         child_trial.imu_trace.mag[high_idx] = 0.0
-    elif condition == 'mag off':
+    elif mag_mode == 'off':
         parent_trial.imu_trace.mag = np.zeros_like(parent_trial.imu_trace.mag)
         child_trial.imu_trace.mag = np.zeros_like(child_trial.imu_trace.mag)
-    elif condition not in ['mag on', 'unprojected', 'ekf']:
-        raise ValueError(f"Unknown condition '{condition}' specified for joint orientation estimation.")
+    elif mag_mode != 'on':
+        raise ValueError(f"Unknown mag_mode '{mag_mode}' specified.")
 
     # 3. Filter execution
     joint_filter = RelativeFilter(
@@ -111,427 +140,492 @@ def calculate_joint_angle_from_segments(parent_trial: PlateTrial,
                             [child_trial.imu_trace.acc[0], child_trial.imu_trace.mag[0]], dt)
 
     # Main update loop
-    R_pc = []
-    for t in range(len(parent_trial)):
-        joint_filter.update(parent_trial.imu_trace.gyro[t], child_trial.imu_trace.gyro[t],
-                            [parent_trial.imu_trace.acc[t], parent_trial.imu_trace.mag[t]],
-                            [child_trial.imu_trace.acc[t], child_trial.imu_trace.mag[t]], dt)
-        R_pc.append(joint_filter.get_R_pc())
+    N = len(parent_trial)
+    R_pc = np.empty((N, 3, 3), dtype=np.float64)
 
+    for t in range(N):
+        joint_filter.update(
+            parent_trial.imu_trace.gyro[t], child_trial.imu_trace.gyro[t],
+            [parent_trial.imu_trace.acc[t], parent_trial.imu_trace.mag[t]],
+            [child_trial.imu_trace.acc[t], child_trial.imu_trace.mag[t]], dt
+        )
+        R_pc[t] = joint_filter.get_R_pc()
     return R_pc
 
-def generate_joint_angle_npz(output_directory: str,
-                              plate_trials: List[PlateTrial],
-                              num_frames: int,
-                              condition: str = 'Never Project') -> Tuple[float, List[str]]:
-    """Generates a .npz file containing root orientations and precalculated joint angles directly."""
-    num_frames = num_frames if num_frames > 0 else len(plate_trials[0])
-    plate_trials = [plate[:num_frames] for plate in plate_trials]
-    timestamps = plate_trials[0].imu_trace.timestamps
-    data_dict = {}
-
-    def get_plate(name_pattern):
-        return next((p for p in plate_trials if name_pattern in p.name), None)
-
-    pelvis_plate = get_plate('pelvis_imu')
-
-    if condition == 'marker':
-        if pelvis_plate:
-            data_dict['pelvis_imu'] = pelvis_plate.world_trace.rotations
-            
-        for joint_name, (parent, child) in JOINT_SEGMENT_DICT.items():
-            parent_plate = get_plate(parent)
-            child_plate = get_plate(child)
-            if parent_plate and child_plate:
-                R_joint = np.einsum('tji,tjk->tik', parent_plate.world_trace.rotations, child_plate.world_trace.rotations)
-                data_dict[joint_name] = Rotation.from_matrix(R_joint).as_rotvec()
-
-    elif condition == 'ekf':
-        segment_orientations = {}
-        ground_plate = _setup_ekf_ground_plate_(plate_trials)
-            
-        for plate in plate_trials:
-            segment_orientations[plate.name] = calculate_joint_angle_from_segments(
-                ground_plate, plate, condition='ekf',
-                gyro_std_parent=1e-4, acc_std_parent=1e-4, mag_std_parent=1e-4,
-                project_imu=False, warmup_steps=2000
-            )
-            
-        pelvis_key = next((k for k in segment_orientations if 'pelvis_imu' in k), None)
-        if pelvis_key:
-            data_dict['pelvis_imu'] = np.array(segment_orientations[pelvis_key])
-
-        for joint_name, (parent, child) in JOINT_SEGMENT_DICT.items():
-            parent_key = next((k for k in segment_orientations if parent in k), None)
-            child_key = next((k for k in segment_orientations if child in k), None)
-            if parent_key and child_key:
-                R_parent = np.array(segment_orientations[parent_key])
-                R_child = np.array(segment_orientations[child_key])
-                R_joint = np.einsum('tji,tjk->tik', R_parent, R_child)
-                data_dict[joint_name] = Rotation.from_matrix(R_joint).as_rotvec()
-
-    else:
-        if pelvis_plate:
-            data_dict['pelvis_imu'] = pelvis_plate.world_trace.rotations
-
-        for joint_name, (parent, child) in JOINT_SEGMENT_DICT.items():
-            parent_plate = get_plate(parent)
-            child_plate = get_plate(child)
-            if parent_plate and child_plate:
-                R_pc = calculate_joint_angle_from_segments(parent_plate, child_plate, condition)
-                data_dict[joint_name] = Rotation.from_matrix(R_pc).as_rotvec()
-
-    output_path = os.path.join(
-        output_directory,
-        f'{"walking" if "walking" in output_directory else "complexTasks"}_orientations_{condition.lower().replace(" ", "_")}.npz'
-    )
-    os.makedirs(output_directory, exist_ok=True)
-    np.savez_compressed(output_path, timestamps=timestamps, **data_dict)
-    return timestamps[-1], list(data_dict.keys())
-
-def process_subject_activity(subject_num: str, activity: str, num_frames: int):
-    print(f"-------Processing Subject {subject_num}, Activity {activity}...--------")
-    try:
-        subject_activity_folder = os.path.abspath(os.path.join("data", f"Subject{subject_num}", activity))
-        plate_trials = DataLoader(subject_activity_folder).load_plate_trials(align_plate_trials=True)
-
-        print(f"Loaded {len(plate_trials)} plate trials for Subject {subject_num}, {activity}.")
-        print(f"Identified segments: {[plate.name for plate in plate_trials]}")
-
-        for condition in METHODS:
-            print(f"Generating NPZ file for Subject {subject_num}, {activity}, condition: {condition}...")
-            generate_joint_angle_npz(subject_activity_folder, plate_trials, num_frames, condition.lower())
-    except Exception as e:
-        print(f"Failed to process Subject {subject_num}, Activity {activity}: {e}")
-
-# ==============================================================================
-# PART 2: Statistics Analysis & Downstream Aggregation
-# ==============================================================================
-
-def get_joint_traces_from_world_traces(world_traces: Dict[str, WorldTrace]) -> pd.DataFrame:
-    """Calculates joint rotations (child relative to parent) from WorldTraces."""
+def _joint_angles_from_marker(plates: Dict[str, PlateTrial]) -> pd.DataFrame:
     all_joint_data = []
-    any_trace = next(iter(world_traces.values()))
-    timestamps = any_trace.timestamps
+    any_plate = next(iter(plates.values()))
+    timestamps = any_plate.imu_trace.timestamps
     
-    for joint_name, (parent_name, child_name) in JOINT_SEGMENT_DICT.items():
-        parent_key = next((k for k in world_traces if parent_name in k), None)
-        child_key = next((k for k in world_traces if child_name in k), None)
-        
-        if not parent_key or not child_key:
+    for joint_name, (parent, child) in JOINTS.items():
+        if parent not in plates or child not in plates:
+            if os.environ.get("DISABLE_TQDM") != "True":
+                print(f"Skipping joint {joint_name}: parent '{parent}' or child '{child}' not in loaded plates.")
             continue
-            
-        parent_trace = world_traces[parent_key]
-        child_trace = world_traces[child_key]
+        parent_plate = plates[parent]
+        child_plate = plates[child]
+        R_joint = np.einsum('tji,tjk->tik', parent_plate.world_trace.rotations, child_plate.world_trace.rotations)
+        rotvec = Rotation.from_matrix(R_joint).as_rotvec()
         
-        # R_joint = R_parent.T @ R_child
-        R_joint = np.einsum('tji,tjk->tik', parent_trace.rotations, child_trace.rotations)
-        joint_rotations_rotvec = Rotation.from_matrix(R_joint).as_rotvec()
-        
-        joint_df = pd.DataFrame({
+        df = pd.DataFrame({
             'timestamp': timestamps,
-            'angle_axis_x_rad': joint_rotations_rotvec[:, 0],
-            'angle_axis_y_rad': joint_rotations_rotvec[:, 1],
-            'angle_axis_z_rad': joint_rotations_rotvec[:, 2],
+            'joint_name': joint_name,
+            'rx': rotvec[:, 0],
+            'ry': rotvec[:, 1],
+            'rz': rotvec[:, 2],
         })
-        joint_df['joint_name'] = joint_name
-        all_joint_data.append(joint_df)
+        all_joint_data.append(df)
         
-    if not all_joint_data:
-        return pd.DataFrame()
-    return pd.concat(all_joint_data, ignore_index=True)
+    return pd.concat(all_joint_data, ignore_index=True) if all_joint_data else pd.DataFrame()
 
-def load_joint_traces_for_subject_df(subject_id: str, 
-                                     trial_type: str,
-                                     methods: List[str]) -> pd.DataFrame:
-    """Loads, resyncs, and processes joint traces for a specific subject/trial from precalculated NPZs."""
-    plate_trials_by_method = {}
+def _joint_angles_from_filter(plates: Dict[str, PlateTrial], project: bool, mag_mode: str) -> pd.DataFrame:
+    all_joint_data = []
+    any_plate = next(iter(plates.values()))
+    timestamps = any_plate.imu_trace.timestamps
     
-    try:
-        # Load Marker first to define primary timestamps and get length
-        marker_npz_path = os.path.abspath(os.path.join("data", subject_id, trial_type, f"{trial_type}_orientations_marker.npz"))
-        if not os.path.exists(marker_npz_path):
-            print(f"Error: Marker NPZ not found for {subject_id} {trial_type}. Skipping.")
-            return pd.DataFrame()
-            
-        marker_data = np.load(marker_npz_path)
-        min_length = len(marker_data['timestamps'])
+    for joint_name, (parent, child) in JOINTS.items():
+        if parent not in plates or child not in plates:
+            if os.environ.get("DISABLE_TQDM") != "True":
+                print(f"Skipping joint {joint_name}: parent '{parent}' or child '{child}' not in loaded plates.")
+            continue
+        parent_plate = plates[parent]
+        child_plate = plates[child]
+        R_pc = _run_relative_filter(parent_plate, child_plate, project=project, mag_mode=mag_mode)
+        rotvec = Rotation.from_matrix(R_pc).as_rotvec()
         
-        # Load and verify lengths for all other methods
-        loaded_methods = {}
-        for method in methods:
-            npz_path = os.path.abspath(os.path.join("data", subject_id, trial_type, f"{trial_type}_orientations_{method.replace(' ', '_').lower()}.npz"))
-            sto_path = os.path.abspath(os.path.join("data", subject_id, trial_type, f"{trial_type}_orientations_{method.replace(' ', '_').lower()}.sto"))
-            
-            if os.path.exists(npz_path):
-                # Try loading baked joint angles from NPZ directly for speed
-                data = np.load(npz_path)
-                loaded_methods[method] = (data, 'npz')
-                min_length = min(min_length, len(data['timestamps']))
-            elif os.path.exists(sto_path):
-                # Fallback to parsing STO
-                world_traces = parse_sto_file(sto_path)
-                loaded_methods[method] = (world_traces, 'sto')
-                any_trace = next(iter(world_traces.values()))
-                min_length = min(min_length, len(any_trace.timestamps))
-                
-        # Aggregate joint angles for each method trimmed to min_length
-        all_method_dfs = []
-        for method, (data, file_type) in loaded_methods.items():
-            if file_type == 'npz':
-                timestamps = data['timestamps'][-min_length:]
-                joint_dfs = []
-                for joint_name in JOINT_SEGMENT_DICT:
-                    if joint_name in data:
-                        rotvec = data[joint_name][-min_length:]
-                        df = pd.DataFrame({
-                            'timestamp': timestamps,
-                            'angle_axis_x_rad': rotvec[:, 0],
-                            'angle_axis_y_rad': rotvec[:, 1],
-                            'angle_axis_z_rad': rotvec[:, 2],
-                        })
-                        df['joint_name'] = joint_name
-                        joint_dfs.append(df)
-                if joint_dfs:
-                    joint_df = pd.concat(joint_dfs, ignore_index=True)
-                else:
-                    joint_df = pd.DataFrame()
-            else: # sto fallback
-                # Slices all world trace rotations to match min_length
-                sliced_world_traces = {}
-                for key, trace in data.items():
-                    sliced_world_traces[key] = WorldTrace(
-                        timestamps=trace.timestamps[-min_length:],
-                        positions=trace.positions[-min_length:],
-                        rotations=trace.rotations[-min_length:]
-                    )
-                joint_df = get_joint_traces_from_world_traces(sliced_world_traces)
-                
-            if not joint_df.empty:
-                joint_df['method'] = method
-                all_method_dfs.append(joint_df)
+        df = pd.DataFrame({
+            'timestamp': timestamps,
+            'joint_name': joint_name,
+            'rx': rotvec[:, 0],
+            'ry': rotvec[:, 1],
+            'rz': rotvec[:, 2],
+        })
+        all_joint_data.append(df)
+        
+    return pd.concat(all_joint_data, ignore_index=True) if all_joint_data else pd.DataFrame()
 
-        if not all_method_dfs:
-            return pd.DataFrame()
-            
-        final_df = pd.concat(all_method_dfs, ignore_index=True)
-        final_df['subject_id'] = subject_id
-        final_df['trial_type'] = trial_type
+def _joint_angles_from_ekf(plates: Dict[str, PlateTrial]) -> pd.DataFrame:
+    plate_trials = list(plates.values())
+    ground_plate = _setup_ekf_ground_plate_(plate_trials)
+    
+    segment_orientations = {}
+    for plate_name, plate in plates.items():
+        segment_orientations[plate_name] = _run_relative_filter(
+            ground_plate, plate, project=False, mag_mode='on',
+            warmup_steps=2000
+        )
         
-        # Columns normalization
-        meta_cols = ['subject_id', 'trial_type', 'method', 'joint_name', 'timestamp']
-        data_cols = ['angle_axis_x_rad', 'angle_axis_y_rad', 'angle_axis_z_rad']
-        columns_order = [col for col in meta_cols + data_cols if col in final_df.columns]
+    all_joint_data = []
+    timestamps = plate_trials[0].imu_trace.timestamps
+    
+    for joint_name, (parent, child) in JOINTS.items():
+        if parent not in segment_orientations or child not in segment_orientations:
+            if os.environ.get("DISABLE_TQDM") != "True":
+                print(f"Skipping joint {joint_name}: parent '{parent}' or child '{child}' not in segment orientations.")
+            continue
+        R_parent = np.array(segment_orientations[parent])
+        R_child = np.array(segment_orientations[child])
+        R_joint = np.einsum('tji,tjk->tik', R_parent, R_child)
+        rotvec = Rotation.from_matrix(R_joint).as_rotvec()
         
-        final_df = final_df.reindex(columns=columns_order)
-        final_df = final_df.set_index(['subject_id', 'trial_type', 'method', 'joint_name', 'timestamp']).sort_index()
-        return final_df
+        df = pd.DataFrame({
+            'timestamp': timestamps,
+            'joint_name': joint_name,
+            'rx': rotvec[:, 0],
+            'ry': rotvec[:, 1],
+            'rz': rotvec[:, 2],
+        })
+        all_joint_data.append(df)
         
-    except Exception as e:
-        print(f"Error loading joint data for {subject_id}: {e}. Skipping subject.")
+    return pd.concat(all_joint_data, ignore_index=True) if all_joint_data else pd.DataFrame()
+
+def compute_joint_angles(plates: Dict[str, PlateTrial], method: str) -> pd.DataFrame:
+    spec = METHODS[method]
+    if spec['kind'] == 'marker':
+        return _joint_angles_from_marker(plates)
+    if spec['kind'] == 'ekf':
+        return _joint_angles_from_ekf(plates)
+    return _joint_angles_from_filter(plates, project=spec['project'], mag_mode=spec['mag_mode'])
+
+# ==============================================================================
+# STAGE 2 — Intermediate save/load
+# ==============================================================================
+
+def joint_angles_path(subject: str, activity: str, method: str) -> Path:
+    return BASE_DATA_PATH / f"Subject{subject}" / activity / f"{method}.parquet"
+
+def save_joint_angles(df: pd.DataFrame, subject: str, activity: str, method: str):
+    path = joint_angles_path(subject, activity, method)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, engine='pyarrow')
+
+def load_joint_angles(subject: str, activity: str, method: str) -> Optional[pd.DataFrame]:
+    path = joint_angles_path(subject, activity, method)
+    return pd.read_parquet(path, engine='pyarrow') if path.exists() else None
+
+# ==============================================================================
+# STAGE 3 — Statistics on joint angles
+# ==============================================================================
+
+def load_all_joint_angles(subjects: List[str], activities: List[str], methods: List[str]) -> pd.DataFrame:
+    frames = []
+    for subject, activity, method in itertools.product(subjects, activities, methods):
+        df = load_joint_angles(subject, activity, method)
+        if df is None:
+            if os.environ.get("DISABLE_TQDM") != "True":
+                print(f"Warning: missing joint angles for Subject{subject}/{activity}/{method} — skipping")
+            continue
+        df = df.assign(subject=f"Subject{subject}", trial_type=activity, method=method)
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+import numpy as np
+import pandas as pd
+from scipy.spatial.transform import Rotation as R
+
+def compute_error_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculates summary statistics using fast wide-format C-aggregations."""
+    if df.empty:
         return pd.DataFrame()
-
-def get_summary_statistics(all_data_df: pd.DataFrame, group_by: List[str]) -> pd.DataFrame:
-    """Calculates summary statistics of error vectors against Marker ground truth."""
-    if 'subject' in group_by and 'subject_id' in all_data_df.index.names:
-        df = all_data_df.rename_axis(index={'subject_id': 'subject'})
-    else:
-        df = all_data_df.copy()
-
-    index_levels = df.index.names
-    try:
-        df_reset = df.reset_index()
-        marker_df_full = df_reset[df_reset['method'] == 'Marker']
-        imu_df_full = df_reset[df_reset['method'] != 'Marker']
-    except KeyError:
+        
+    marker_df = df[df['method'] == 'marker']
+    imu_df = df[df['method'] != 'marker']
+    
+    if marker_df.empty or imu_df.empty:
         return pd.DataFrame()
         
-    if imu_df_full.empty:
-        return pd.DataFrame()
-
-    join_levels = [name for name in index_levels if name != 'method']
-    merged_df = pd.merge(imu_df_full, marker_df_full, on=join_levels, suffixes=('_imu', '_marker'))
+    join_cols = ['subject', 'trial_type', 'joint_name', 'timestamp']
+    merged_df = pd.merge(imu_df, marker_df, on=join_cols, suffixes=('_imu', '_marker'))
     
     if merged_df.empty:
         return pd.DataFrame()
 
-    aa_cols_imu = ['angle_axis_x_rad_imu', 'angle_axis_y_rad_imu', 'angle_axis_z_rad_imu']
-    aa_cols_marker = ['angle_axis_x_rad_marker', 'angle_axis_y_rad_marker', 'angle_axis_z_rad_marker']
+    rotvec_imu = merged_df[['rx_imu', 'ry_imu', 'rz_imu']].to_numpy()
+    rotvec_marker = merged_df[['rx_marker', 'ry_marker', 'rz_marker']].to_numpy()
 
-    imu_vecs = merged_df[aa_cols_imu].values
-    marker_vecs = merged_df[aa_cols_marker].values
-    error_vecs = imu_vecs - marker_vecs
+    r_imu = R.from_rotvec(rotvec_imu)
+    r_marker = R.from_rotvec(rotvec_marker)
+    r_error = r_imu * r_marker.inv()
+    rotvec_error = r_error.as_rotvec()
 
-    error_magnitude = np.linalg.norm(error_vecs, axis=1)
-    MAGNITUDE_COL_NAME = 'angle_axis_error_magnitude_rad'
-    merged_df[MAGNITUDE_COL_NAME] = error_magnitude
-    merged_df['error_aa_x_rad'] = error_vecs[:, 0]
-    merged_df['error_aa_y_rad'] = error_vecs[:, 1]
-    merged_df['error_aa_z_rad'] = error_vecs[:, 2]
+    merged_df['X'] = rotvec_error[:, 0]
+    merged_df['Y'] = rotvec_error[:, 1]
+    merged_df['Z'] = rotvec_error[:, 2]
+    merged_df['MAG'] = np.linalg.norm(rotvec_error, axis=1)
+    
+    merged_df = merged_df.rename(columns={'method_imu': 'method'})
+    group_cols = ['trial_type', 'method', 'joint_name', 'subject']
+    target_cols = ['MAG', 'X', 'Y', 'Z']
 
-    error_cols_dict = {
-        MAGNITUDE_COL_NAME: 'MAG',
-        'error_aa_x_rad': 'X',
-        'error_aa_y_rad': 'Y',
-        'error_aa_z_rad': 'Z'
+    # Pre-calculate squared & absolute columns for vectorized MAE/RMSE
+    for col in target_cols:
+        merged_df[f'{col}_sq'] = merged_df[col] ** 2
+        merged_df[f'{col}_abs'] = merged_df[col].abs()
+
+    # Fast built-in aggregations across wide format
+    grouped = merged_df.groupby(group_cols)
+    
+    means = grouped[target_cols].mean()
+    stds = grouped[target_cols].std()
+    mins = grouped[target_cols].min()
+    maxs = grouped[target_cols].max()
+    medians = grouped[target_cols].median()
+    q25s = grouped[target_cols].quantile(0.25)
+    q75s = grouped[target_cols].quantile(0.75)
+    maes = grouped[[f'{c}_abs' for c in target_cols]].mean().rename(columns=lambda c: c.replace('_abs', ''))
+    rmses = np.sqrt(grouped[[f'{c}_sq' for c in target_cols]].mean()).rename(columns=lambda c: c.replace('_sq', ''))
+    
+    # MAD: median absolute deviation from median
+    mads = grouped[target_cols].apply(lambda g: (g - g.median()).abs().median())
+
+    # Build multi-index summary and melt at the very end
+    summary_list = []
+    metric_map = {
+        'mean_rad': means, 'std_rad': stds, 'rmse_rad': rmses, 
+        'mae_rad': maes, 'mad_rad': mads, 'min_rad': mins, 
+        'q25_rad': q25s, 'median_rad': medians, 'q75_rad': q75s, 'max_rad': maxs
     }
     
-    meta_cols = [lvl for lvl in join_levels]
-    if 'method_imu' in merged_df.columns:
-        merged_df = merged_df.rename(columns={'method_imu': 'method'})
-    
-    if 'method' not in meta_cols:
-        meta_cols.append('method')
-        
-    id_vars = [col for col in meta_cols if col in merged_df.columns]
-    error_long = pd.melt(merged_df, id_vars=id_vars, value_vars=list(error_cols_dict.keys()), var_name='error_metric_name', value_name='error_rad')
-    error_long['axis'] = error_long['error_metric_name'].map(error_cols_dict)
-    
-    final_index_cols = [col for col in group_by if col in error_long.columns]
-    final_index_cols.append('axis')
-    final_index_cols = list(dict.fromkeys(final_index_cols))
+    for metric_name, metric_df in metric_map.items():
+        melted = metric_df.reset_index().melt(
+            id_vars=group_cols, value_vars=target_cols, var_name='axis', value_name=metric_name
+        )
+        summary_list.append(melted.set_index(group_cols + ['axis']))
 
-    set_index_cols = [col for col in final_index_cols if col in error_long.columns]
-    error_long_indexed = error_long.set_index(set_index_cols)
-
-    def q25(x): return x.quantile(0.25)
-    def q75(x): return x.quantile(0.75)
-    def rmse(x): return np.sqrt(np.mean(x**2))
-    def mae(x): return x.abs().mean()
-    def mad(x): return (x - x.median()).abs().median()
-
-    summary_df = error_long_indexed['error_rad'].groupby(level=set_index_cols).agg(
-        [np.mean, np.std, rmse, mae, mad, np.min, q25, np.median, q75, np.max]
-    )
-    summary_df.columns = ['mean_rad', 'std_rad', 'rmse_rad', 'mae_rad', 'mad_rad', 'min_rad', 'q25_rad', 'median_rad', 'q75_rad', 'max_rad']
+    summary_df = pd.concat(summary_list, axis=1).reset_index()
     return summary_df
 
-def get_pearson_correlation_summary(all_data_df: pd.DataFrame, group_by: List[str]) -> pd.DataFrame:
-    """Generates a Pearson correlation summary comparing predicted joint angles vs Marker."""
-    if 'subject' in group_by and 'subject_id' in all_data_df.index.names:
-        df = all_data_df.rename_axis(index={'subject_id': 'subject'})
-    else:
-        df = all_data_df.copy()
-
-    index_levels = df.index.names
-    try:
-        df_reset = df.reset_index()
-        marker_df_full = df_reset[df_reset['method'] == 'Marker']
-        imu_df_full = df_reset[df_reset['method'] != 'Marker']
-    except KeyError:
+def compute_correlation_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """Generates a Pearson correlation summary using fully vectorized operations."""
+    if df.empty:
         return pd.DataFrame()
-
-    join_levels = [name for name in index_levels if name != 'method']
-    merged_df = pd.merge(imu_df_full, marker_df_full, on=join_levels, suffixes=('_imu', '_marker'))
-
+        
+    marker_df = df[df['method'] == 'marker']
+    imu_df = df[df['method'] != 'marker']
+    
+    if marker_df.empty or imu_df.empty:
+        return pd.DataFrame()
+        
+    join_cols = ['subject', 'trial_type', 'joint_name', 'timestamp']
+    merged_df = pd.merge(imu_df, marker_df, on=join_cols, suffixes=('_imu', '_marker'))
+    
     if merged_df.empty:
         return pd.DataFrame()
-
-    if 'method_imu' in merged_df.columns:
-        merged_df = merged_df.rename(columns={'method_imu': 'method'})
         
-    meta_cols = [lvl for lvl in join_levels]
-    if 'method' not in meta_cols:
-        meta_cols.append('method')
+    merged_df = merged_df.rename(columns={'method_imu': 'method'})
+    groupby_cols = ['trial_type', 'method', 'joint_name', 'subject']
 
-    groupby_cols = [col for col in group_by if col in merged_df.columns]
-    
-    def calculate_pair_correlation(group, col_pairs):
-        corrs = {}
-        for axis_name, (col_imu, col_marker) in col_pairs.items():
-            if len(group) > 1:
-                corr_matrix = np.corrcoef(group[col_imu], group[col_marker])
-                corrs[axis_name] = corr_matrix[0, 1] if not np.isnan(corr_matrix[0, 1]) else 0.0
-            else:
-                corrs[axis_name] = 0.0
-        return pd.Series(corrs)
+    # Vectorized mean-centering across all rows
+    aggs = {}
+    for axis in ['x', 'y', 'z']:
+        col_imu = f'r{axis}_imu'
+        col_marker = f'r{axis}_marker'
+        
+        imu_mean = merged_df.groupby(groupby_cols)[col_imu].transform('mean')
+        marker_mean = merged_df.groupby(groupby_cols)[col_marker].transform('mean')
+        
+        dx = merged_df[col_imu] - imu_mean
+        dy = merged_df[col_marker] - marker_mean
+        
+        merged_df[f'cov_{axis}'] = dx * dy
+        merged_df[f'var_imu_{axis}'] = dx ** 2
+        merged_df[f'var_marker_{axis}'] = dy ** 2
+        
+        aggs[f'cov_{axis}'] = 'sum'
+        aggs[f'var_imu_{axis}'] = 'sum'
+        aggs[f'var_marker_{axis}'] = 'sum'
 
-    col_pairs = {
-        'X': ('angle_axis_x_rad_imu', 'angle_axis_x_rad_marker'),
-        'Y': ('angle_axis_y_rad_imu', 'angle_axis_y_rad_marker'),
-        'Z': ('angle_axis_z_rad_imu', 'angle_axis_z_rad_marker')
-    }
+    # Single vectorized aggregation pass
+    grouped = merged_df.groupby(groupby_cols).agg(aggs)
 
-    corr_df = merged_df.groupby(groupby_cols).apply(calculate_pair_correlation, col_pairs=col_pairs)
-    corr_df_stacked = corr_df.stack().to_frame()
+    # Compute correlation per axis
+    corr_cols = {}
+    for axis, upper_axis in [('x', 'X'), ('y', 'Y'), ('z', 'Z')]:
+        denom = np.sqrt(grouped[f'var_imu_{axis}'] * grouped[f'var_marker_{axis}'])
+        corr_cols[upper_axis] = np.where(denom > 1e-12, grouped[f'cov_{axis}'] / denom, 0.0)
+
+    res_df = pd.DataFrame(corr_cols, index=grouped.index)
+    corr_df_stacked = res_df.stack().to_frame()
     corr_df_stacked.index.names = groupby_cols + ['axis']
     corr_df_stacked.columns = ['pearson_r']
     return corr_df_stacked
 
 # ==============================================================================
-# PART 3: Core Orchestrator
+# CLI / ORCHESTRATOR
 # ==============================================================================
+
+def process_subject_activity(subject: str, activity: str, methods: List[str], shared_state: Dict):
+    shared_state[(subject, activity, 'load')] = "Running"
+    try:
+        plates = load_raw_data(subject, activity)
+        shared_state[(subject, activity, 'load')] = "Success"
+        
+        for method in methods:
+            shared_state[(subject, activity, method)] = "Running"
+            try:
+                df = compute_joint_angles(plates, method)
+                if df is not None and not df.empty:
+                    save_joint_angles(df, subject, activity, method)
+                    shared_state[(subject, activity, method)] = "Success"
+                else:
+                    shared_state[(subject, activity, method)] = "Skipped"
+            except Exception as e:
+                shared_state[(subject, activity, method)] = f"Failed ({e})"
+    except Exception as e:
+        shared_state[(subject, activity, 'load')] = "Failed"
+        for method in methods:
+            shared_state[(subject, activity, method)] = "Failed"
+
+def make_table(subjects: List[str], activities: List[str], methods: List[str], shared_state: Dict) -> Table:
+    table = Table(
+        title="[bold magenta]🔮 MAJIC MOCAP PIPELINE STATUS 🔮[/bold magenta]", 
+        show_header=True, 
+        header_style="bold cyan",
+        border_style="bold blue"
+    )
+    table.add_column("Subject", style="bold white", justify="center")
+    table.add_column("Activity", style="bold white", justify="center")
+    table.add_column("Load Raw", justify="center")
+    for method in methods:
+        table.add_column(method, justify="center")
+    table.add_column("Stats", justify="center")
+    
+    for subject in subjects:
+        for activity in activities:
+            row = [subject, activity]
+            
+            # Step 1: Load Data
+            load_status = shared_state.get((subject, activity, 'load'), 'Pending')
+            if load_status == "Pending":
+                row.append("[bold white]■[/bold white]")
+            elif load_status == "Running":
+                row.append("[bold yellow]■[/bold yellow]")
+            elif load_status == "Success":
+                row.append("[bold green]■[/bold green]")
+            else:
+                row.append("[bold red]■[/bold red]")
+                
+            # Step 2: Generate Joint Angles for each method
+            for method in methods:
+                status = shared_state.get((subject, activity, method), 'Pending')
+                if status == "Pending":
+                    row.append("[bold white]■[/bold white]")
+                elif status == "Running":
+                    row.append("[bold yellow]■[/bold yellow]")
+                elif status == "Success":
+                    row.append("[bold green]■[/bold green]")
+                elif status == "Skipped":
+                    row.append("[bold yellow]■[/bold yellow]")
+                else:
+                    row.append("[bold red]■[/bold red]")
+                    
+            # Step 3: Generate Statistics
+            stats_status = shared_state.get((subject, activity, 'stats'), 'Pending')
+            if stats_status == "Pending":
+                row.append("[bold white]■[/bold white]")
+            elif stats_status == "Running":
+                row.append("[bold yellow]■[/bold yellow]")
+            elif stats_status == "Success":
+                row.append("[bold green]■[/bold green]")
+            else:
+                row.append("[bold red]■[/bold red]")
+                
+            table.add_row(*row)
+    return table
 
 def main():
     parser = argparse.ArgumentParser(description="Unified Segment Orientation and Statistics Pipeline.")
+    parser.add_argument("--subjects", nargs='+', default=SUBJECTS, help="Subject IDs to process.")
+    parser.add_argument("--activities", nargs='+', default=ACTIVITIES, help="Activities/trials to process.")
+    parser.add_argument("--methods", nargs='+', default=list(METHODS.keys()), help="Methods to process.")
     parser.add_argument("--stats-only", action="store_true", help="Skip orientation generation and only compile statistics.")
+    parser.add_argument("--workers", type=int, default=os.cpu_count())
     args = parser.parse_args()
 
-    # 1. Orientation NPZ Generation Phase
-    if not args.stats_only:
-        num_frames = -1
-        tasks = []
-        for subject_num in SUBJECTS:
-            for activity in TRIALS:
-                tasks.append((subject_num, activity, num_frames))
+    # Validate up front
+    for m in args.methods:
+        if m not in METHODS:
+            print(f"Error: Unknown method '{m}'. Allowed: {list(METHODS.keys())}")
+            return
+    for a in args.activities:
+        if a not in ACTIVITIES:
+            print(f"Error: Unknown activity '{a}'. Allowed: {ACTIVITIES}")
+            return
 
-        print(f"Starting parallel generation of NPZ files for {len(tasks)} tasks...")
-        with ProcessPoolExecutor() as executor:
-            futures = [executor.submit(process_subject_activity, *task) for task in tasks]
-            for future in futures:
-                future.result()
-        print("NPZ generation phase complete.\n")
+    # We need a shared state manager
+    manager = multiprocessing.Manager()
+    shared_state = manager.dict()
+    
+    # Initialize state
+    for subject in args.subjects:
+        for activity in args.activities:
+            shared_state[(subject, activity, 'load')] = "Pending"
+            for method in args.methods:
+                shared_state[(subject, activity, method)] = "Pending"
+            shared_state[(subject, activity, 'stats')] = "Pending"
+
+    # 1. Orientation NPZ/Pickle Generation Phase
+    if not args.stats_only:
+        print(f"Starting parallel generation of joint angles for {len(args.subjects) * len(args.activities)} tasks using {args.workers} workers...")
+        
+        with Live(make_table(args.subjects, args.activities, args.methods, shared_state), refresh_per_second=4) as live:
+            with ProcessPoolExecutor(max_workers=args.workers) as executor:
+                futures = [executor.submit(process_subject_activity, subject, activity, args.methods, shared_state) 
+                           for subject in args.subjects for activity in args.activities]
+                
+                while any(not f.done() for f in futures):
+                    time.sleep(0.25)
+                    live.update(make_table(args.subjects, args.activities, args.methods, shared_state))
+                
+                # Retrieve results to propagate exceptions if any
+                for f in futures:
+                    f.result()
+                    
+        print("Joint angles generation phase complete.\n")
 
     # 2. Aggregation & Statistics Phase
     print("--- Starting Statistics Aggregation Phase ---")
-    data_file_path = os.path.join(BASE_DATA_PATH, "all_subject_data.pkl")
+    with Live(make_table(args.subjects, args.activities, args.methods, shared_state), refresh_per_second=4) as live:
+        for subject in args.subjects:
+            for activity in args.activities:
+                # Stats fails if any of the requested methods failed or load failed
+                load_success = shared_state.get((subject, activity, 'load')) == "Success"
+                any_method_success = any(shared_state.get((subject, activity, method)) == "Success" for method in args.methods)
+                if not load_success or not any_method_success:
+                    shared_state[(subject, activity, 'stats')] = "Failed"
+                    live.update(make_table(args.subjects, args.activities, args.methods, shared_state))
+                    continue
+                    
+                shared_state[(subject, activity, 'stats')] = "Running"
+                live.update(make_table(args.subjects, args.activities, args.methods, shared_state))
+                
+                try:
+                    frames = []
+                    for method in args.methods:
+                        df = load_joint_angles(subject, activity, method)
+                        if df is not None:
+                            df = df.assign(subject=f"Subject{subject}", trial_type=activity, method=method)
+                            frames.append(df)
+                    
+                    if frames:
+                        all_df = pd.concat(frames, ignore_index=True)
+                        
+                        # Save single subject stats
+                        stats_df = compute_error_stats(all_df)
+                        if not stats_df.empty:
+                            stats_path = BASE_DATA_PATH / f"Subject{subject}" / activity / "all_subject_statistics.parquet"
+                            stats_df.to_parquet(stats_path, engine='pyarrow')
+                            
+                        # Save single subject pearson
+                        pearson_df = compute_correlation_stats(all_df)
+                        if not pearson_df.empty:
+                            pearson_path = BASE_DATA_PATH / f"Subject{subject}" / activity / "all_subject_pearson_correlation.parquet"
+                            pearson_df.to_parquet(pearson_path, engine='pyarrow')
+                            
+                        shared_state[(subject, activity, 'stats')] = "Success"
+                    else:
+                        shared_state[(subject, activity, 'stats')] = "Failed"
+                except Exception:
+                    shared_state[(subject, activity, 'stats')] = "Failed"
+                    
+                live.update(make_table(args.subjects, args.activities, args.methods, shared_state))
+
+    # 3. Global Aggregation & Statistics Phase
+    print("\n--- Starting Global Aggregation & Statistics Phase ---")
+    data_file_path = BASE_DATA_PATH / "all_subject_data.parquet"
     
-    tasks = []
-    # Note: We aggregate across ALL subjects (Subject01-Subject11) and trials
-    for subject_num in SUBJECTS:
-        subject_id = f"Subject{subject_num}"
-        for activity in TRIALS:
-            tasks.append((subject_id, activity, METHODS))
-
-    all_subject_dfs = []
-    print(f"Starting parallel load of precalculated joint data for {len(tasks)} tasks...")
-    with ProcessPoolExecutor() as executor:
-        futures = [executor.submit(load_joint_traces_for_subject_df, *task) for task in tasks]
-        for future in futures:
-            subject_df = future.result()
-            if not subject_df.empty:
-                all_subject_dfs.append(subject_df)
-
-    if not all_subject_dfs:
+    all_data_df = load_all_joint_angles(args.subjects, args.activities, args.methods)
+    if all_data_df.empty:
         print("Error: No data was loaded for any subject. Exiting.")
         return
 
-    print("--- Concatenating all subject trials ---")
-    all_data_df = pd.concat(all_subject_dfs)
-    all_data_df.to_pickle(data_file_path)
+    print("--- Saving concatenated all subject joint angles ---")
+    BASE_DATA_PATH.mkdir(parents=True, exist_ok=True)
+    all_data_df.to_parquet(BASE_DATA_PATH / "all_subject_joint_angles.parquet", engine='pyarrow')
+    # Also save to old-expected path for compatibility if any scripts read it
+    all_data_df.to_parquet(data_file_path, engine='pyarrow')
     print(f"Concatenated DataFrame saved to {data_file_path}")
 
     # Generate and save summary statistics
     print("\n--- Generating summary statistics... ---")
-    stats_file_path = os.path.join(BASE_DATA_PATH, "all_subject_statistics.pkl")
-    summary_stats_df = get_summary_statistics(
-        all_data_df,
-        group_by=['trial_type', 'method', 'joint_name', 'subject']
-    )
-    summary_stats_df.to_pickle(stats_file_path)
-    summary_stats_df.to_csv(os.path.join(BASE_DATA_PATH, "all_subject_statistics.csv"))
-    print(f"Summary statistics saved to {stats_file_path}")
+    stats_file_path = BASE_DATA_PATH / "all_subject_statistics.parquet"
+    summary_stats_df = compute_error_stats(all_data_df)
+    if not summary_stats_df.empty:
+        summary_stats_df.to_parquet(stats_file_path, engine='pyarrow')
+        print(f"Summary statistics saved to {stats_file_path}")
+    else:
+        print("Warning: Summary statistics DataFrame is empty.")
 
     # Generate and save Pearson Correlation summary
     print("\n--- Generating Pearson correlation summary... ---")
-    pearson_corr_file_path = os.path.join(BASE_DATA_PATH, "all_subject_pearson_correlation.pkl")
-    pearson_corr_df = get_pearson_correlation_summary(
-        all_data_df,
-        group_by=['trial_type', 'method', 'joint_name', 'subject']
-    )
-    pearson_corr_df.to_pickle(pearson_corr_file_path)
-    pearson_corr_df.to_csv(os.path.join(BASE_DATA_PATH, "all_subject_pearson_correlation.csv"))
-    print(f"Pearson correlations saved to {pearson_corr_file_path}")
+    pearson_corr_file_path = BASE_DATA_PATH / "all_subject_pearson_correlation.parquet"
+    pearson_corr_df = compute_correlation_stats(all_data_df)
+    if not pearson_corr_df.empty:
+        pearson_corr_df.to_parquet(pearson_corr_file_path, engine='pyarrow')
+        print(f"Pearson correlations saved to {pearson_corr_file_path}")
+    else:
+        print("Warning: Pearson correlation DataFrame is empty.")
+        
     print("\nPipeline finished successfully!")
 
 if __name__ == '__main__':

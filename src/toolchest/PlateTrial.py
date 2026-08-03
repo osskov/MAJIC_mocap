@@ -1,3 +1,4 @@
+from pathlib import Path
 import os
 import numpy as np
 import scipy.signal as signal
@@ -8,8 +9,6 @@ import matplotlib.pyplot as plt
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 from tqdm.auto import tqdm  # Import tqdm for progress bars
-
-
 
 class PlateTrial:
     """
@@ -53,8 +52,9 @@ class PlateTrial:
         
         # Check for timestamp synchronization
         if max(np.abs(imu_trace.timestamps - world_trace.timestamps)) > 1e-8:
-            print(f"Warning: IMU and World traces must have the same timestamps. "
-                  f"Max difference: {max(np.abs(imu_trace.timestamps - world_trace.timestamps))}")
+            if os.getenv("DISABLE_TQDM", "False") != "True":
+                print(f"Warning: IMU and World traces must have the same timestamps. "
+                      f"Max difference: {max(np.abs(imu_trace.timestamps - world_trace.timestamps))}")
         
         assert max(np.abs(imu_trace.timestamps - world_trace.timestamps)) < 1e-8, \
             "Timestamps must match"
@@ -66,7 +66,6 @@ class PlateTrial:
         self.name = name
         self.imu_trace = imu_trace
         self.world_trace = world_trace
-
 
     def __len__(self) -> int:
         """Returns the number of samples (timesteps) in the trial."""
@@ -164,7 +163,7 @@ class PlateTrial:
         return self.imu_trace.project_acc(local_offset)
     
     @staticmethod
-    def generate_plate_from_traces(
+    def from_traces(
         imu_traces: Dict[str, 'IMUTrace'], 
         world_traces: Dict[str, 'WorldTrace'], 
         align_plate_trials: bool
@@ -191,7 +190,7 @@ class PlateTrial:
             List['PlateTrial']: A list of processed, synchronized, and aligned
                 PlateTrial objects.
         """
-        plate_trials = []
+        plate_trials = {}
         imu_slice, world_slice = slice(0, 0), slice(0, 0)
         
         if not imu_traces:
@@ -200,13 +199,16 @@ class PlateTrial:
         
         # --- ADDED TQDM ---
         # Wrap the imu_traces dictionary items with tqdm for a progress bar
-        print("Processing and synchronizing traces...")
-        for imu_name, imu_trace in tqdm(imu_traces.items(), desc="Generating PlateTrials"):
+        disable_tqdm = os.getenv("DISABLE_TQDM", "False") == "True"
+        if not disable_tqdm:
+            print("Processing and synchronizing traces...")
+        for imu_name, imu_trace in tqdm(imu_traces.items(), desc="Generating PlateTrials", disable=disable_tqdm):
             try:
                 # Find the corresponding world_trace using the exact name
                 world_trace = world_traces[imu_name]
             except KeyError:
-                print(f"IMU {imu_name} not found in world traces. Skipping.")
+                if not disable_tqdm:
+                    print(f"IMU {imu_name} not found in world traces. Skipping.")
                 continue
 
             # Resample if frequencies don't match (within a small tolerance)
@@ -228,20 +230,32 @@ class PlateTrial:
             if align_plate_trials:
                 new_plate_trial = new_plate_trial._align_world_trace_to_imu_trace()
                 
-            plate_trials.append(new_plate_trial)
+            plate_trials[imu_name] = new_plate_trial
 
         # Ensure all trials have the same length by trimming to the shortest one
-        plate_trial_lengths = [len(plate_trial) for plate_trial in plate_trials]
+        plate_trial_lengths = [len(plate_trial) for plate_trial in plate_trials.values()]
         if len(set(plate_trial_lengths)) > 1:
-            print(f"Warning: Plate trials have different lengths: {plate_trial_lengths}. "
-                  "Trimming to minimum length.")
+            if not disable_tqdm:
+                print(f"Warning: Plate trials have different lengths: {plate_trial_lengths}. "
+                      "Trimming to minimum length.")
             min_length = min(plate_trial_lengths)
-            plate_trials = [plate_trial[:min_length] for plate_trial in plate_trials]
+            plate_trials = {key: plate[:min_length] for key, plate in plate_trials.items()}
 
-        print(f"Successfully generated {len(plate_trials)} PlateTrials.")
+        if not disable_tqdm:
+            print(f"Successfully generated {len(plate_trials)} PlateTrials.")
         return plate_trials
+    
+    @staticmethod
+    def from_folder(folder_path: Union[str, Path], align_plate_trials: bool = True):
+        folder = Path(folder_path).resolve()
+        imu_traces = IMUTrace.from_folder(folder)
 
-
+        trc_files = list(folder.glob("*.trc"))
+        if not trc_files:
+            raise FileNotFoundError(f"No .trc file found in {folder}")
+        world_traces = WorldTrace.from_trc(trc_files[0])
+        return PlateTrial.from_traces(
+            imu_traces=imu_traces,world_traces=world_traces,align_plate_trials=align_plate_trials)
     
     @staticmethod
     def _sync_traces(imu_trace: IMUTrace, world_trace: WorldTrace) -> Tuple[slice, slice]:
