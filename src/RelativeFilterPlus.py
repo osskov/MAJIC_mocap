@@ -41,7 +41,10 @@ class RelativeFilter:
                  dof2_axis_parent: Optional[np.ndarray] = None, 
                  dof2_axis_child: Optional[np.ndarray] = None, 
                  dof2_angle_rad: float = np.pi/2.0, 
-                 dof2_std: Optional[float] = None):
+                 dof2_std: Optional[float] = None,
+                 r_parent: Optional[np.ndarray] = None,
+                 r_child: Optional[np.ndarray] = None,
+                 use_dyn_noise: bool = False):
         """
         Initializes the filter matrices.
         
@@ -133,6 +136,17 @@ class RelativeFilter:
         self.q_wp = Rotation.identity()
         self.q_wc = Rotation.identity()
 
+        # --- Dynamic Projected Noise Parameters ---
+        self.r_parent = r_parent
+        self.r_child = r_child
+        self.use_dyn_noise = use_dyn_noise
+        
+        self.sigma_a_p = vector_sensor_stds_parent[0][0] if len(vector_sensor_stds_parent) > 0 else 0.05
+        self.sigma_g_p = gyro_std_parent[0]
+        
+        self.sigma_a_c = vector_sensor_stds_child[0][0] if len(vector_sensor_stds_child) > 0 else 0.05
+        self.sigma_g_c = gyro_std_child[0]
+
     def get_q_pc(self) -> Rotation:
         return self.q_wp.inv() * self.q_wc
 
@@ -141,7 +155,9 @@ class RelativeFilter:
 
     def update(self, gyro_p: np.ndarray, gyro_c: np.ndarray, 
                vector_sensor_data_p: List[np.ndarray], 
-               vector_sensor_data_c: List[np.ndarray], dt: float):
+               vector_sensor_data_c: List[np.ndarray], dt: float,
+               acc_p_raw: Optional[np.ndarray] = None,
+               acc_c_raw: Optional[np.ndarray] = None):
         """Performs a full prediction and measurement update cycle."""
         if len(vector_sensor_data_p) != self.num_vector_sensors or len(vector_sensor_data_c) != self.num_vector_sensors:
             raise ValueError(f"Expected {self.num_vector_sensors} vector sensor readings for parent and child.")
@@ -150,7 +166,12 @@ class RelativeFilter:
         q_lin_wp, q_lin_wc = self._get_measurement_update(
             q_lin_wp, q_lin_wc, 
             vector_sensor_data_p, 
-            vector_sensor_data_c
+            vector_sensor_data_c,
+            gyro_p=gyro_p,
+            gyro_c=gyro_c,
+            acc_p_raw=acc_p_raw,
+            acc_c_raw=acc_c_raw,
+            dt=dt
         )
         
         self.q_wp = q_lin_wp
@@ -162,24 +183,34 @@ class RelativeFilter:
 
     @staticmethod
     def skew_symmetric(v: np.ndarray) -> np.ndarray:
-        return np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+        m = np.zeros((3, 3))
+        m[0, 1], m[0, 2] = -v[2], v[1]
+        m[1, 0], m[1, 2] = v[2], -v[0]
+        m[2, 0], m[2, 1] = -v[1], v[0]
+        return m
 
     def _get_time_update(self, gyro_p: np.ndarray, gyro_c: np.ndarray, dt: float) -> Tuple[Rotation, Rotation]:
         """Predicts the next state based on gyroscope data."""
         R_p_update = Rotation.from_rotvec(dt * gyro_p).as_matrix()
         R_c_update = Rotation.from_rotvec(dt * gyro_c).as_matrix()
         
-        F = np.zeros((6, 6))
-        F[:3, :3] = R_p_update
-        F[3:, 3:] = R_c_update
+        P11 = self.P[:3, :3]
+        P12 = self.P[:3, 3:]
+        P22 = self.P[3:, 3:]
         
-        G = np.eye(6) * dt
+        new_P11 = R_p_update @ P11 @ R_p_update.T
+        new_P12 = R_p_update @ P12 @ R_c_update.T
+        new_P22 = R_c_update @ P22 @ R_c_update.T
+        
+        self.P[:3, :3] = new_P11
+        self.P[:3, 3:] = new_P12
+        self.P[3:, :3] = new_P12.T
+        self.P[3:, 3:] = new_P22
+        
+        self.P += (dt**2) * self.Q
 
         q_lin_wp = self._get_gyro_orientation_estimate(self.q_wp, gyro_p, dt)
         q_lin_wc = self._get_gyro_orientation_estimate(self.q_wc, gyro_c, dt)
-
-        # Predict covariance
-        self.P = F @ self.P @ F.T + G @ self.Q @ G.T
         return q_lin_wp, q_lin_wc
 
     def _get_gyro_orientation_estimate(self, q: Rotation, gyro: np.ndarray, dt: float) -> Rotation:
@@ -189,7 +220,12 @@ class RelativeFilter:
 
     def _get_measurement_update(self, q_lin_wp: Rotation, q_lin_wc: Rotation, 
                                 vector_sensor_data_p: List[np.ndarray], 
-                                vector_sensor_data_c: List[np.ndarray]) -> Tuple[Rotation, Rotation]:
+                                vector_sensor_data_c: List[np.ndarray],
+                                gyro_p: Optional[np.ndarray] = None,
+                                gyro_c: Optional[np.ndarray] = None,
+                                acc_p_raw: Optional[np.ndarray] = None,
+                                acc_c_raw: Optional[np.ndarray] = None,
+                                dt: float = 0.01) -> Tuple[Rotation, Rotation]:
         """Corrects the state prediction using sensor measurements."""
         R_wp = q_lin_wp.as_matrix()
         R_wc = q_lin_wc.as_matrix()
@@ -197,10 +233,54 @@ class RelativeFilter:
         # Get Jacobians and residual, evaluated at eta = 0
         H = self.get_H_jacobian(R_wp, R_wc, vector_sensor_data_p, vector_sensor_data_c)
         e = self.get_h(R_wp, R_wc, vector_sensor_data_p, vector_sensor_data_c)
-        M = self.get_M_jacobian(R_wp, R_wc)
         
-        # Kalman gain calculation
-        S = H @ self.P @ H.T + M @ self.R @ M.T
+        if self.use_dyn_noise and self.r_parent is not None and self.r_child is not None and gyro_p is not None and gyro_c is not None:
+            g_p = np.linalg.norm(acc_p_raw) if (acc_p_raw is not None and np.linalg.norm(acc_p_raw) > 1e-3) else 9.80665
+            g_c = np.linalg.norm(acc_c_raw) if (acc_c_raw is not None and np.linalg.norm(acc_c_raw) > 1e-3) else 9.80665
+            
+            sigma_alpha_p = (np.sqrt(2) * self.sigma_g_p) / dt
+            sigma_alpha_c = (np.sqrt(2) * self.sigma_g_c) / dt
+            
+            r_p_skew = self.skew_symmetric(self.r_parent)
+            r_c_skew = self.skew_symmetric(self.r_child)
+            
+            w_p_skew = self.skew_symmetric(gyro_p)
+            w_c_skew = self.skew_symmetric(gyro_c)
+            
+            w_x_r_p = np.cross(gyro_p, self.r_parent)
+            w_x_r_c = np.cross(gyro_c, self.r_child)
+            
+            J_c_p = -self.skew_symmetric(w_x_r_p) - w_p_skew @ r_p_skew
+            J_c_c = -self.skew_symmetric(w_x_r_c) - w_c_skew @ r_c_skew
+            
+            cov_p_local = (self.sigma_a_p**2 * np.eye(3) + 
+                           sigma_alpha_p**2 * r_p_skew @ r_p_skew.T + 
+                           self.sigma_g_p**2 * J_c_p @ J_c_p.T) / (g_p**2)
+                           
+            cov_c_local = (self.sigma_a_c**2 * np.eye(3) + 
+                           sigma_alpha_c**2 * r_c_skew @ r_c_skew.T + 
+                           self.sigma_g_c**2 * J_c_c @ J_c_c.T) / (g_c**2)
+            
+            cov_mag_p = (self.sigma_a_p**2 * np.eye(3))
+            cov_mag_c = (self.sigma_a_c**2 * np.eye(3))
+            
+            if len(vector_sensor_data_p) > 1:
+                norm_mag_p = np.linalg.norm(vector_sensor_data_p[1])
+                norm_mag_c = np.linalg.norm(vector_sensor_data_c[1])
+                if norm_mag_p > 1e-3: cov_mag_p /= (norm_mag_p**2)
+                if norm_mag_c > 1e-3: cov_mag_c /= (norm_mag_c**2)
+
+            S_acc = R_wp @ cov_p_local @ R_wp.T + R_wc @ cov_c_local @ R_wc.T
+            S_mag = R_wp @ cov_mag_p @ R_wp.T + R_wc @ cov_mag_c @ R_wc.T
+            
+            S_meas = np.zeros((6, 6))
+            S_meas[:3, :3] = S_acc
+            S_meas[3:, 3:] = S_mag
+            S = H @ self.P @ H.T + S_meas
+        else:
+            M = self.get_M_jacobian(R_wp, R_wc)
+            S = H @ self.P @ H.T + M @ self.R @ M.T
+        
         K = self.P @ H.T @ np.linalg.inv(S)
         
         # State and covariance update
@@ -215,10 +295,17 @@ class RelativeFilter:
         q_lin_wc = q_lin_wc * q_delta_c
   
         # Update covariance matrix with the rotation correction
-        J = np.eye(6)
-        J[:3, :3] = Rotation.from_rotvec(n[:3]).as_matrix()
-        J[3:, 3:] = Rotation.from_rotvec(n[3:]).as_matrix()
-        self.P = J @ P_tilde @ J.T
+        J_p = q_delta_p.as_matrix()
+        J_c = q_delta_c.as_matrix()
+        
+        Pt11 = P_tilde[:3, :3]
+        Pt12 = P_tilde[:3, 3:]
+        Pt22 = P_tilde[3:, 3:]
+        
+        self.P[:3, :3] = J_p @ Pt11 @ J_p.T
+        self.P[:3, 3:] = J_p @ Pt12 @ J_c.T
+        self.P[3:, :3] = self.P[:3, 3:].T
+        self.P[3:, 3:] = J_c @ Pt22 @ J_c.T
         
         return q_lin_wp, q_lin_wc
 

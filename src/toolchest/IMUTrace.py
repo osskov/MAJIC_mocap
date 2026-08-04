@@ -240,6 +240,17 @@ class IMUTrace:
             mag=self.mag.copy()
         )
 
+    def shallow_copy(self) -> 'IMUTrace':
+        """
+        Returns a shallow copy of the IMUTrace object, sharing the underlying numpy arrays.
+        """
+        return IMUTrace(
+            timestamps=self.timestamps,
+            gyro=self.gyro,
+            acc=self.acc,
+            mag=self.mag
+        )
+
     def _finite_difference_gyros(self, method='polyfit') -> np.ndarray:
         r"""
         Private method to compute the angular acceleration (derivative of gyro).

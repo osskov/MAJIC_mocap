@@ -34,6 +34,7 @@ METHODS = {
     'mag_on':      {'kind': 'filter', 'project': True,  'mag_mode': 'on'},
     'mag_off':     {'kind': 'filter', 'project': True,  'mag_mode': 'off'},
     'mag_adapt':   {'kind': 'filter', 'project': True,  'mag_mode': 'adapt'},
+    'mag_adapt_dyn': {'kind': 'filter', 'project': True,  'mag_mode': 'adapt', 'use_dyn_noise': True},
     'unprojected': {'kind': 'filter', 'project': False, 'mag_mode': 'on'},
     'ekf':         {'kind': 'ekf'},
 }
@@ -90,26 +91,32 @@ def _run_relative_filter(parent_trial: PlateTrial,
                          project: bool,
                          mag_mode: str,
                          gyro_std_parent: float = np.sqrt(0.01),
-                         acc_std_parent: float = np.sqrt(0.05),
-                         mag_std_parent: float = np.sqrt(0.05),
+                         acc_std_parent: float = np.sqrt(0.1),
+                         mag_std_parent: float = np.sqrt(0.1),
                          gyro_std_child: float = np.sqrt(0.01),
-                         acc_std_child: float = np.sqrt(0.05),
-                         mag_std_child: float = np.sqrt(0.05),
+                         acc_std_child: float = np.sqrt(0.1),
+                         mag_std_child: float = np.sqrt(0.1),
                          mag_adapt_threshold: float = 150.0,
-                         warmup_steps: int = 0) -> List[np.ndarray]:
+                         use_dyn_noise: bool = False) -> List[np.ndarray]:
     """Estimates joint orientations between parent and child trials using specified filter configurations."""
     parent_trial = parent_trial.copy()
     child_trial = child_trial.copy()
+
+    # Save raw accelerometer readings before any projection is applied
+    acc_p_raw = parent_trial.imu_trace.acc.copy()
+    acc_c_raw = child_trial.imu_trace.acc.copy()
     
     # 1. IMU projection
-    if project:
+    parent_offset, child_offset = None, None
+    if project or use_dyn_noise:
         parent_offset, child_offset, error = parent_trial.world_trace.get_joint_center(child_trial.world_trace)
-        if np.mean(np.linalg.norm(error, axis=1)) > 0.05:
-            if os.environ.get("DISABLE_TQDM") != "True":
-                print(f"Warning: High joint center error ({np.mean(np.linalg.norm(error, axis=1))} m) "
-                      f"between {parent_trial.name} and {child_trial.name}. Check marker placement.")
-        parent_trial.imu_trace = parent_trial.project_imu_trace(parent_offset)
-        child_trial.imu_trace = child_trial.project_imu_trace(child_offset)
+        if project:
+            if np.mean(np.linalg.norm(error, axis=1)) > 0.05:
+                if os.environ.get("DISABLE_TQDM") != "True":
+                    print(f"Warning: High joint center error ({np.mean(np.linalg.norm(error, axis=1))} m) "
+                          f"between {parent_trial.name} and {child_trial.name}. Check marker placement.")
+            parent_trial.imu_trace = parent_trial.project_imu_trace(parent_offset)
+            child_trial.imu_trace = child_trial.project_imu_trace(child_offset)
 
     # 2. Magnetometer modifications
     if mag_mode == 'adapt':
@@ -128,16 +135,13 @@ def _run_relative_filter(parent_trial: PlateTrial,
         gyro_std_parent=np.ones(3) * gyro_std_parent,
         gyro_std_child=np.ones(3) * gyro_std_child,
         vector_sensor_stds_parent=[np.ones(3) * acc_std_parent, np.ones(3) * mag_std_parent],
-        vector_sensor_stds_child=[np.ones(3) * acc_std_child, np.ones(3) * mag_std_child]
+        vector_sensor_stds_child=[np.ones(3) * acc_std_child, np.ones(3) * mag_std_child],
+        r_parent=parent_offset,
+        r_child=child_offset,
+        use_dyn_noise=use_dyn_noise
     )
     joint_filter.set_qs(Rotation.from_matrix(parent_trial.world_trace.rotations[0]), Rotation.from_matrix(child_trial.world_trace.rotations[0]))
     dt = np.mean(parent_trial.imu_trace.timestamps[1:] - parent_trial.imu_trace.timestamps[:-1])
-
-    # Warmup loop
-    for _ in range(warmup_steps):
-        joint_filter.update(parent_trial.imu_trace.gyro[0], child_trial.imu_trace.gyro[0],
-                            [parent_trial.imu_trace.acc[0], parent_trial.imu_trace.mag[0]],
-                            [child_trial.imu_trace.acc[0], child_trial.imu_trace.mag[0]], dt)
 
     # Main update loop
     N = len(parent_trial)
@@ -147,7 +151,9 @@ def _run_relative_filter(parent_trial: PlateTrial,
         joint_filter.update(
             parent_trial.imu_trace.gyro[t], child_trial.imu_trace.gyro[t],
             [parent_trial.imu_trace.acc[t], parent_trial.imu_trace.mag[t]],
-            [child_trial.imu_trace.acc[t], child_trial.imu_trace.mag[t]], dt
+            [child_trial.imu_trace.acc[t], child_trial.imu_trace.mag[t]], dt,
+            acc_p_raw=acc_p_raw[t],
+            acc_c_raw=acc_c_raw[t]
         )
         R_pc[t] = joint_filter.get_R_pc()
     return R_pc
@@ -178,7 +184,7 @@ def _joint_angles_from_marker(plates: Dict[str, PlateTrial]) -> pd.DataFrame:
         
     return pd.concat(all_joint_data, ignore_index=True) if all_joint_data else pd.DataFrame()
 
-def _joint_angles_from_filter(plates: Dict[str, PlateTrial], project: bool, mag_mode: str) -> pd.DataFrame:
+def _joint_angles_from_filter(plates: Dict[str, PlateTrial], project: bool, mag_mode: str, use_dyn_noise: bool = False) -> pd.DataFrame:
     all_joint_data = []
     any_plate = next(iter(plates.values()))
     timestamps = any_plate.imu_trace.timestamps
@@ -190,7 +196,7 @@ def _joint_angles_from_filter(plates: Dict[str, PlateTrial], project: bool, mag_
             continue
         parent_plate = plates[parent]
         child_plate = plates[child]
-        R_pc = _run_relative_filter(parent_plate, child_plate, project=project, mag_mode=mag_mode)
+        R_pc = _run_relative_filter(parent_plate, child_plate, project=project, mag_mode=mag_mode, use_dyn_noise=use_dyn_noise)
         rotvec = Rotation.from_matrix(R_pc).as_rotvec()
         
         df = pd.DataFrame({
@@ -211,8 +217,7 @@ def _joint_angles_from_ekf(plates: Dict[str, PlateTrial]) -> pd.DataFrame:
     segment_orientations = {}
     for plate_name, plate in plates.items():
         segment_orientations[plate_name] = _run_relative_filter(
-            ground_plate, plate, project=False, mag_mode='on',
-            warmup_steps=2000
+            ground_plate, plate, project=False, mag_mode='on'
         )
         
     all_joint_data = []
@@ -245,7 +250,12 @@ def compute_joint_angles(plates: Dict[str, PlateTrial], method: str) -> pd.DataF
         return _joint_angles_from_marker(plates)
     if spec['kind'] == 'ekf':
         return _joint_angles_from_ekf(plates)
-    return _joint_angles_from_filter(plates, project=spec['project'], mag_mode=spec['mag_mode'])
+    return _joint_angles_from_filter(
+        plates,
+        project=spec['project'],
+        mag_mode=spec['mag_mode'],
+        use_dyn_noise=spec.get('use_dyn_noise', False)
+    )
 
 # ==============================================================================
 # STAGE 2 — Intermediate save/load
@@ -415,17 +425,21 @@ def compute_correlation_stats(df: pd.DataFrame) -> pd.DataFrame:
 # ==============================================================================
 
 def process_subject_activity(subject: str, activity: str, methods: List[str], shared_state: Dict):
+    t_start_load = time.time()
     shared_state[(subject, activity, 'load')] = "Running"
     try:
         plates = load_raw_data(subject, activity)
+        shared_state[(subject, activity, 'load_time')] = time.time() - t_start_load
         shared_state[(subject, activity, 'load')] = "Success"
         
         for method in methods:
+            t_start_method = time.time()
             shared_state[(subject, activity, method)] = "Running"
             try:
                 df = compute_joint_angles(plates, method)
                 if df is not None and not df.empty:
                     save_joint_angles(df, subject, activity, method)
+                    shared_state[(subject, activity, f"{method}_time")] = time.time() - t_start_method
                     shared_state[(subject, activity, method)] = "Success"
                 else:
                     shared_state[(subject, activity, method)] = "Skipped"
@@ -456,24 +470,28 @@ def make_table(subjects: List[str], activities: List[str], methods: List[str], s
             
             # Step 1: Load Data
             load_status = shared_state.get((subject, activity, 'load'), 'Pending')
+            load_time = shared_state.get((subject, activity, 'load_time'), None)
+            time_suffix = f" [dim]({load_time:.1f}s)[/dim]" if load_time is not None else ""
             if load_status == "Pending":
                 row.append("[bold white]■[/bold white]")
             elif load_status == "Running":
                 row.append("[bold yellow]■[/bold yellow]")
             elif load_status == "Success":
-                row.append("[bold green]■[/bold green]")
+                row.append(f"[bold green]■[/bold green]{time_suffix}")
             else:
                 row.append("[bold red]■[/bold red]")
                 
             # Step 2: Generate Joint Angles for each method
             for method in methods:
                 status = shared_state.get((subject, activity, method), 'Pending')
+                m_time = shared_state.get((subject, activity, f"{method}_time"), None)
+                m_time_suffix = f" [dim]({m_time:.1f}s)[/dim]" if m_time is not None else ""
                 if status == "Pending":
                     row.append("[bold white]■[/bold white]")
                 elif status == "Running":
                     row.append("[bold yellow]■[/bold yellow]")
                 elif status == "Success":
-                    row.append("[bold green]■[/bold green]")
+                    row.append(f"[bold green]■[/bold green]{m_time_suffix}")
                 elif status == "Skipped":
                     row.append("[bold yellow]■[/bold yellow]")
                 else:
@@ -481,12 +499,14 @@ def make_table(subjects: List[str], activities: List[str], methods: List[str], s
                     
             # Step 3: Generate Statistics
             stats_status = shared_state.get((subject, activity, 'stats'), 'Pending')
+            stats_time = shared_state.get((subject, activity, 'stats_time'), None)
+            s_time_suffix = f" [dim]({stats_time:.1f}s)[/dim]" if stats_time is not None else ""
             if stats_status == "Pending":
                 row.append("[bold white]■[/bold white]")
             elif stats_status == "Running":
                 row.append("[bold yellow]■[/bold yellow]")
             elif stats_status == "Success":
-                row.append("[bold green]■[/bold green]")
+                row.append(f"[bold green]■[/bold green]{s_time_suffix}")
             else:
                 row.append("[bold red]■[/bold red]")
                 
@@ -556,6 +576,7 @@ def main():
                     live.update(make_table(args.subjects, args.activities, args.methods, shared_state))
                     continue
                     
+                t_start_stats = time.time()
                 shared_state[(subject, activity, 'stats')] = "Running"
                 live.update(make_table(args.subjects, args.activities, args.methods, shared_state))
                 
@@ -573,15 +594,16 @@ def main():
                         # Save single subject stats
                         stats_df = compute_error_stats(all_df)
                         if not stats_df.empty:
-                            stats_path = BASE_DATA_PATH / f"Subject{subject}" / activity / "all_subject_statistics.parquet"
+                            stats_path = BASE_DATA_PATH / f"Subject{subject}" / activity / "subject_statistics.parquet"
                             stats_df.to_parquet(stats_path, engine='pyarrow')
                             
                         # Save single subject pearson
                         pearson_df = compute_correlation_stats(all_df)
                         if not pearson_df.empty:
-                            pearson_path = BASE_DATA_PATH / f"Subject{subject}" / activity / "all_subject_pearson_correlation.parquet"
+                            pearson_path = BASE_DATA_PATH / f"Subject{subject}" / activity / "subject_pearson_correlation.parquet"
                             pearson_df.to_parquet(pearson_path, engine='pyarrow')
                             
+                        shared_state[(subject, activity, 'stats_time')] = time.time() - t_start_stats
                         shared_state[(subject, activity, 'stats')] = "Success"
                     else:
                         shared_state[(subject, activity, 'stats')] = "Failed"
