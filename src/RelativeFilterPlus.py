@@ -136,17 +136,6 @@ class RelativeFilter:
         self.q_wp = Rotation.identity()
         self.q_wc = Rotation.identity()
 
-        # --- Dynamic Projected Noise Parameters ---
-        self.r_parent = r_parent
-        self.r_child = r_child
-        self.use_dyn_noise = use_dyn_noise
-        
-        self.sigma_a_p = vector_sensor_stds_parent[0][0] if len(vector_sensor_stds_parent) > 0 else 0.05
-        self.sigma_g_p = gyro_std_parent[0]
-        
-        self.sigma_a_c = vector_sensor_stds_child[0][0] if len(vector_sensor_stds_child) > 0 else 0.05
-        self.sigma_g_c = gyro_std_child[0]
-
     def get_q_pc(self) -> Rotation:
         return self.q_wp.inv() * self.q_wc
 
@@ -227,6 +216,10 @@ class RelativeFilter:
                                 acc_c_raw: Optional[np.ndarray] = None,
                                 dt: float = 0.01) -> Tuple[Rotation, Rotation]:
         """Corrects the state prediction using sensor measurements."""
+
+        vector_sensor_data_p = [v/np.linalg.norm(v) if np.linalg.norm(v) > 0. else v for v in vector_sensor_data_p]
+        vector_sensor_data_c = [v/np.linalg.norm(v) if np.linalg.norm(v) > 0. else v for v in vector_sensor_data_c]
+
         R_wp = q_lin_wp.as_matrix()
         R_wc = q_lin_wc.as_matrix()
 
@@ -234,52 +227,8 @@ class RelativeFilter:
         H = self.get_H_jacobian(R_wp, R_wc, vector_sensor_data_p, vector_sensor_data_c)
         e = self.get_h(R_wp, R_wc, vector_sensor_data_p, vector_sensor_data_c)
         
-        if self.use_dyn_noise and self.r_parent is not None and self.r_child is not None and gyro_p is not None and gyro_c is not None:
-            g_p = np.linalg.norm(acc_p_raw) if (acc_p_raw is not None and np.linalg.norm(acc_p_raw) > 1e-3) else 9.80665
-            g_c = np.linalg.norm(acc_c_raw) if (acc_c_raw is not None and np.linalg.norm(acc_c_raw) > 1e-3) else 9.80665
-            
-            sigma_alpha_p = (np.sqrt(2) * self.sigma_g_p) / dt
-            sigma_alpha_c = (np.sqrt(2) * self.sigma_g_c) / dt
-            
-            r_p_skew = self.skew_symmetric(self.r_parent)
-            r_c_skew = self.skew_symmetric(self.r_child)
-            
-            w_p_skew = self.skew_symmetric(gyro_p)
-            w_c_skew = self.skew_symmetric(gyro_c)
-            
-            w_x_r_p = np.cross(gyro_p, self.r_parent)
-            w_x_r_c = np.cross(gyro_c, self.r_child)
-            
-            J_c_p = -self.skew_symmetric(w_x_r_p) - w_p_skew @ r_p_skew
-            J_c_c = -self.skew_symmetric(w_x_r_c) - w_c_skew @ r_c_skew
-            
-            cov_p_local = (self.sigma_a_p**2 * np.eye(3) + 
-                           sigma_alpha_p**2 * r_p_skew @ r_p_skew.T + 
-                           self.sigma_g_p**2 * J_c_p @ J_c_p.T) / (g_p**2)
-                           
-            cov_c_local = (self.sigma_a_c**2 * np.eye(3) + 
-                           sigma_alpha_c**2 * r_c_skew @ r_c_skew.T + 
-                           self.sigma_g_c**2 * J_c_c @ J_c_c.T) / (g_c**2)
-            
-            cov_mag_p = (self.sigma_a_p**2 * np.eye(3))
-            cov_mag_c = (self.sigma_a_c**2 * np.eye(3))
-            
-            if len(vector_sensor_data_p) > 1:
-                norm_mag_p = np.linalg.norm(vector_sensor_data_p[1])
-                norm_mag_c = np.linalg.norm(vector_sensor_data_c[1])
-                if norm_mag_p > 1e-3: cov_mag_p /= (norm_mag_p**2)
-                if norm_mag_c > 1e-3: cov_mag_c /= (norm_mag_c**2)
-
-            S_acc = R_wp @ cov_p_local @ R_wp.T + R_wc @ cov_c_local @ R_wc.T
-            S_mag = R_wp @ cov_mag_p @ R_wp.T + R_wc @ cov_mag_c @ R_wc.T
-            
-            S_meas = np.zeros((6, 6))
-            S_meas[:3, :3] = S_acc
-            S_meas[3:, 3:] = S_mag
-            S = H @ self.P @ H.T + S_meas
-        else:
-            M = self.get_M_jacobian(R_wp, R_wc)
-            S = H @ self.P @ H.T + M @ self.R @ M.T
+        M = self.get_M_jacobian(R_wp, R_wc)
+        S = H @ self.P @ H.T + M @ self.R @ M.T
         
         K = self.P @ H.T @ np.linalg.inv(S)
         

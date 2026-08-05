@@ -34,12 +34,12 @@ METHODS = {
     'mag_on':      {'kind': 'filter', 'project': True,  'mag_mode': 'on'},
     'mag_off':     {'kind': 'filter', 'project': True,  'mag_mode': 'off'},
     'mag_adapt':   {'kind': 'filter', 'project': True,  'mag_mode': 'adapt'},
-    'mag_adapt_dyn': {'kind': 'filter', 'project': True,  'mag_mode': 'adapt', 'use_dyn_noise': True},
-    'unprojected': {'kind': 'filter', 'project': False, 'mag_mode': 'on'},
+    # 'mag_adapt_dyn': {'kind': 'filter', 'project': True,  'mag_mode': 'on', 'use_dyn_noise': True},
+    # 'unprojected': {'kind': 'filter', 'project': False, 'mag_mode': 'on'},
     'ekf':         {'kind': 'ekf'},
 }
 
-SUBJECTS = [f'{i:02d}' for i in range(1, 2)]
+SUBJECTS = [f'{i:02d}' for i in range(1, 12)]
 ACTIVITIES = ['walking', 'complexTasks']
 BASE_DATA_PATH = Path("data").resolve()
 
@@ -64,7 +64,7 @@ def _setup_ekf_ground_plate_(plate_trials: List[PlateTrial]) -> PlateTrial:
     # Precompute expected magnetic field as the median of all global magnetic field readings
     all_global_mags = [
         (plate.world_trace.rotations @ plate.imu_trace.mag[..., None])[..., 0]
-        for plate in plate_trials
+        for plate in plate_trials if 'pelvis' in plate.name
     ]
     expected_mag = np.median(np.concatenate(all_global_mags, axis=0), axis=0)
     
@@ -90,12 +90,12 @@ def _run_relative_filter(parent_trial: PlateTrial,
                          child_trial: PlateTrial,
                          project: bool,
                          mag_mode: str,
-                         gyro_std_parent: float = np.sqrt(0.01),
-                         acc_std_parent: float = np.sqrt(0.1),
-                         mag_std_parent: float = np.sqrt(0.1),
-                         gyro_std_child: float = np.sqrt(0.01),
-                         acc_std_child: float = np.sqrt(0.1),
-                         mag_std_child: float = np.sqrt(0.1),
+                         gyro_std_parent: float = 0.0116,
+                         acc_std_parent: float = 0.03,
+                         mag_std_parent: float = 0.05,
+                         gyro_std_child: float = 0.0116,
+                         acc_std_child: float = 0.03,
+                         mag_std_child: float = 0.05,
                          mag_adapt_threshold: float = 150.0,
                          use_dyn_noise: bool = False) -> List[np.ndarray]:
     """Estimates joint orientations between parent and child trials using specified filter configurations."""
@@ -217,7 +217,7 @@ def _joint_angles_from_ekf(plates: Dict[str, PlateTrial]) -> pd.DataFrame:
     segment_orientations = {}
     for plate_name, plate in plates.items():
         segment_orientations[plate_name] = _run_relative_filter(
-            ground_plate, plate, project=False, mag_mode='on'
+            ground_plate, plate, project=False, mag_mode='on'    
         )
         
     all_joint_data = []
