@@ -43,8 +43,7 @@ class RelativeFilter:
                  dof2_angle_rad: float = np.pi/2.0, 
                  dof2_std: Optional[float] = None,
                  r_parent: Optional[np.ndarray] = None,
-                 r_child: Optional[np.ndarray] = None,
-                 use_dyn_noise: bool = False):
+                 r_child: Optional[np.ndarray] = None):
         """
         Initializes the filter matrices.
         

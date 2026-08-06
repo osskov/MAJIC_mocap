@@ -34,10 +34,13 @@ METHODS = {
     'mag_on':      {'kind': 'filter', 'project': True,  'mag_mode': 'on'},
     'mag_off':     {'kind': 'filter', 'project': True,  'mag_mode': 'off'},
     'mag_adapt':   {'kind': 'filter', 'project': True,  'mag_mode': 'adapt'},
-    # 'mag_adapt_dyn': {'kind': 'filter', 'project': True,  'mag_mode': 'on', 'use_dyn_noise': True},
     # 'unprojected': {'kind': 'filter', 'project': False, 'mag_mode': 'on'},
     'ekf':         {'kind': 'ekf'},
 }
+
+# Add threshold methods for sensitivity study
+# for th in np.logspace(np.log10(10), np.log10(200), 8):
+#     METHODS[f'mag_adapt_{th:.2f}'] = {'kind': 'filter', 'project': True, 'mag_mode': 'adapt', 'mag_adapt_threshold': th}
 
 SUBJECTS = [f'{i:02d}' for i in range(1, 12)]
 ACTIVITIES = ['walking', 'complexTasks']
@@ -90,14 +93,13 @@ def _run_relative_filter(parent_trial: PlateTrial,
                          child_trial: PlateTrial,
                          project: bool,
                          mag_mode: str,
-                         gyro_std_parent: float = 0.0116,
-                         acc_std_parent: float = 0.03,
-                         mag_std_parent: float = 0.05,
-                         gyro_std_child: float = 0.0116,
-                         acc_std_child: float = 0.03,
-                         mag_std_child: float = 0.05,
-                         mag_adapt_threshold: float = 150.0,
-                         use_dyn_noise: bool = False) -> List[np.ndarray]:
+                         gyro_std_parent: float = 0.008,
+                         acc_std_parent: float = 0.052,
+                         mag_std_parent: float = 0.058,
+                         gyro_std_child: float = 0.008,
+                         acc_std_child: float = 0.052,
+                         mag_std_child: float = 0.058,
+                         mag_adapt_threshold: float = 150.0) -> List[np.ndarray]:
     """Estimates joint orientations between parent and child trials using specified filter configurations."""
     parent_trial = parent_trial.copy()
     child_trial = child_trial.copy()
@@ -108,15 +110,14 @@ def _run_relative_filter(parent_trial: PlateTrial,
     
     # 1. IMU projection
     parent_offset, child_offset = None, None
-    if project or use_dyn_noise:
+    if project:
         parent_offset, child_offset, error = parent_trial.world_trace.get_joint_center(child_trial.world_trace)
-        if project:
-            if np.mean(np.linalg.norm(error, axis=1)) > 0.05:
-                if os.environ.get("DISABLE_TQDM") != "True":
-                    print(f"Warning: High joint center error ({np.mean(np.linalg.norm(error, axis=1))} m) "
-                          f"between {parent_trial.name} and {child_trial.name}. Check marker placement.")
-            parent_trial.imu_trace = parent_trial.project_imu_trace(parent_offset)
-            child_trial.imu_trace = child_trial.project_imu_trace(child_offset)
+        if np.mean(np.linalg.norm(error, axis=1)) > 0.05:
+            if os.environ.get("DISABLE_TQDM") != "True":
+                print(f"Warning: High joint center error ({np.mean(np.linalg.norm(error, axis=1))} m) "
+                      f"between {parent_trial.name} and {child_trial.name}. Check marker placement.")
+        parent_trial.imu_trace = parent_trial.project_imu_trace(parent_offset)
+        child_trial.imu_trace = child_trial.project_imu_trace(child_offset)
 
     # 2. Magnetometer modifications
     if mag_mode == 'adapt':
@@ -137,8 +138,7 @@ def _run_relative_filter(parent_trial: PlateTrial,
         vector_sensor_stds_parent=[np.ones(3) * acc_std_parent, np.ones(3) * mag_std_parent],
         vector_sensor_stds_child=[np.ones(3) * acc_std_child, np.ones(3) * mag_std_child],
         r_parent=parent_offset,
-        r_child=child_offset,
-        use_dyn_noise=use_dyn_noise
+        r_child=child_offset
     )
     joint_filter.set_qs(Rotation.from_matrix(parent_trial.world_trace.rotations[0]), Rotation.from_matrix(child_trial.world_trace.rotations[0]))
     dt = np.mean(parent_trial.imu_trace.timestamps[1:] - parent_trial.imu_trace.timestamps[:-1])
@@ -184,7 +184,7 @@ def _joint_angles_from_marker(plates: Dict[str, PlateTrial]) -> pd.DataFrame:
         
     return pd.concat(all_joint_data, ignore_index=True) if all_joint_data else pd.DataFrame()
 
-def _joint_angles_from_filter(plates: Dict[str, PlateTrial], project: bool, mag_mode: str, use_dyn_noise: bool = False) -> pd.DataFrame:
+def _joint_angles_from_filter(plates: Dict[str, PlateTrial], project: bool, mag_mode: str, mag_adapt_threshold: float = 150.0) -> pd.DataFrame:
     all_joint_data = []
     any_plate = next(iter(plates.values()))
     timestamps = any_plate.imu_trace.timestamps
@@ -196,7 +196,7 @@ def _joint_angles_from_filter(plates: Dict[str, PlateTrial], project: bool, mag_
             continue
         parent_plate = plates[parent]
         child_plate = plates[child]
-        R_pc = _run_relative_filter(parent_plate, child_plate, project=project, mag_mode=mag_mode, use_dyn_noise=use_dyn_noise)
+        R_pc = _run_relative_filter(parent_plate, child_plate, project=project, mag_mode=mag_mode, mag_adapt_threshold=mag_adapt_threshold)
         rotvec = Rotation.from_matrix(R_pc).as_rotvec()
         
         df = pd.DataFrame({
@@ -254,7 +254,7 @@ def compute_joint_angles(plates: Dict[str, PlateTrial], method: str) -> pd.DataF
         plates,
         project=spec['project'],
         mag_mode=spec['mag_mode'],
-        use_dyn_noise=spec.get('use_dyn_noise', False)
+        mag_adapt_threshold=spec.get('mag_adapt_threshold', 150.0)
     )
 
 # ==============================================================================

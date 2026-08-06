@@ -70,12 +70,17 @@ METHOD_LABELS = {
     'ekf': 'EKF',
     'unprojected': 'Unprojected',
     'mag_off': 'Mag Off',
+    'mag_off_flat': 'Mag Off (Flat)',
+    'mag_off_dyn': 'Mag Off (Dynamic)',
+    'mag_off_unnormalized': 'Mag Off (Unnormalized)',
+    'mag_off_normalized': 'Mag Off (Normalized)',
+    'mag_off_rescaled': 'Mag Off (Rescaled)',
     'mag_on': 'Mag On',
     'mag_adapt_15': 'MAJIC (15)',
     'mag_adapt_100': 'MAJIC (100)',
     'mag_adapt_200': 'MAJIC (200)',
 }
-METHODS_TO_PLOT = ['ekf', 'mag_off', 'mag_on', 'mag_adapt_15', 'mag_adapt_100', 'mag_adapt_200', 'mag_adapt', 'mag_adapt_dyn']
+METHODS_TO_PLOT = ['ekf', 'mag_off', 'mag_off_flat', 'mag_off_dyn', 'mag_off_unnormalized', 'mag_off_normalized', 'mag_off_rescaled', 'mag_on', 'mag_adapt_15', 'mag_adapt_100', 'mag_adapt_200', 'mag_adapt', 'mag_adapt_dyn']
 
 # Left/right joints are pooled together under a common name; list them
 # individually (e.g. 'R_Hip') here instead if that's not desired.
@@ -326,8 +331,9 @@ def plot_metric_heatmap(df: pd.DataFrame, metric: str, higher_is_better: bool = 
     fig, ax = plt.subplots(figsize=(2.1 * len(methods), 1.8 * len(joints)))
     cmap, vmin, vmax = ('vlag', -1.0, 1.0) if 'pearson' in metric else ('Reds', None, None)
     sns.heatmap(pivot, ax=ax, annot=annot, fmt='', annot_kws={'size': 13, 'weight': 'bold'},
-                cmap=cmap, vmin=vmin, vmax=vmax, linewidths=0.5,
+                cmap=cmap, vmin=vmin, vmax=vmax,
                 cbar_kws={'label': f"Mean {metric}", 'shrink': 0.8})
+    ax.grid(False)
 
     ax.set_ylabel("Joint")
     ax.set_xlabel("Method")
