@@ -4,10 +4,6 @@ against its acc/mag oracle variants, plus mag_adapt as a reference point. Reads
 results/statistics/ekf_oracle_comparison_statistics.parquet, produced by
 experiments/ekf_oracle_comparison.py.
 """
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import argparse
 import numpy as np
 

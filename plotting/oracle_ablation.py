@@ -4,10 +4,6 @@ produced by experiments/oracle_ablation.py — one distribution plot + heatmap p
 base method (mag_on, mag_off, mag_adapt, ekf), comparing its real/perfect acc x
 real/perfect mag combos.
 """
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import argparse
 import numpy as np
 
@@ -16,6 +12,16 @@ from plotting.utils import plot_metric_distribution, plot_metric_heatmap
 from experiments.experiment_utils import load_statistics
 
 PLOTS_DIR = paths.plots_dir("oracle_ablation")
+
+# Collapse L/R into joint type, as the other figure scripts do. Two reasons: the
+# shared heatmap indexes rows by joint TYPE, so leaving these split rendered only the
+# Lumbar row; and significance blocking treats a (subject, joint type) cell as the
+# replicate, since left and right of a joint correlate at ICC ~0.5.
+RENAME_JOINTS = {
+    'R_Hip': 'Hip', 'L_Hip': 'Hip',
+    'R_Knee': 'Knee', 'L_Knee': 'Knee',
+    'R_Ankle': 'Ankle', 'L_Ankle': 'Ankle',
+}
 
 COMBO_LABELS = {
     ('real', 'real'): 'Real Acc / Real Mag',
@@ -40,6 +46,7 @@ def main():
     for col in [c for c in df.columns if c.endswith('_rad')]:
         df[col.replace('_rad', '_deg')] = np.degrees(df[col])
 
+    df['joint_name'] = df['joint_name'].replace(RENAME_JOINTS)
     df = df[(df['axis'] == 'MAG') & df['base_method'].notna()]
 
     for base_method in sorted(df['base_method'].unique()):

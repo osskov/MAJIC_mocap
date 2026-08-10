@@ -5,10 +5,6 @@ panel marginalizes over the other two swept parameters (mean RMSE at each level 
 the parameter being plotted) — the combos are a full grid product, not a marginal
 sweep, so this is the simplest way to see each parameter's effect on its own.
 """
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import argparse
 import matplotlib.pyplot as plt
 import numpy as np

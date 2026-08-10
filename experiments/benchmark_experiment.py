@@ -7,12 +7,9 @@ sweeps, noise-tuning sweeps, and other variations on this same pipeline.
 """
 import os
 os.environ["DISABLE_TQDM"] = "True"
-import sys
 import argparse
 from functools import partial
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import paths
 from experiments.experiment_utils import (
     SUBJECTS, ACTIVITIES, METHODS,

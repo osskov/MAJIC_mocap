@@ -1,8 +1,20 @@
-# Ignore the data folder
+# Source data (downloaded separately — see README). Read-only; nothing writes here.
 data/
+
+# Generated artifacts: joint angles, statistics, per-experiment outputs.
+results/
+
+# Stray figures written to the repo root by older scripts. Everything should go
+# to plots/ now; this keeps a stale run from re-committing them.
+/*.png
 
 # Ignore any __pycache__ folders anywhere in the project
 **/__pycache__/
+
+# Packaging artifacts from `pip install -e .`
+*.egg-info/
+build/
+dist/
 
 # Ignore any .DS_Store and .idea files (macOS specific)
 .DS_Store

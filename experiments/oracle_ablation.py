@@ -7,13 +7,10 @@ so this reuses the same generate+stats workers as the vanilla pipeline
 """
 import os
 os.environ["DISABLE_TQDM"] = "True"
-import sys
 import argparse
 from functools import partial
-from pathlib import Path
 from typing import List, Tuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from experiments.experiment_utils import (
     SUBJECTS, ACTIVITIES, load_all_joint_angles, compute_error_stats, save_statistics,
     run_tracked_grid, generate_joint_angles_worker, compute_stats_worker,

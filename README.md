@@ -16,47 +16,96 @@ The data, adapted from Al Borno et al. 2022, can be found on Google Drive (https
 
 ## Repository Structure
 
-The repository is organized into several key Python scripts and a data directory:
+Inputs and outputs are kept strictly separate. **`data/` is read-only source data** —
+nothing in this repository ever writes into it. Every generated artifact goes to
+`results/` (tabular data) or `plots/` (figures). All paths are defined in one place,
+[`paths.py`](paths.py), and the write helpers there raise if something tries to write
+under `data/`, so the rule is enforced rather than merely documented.
+
 ```
 .
-├── data/
+├── data/                                   # <-- INPUTS ONLY, exactly as downloaded
 │   ├── Subject01/
 │   │   ├── walking/
-│   │   │   ├── imu data/                # Raw IMU .txt files
-│   │   │   ├── madgwick (al borno)      # Outputs from Al Borno et. al (2022)
-│   │   │   ├── walking.trc              # Mocap ground truth
-│   │   │   ├── myIMUMappings_walking.xml  # Maps IMU IDs to segments
-│   │   │   └── walking_orientations_mag_on.sto  # <-- Generated orientation file
-│   │   └── complexTasks/
-│   │       └── ... (similar structure)
-│   ├── ... (data for other subjects)
-│   │
-│   ├── all_subject_data.pkl             # <-- Generated full time-series data
-│   ├── all_subject_statistics.pkl       # <-- Generated summary statistics
-│   └── all_subject_pearson_correlation.pkl # <-- Generated correlation data
+│   │   │   ├── imu data/                   # Raw IMU .txt files
+│   │   │   ├── madgwick (al borno)/        # Outputs from Al Borno et al. (2022)
+│   │   │   └── walking.trc                 # Mocap ground truth
+│   │   └── complexTasks/                   # ... same structure
+│   └── ... (Subject02 … Subject11)
 │
-├── plots/                                 # <-- Output directory for figures
+├── results/                                # <-- ALL GENERATED DATA
+│   ├── joint_angles/
+│   │   └── Subject01/walking/mag_on.parquet
+│   ├── statistics/
+│   │   ├── all_subject_statistics.parquet      # benchmark summary (paper figures)
+│   │   ├── all_subject_joint_angles.parquet    # concatenated time series (~1 GB)
+│   │   ├── oracle_ablation_statistics.parquet  # one per named experiment
+│   │   └── per_subject/<experiment>/Subject01/walking.parquet
+│   └── experiments/
+│       ├── noise_sensitivity/
+│       └── drift_observability/
+│
+├── plots/                                  # <-- ALL GENERATED FIGURES
+│
+├── paths.py                                # Every path in the repo, defined once
+├── pyproject.toml                          # Package metadata + one console command per script
 │
 ├── src/
-│   ├── toolchest/
-│   │   ├── IMUTrace.py
-│   │   ├── WorldTrace.py
-│   │   ├── PlateTrial.py
-│   │   └── AHRSFilter.py
-│   └── RelativeFilterPlus.py
+│   ├── toolchest/                          # IMUTrace, WorldTrace, PlateTrial, AHRSFilter
+│   └── RelativeFilterPlus.py               # Core MAJIC / relative filter
 │
-├── generate_method_data_and_stats.py
-├── plot_paper_figures.py
-├── plot_imu_data_in_world_frame.py
+├── experiments/                            # One script per experiment (see below)
+│   ├── experiment_utils.py                 #   shared physics / IO / orchestration engine
+│   └── <name>.py                           #   computes results -> results/statistics/
+├── plotting/                               # One script per experiment, same basename
+│   ├── utils.py                            #   shared plotting + significance testing
+│   └── <name>.py                           #   reads results/statistics/ -> plots/
+│
+├── test/                                   # Unit tests (see "Tests" below)
+├── scratch/                                # Ad-hoc exploration, not part of the pipeline
 └── README.md
 ```
+
+Every artifact is written with a `<name>.manifest.json` sidecar recording the git SHA,
+whether the working tree was dirty, the timestamp, the command line, and the physical
+constants in force (gravity, noise standard deviations, `mag_adapt` threshold). Outputs
+are overwritten in place on re-run, so the sidecar is what tells you which code version
+produced a given file:
+
+```json
+{
+  "git_sha": "0d77bc0…", "git_branch": "paper_revision", "git_dirty": true,
+  "written_at": "2026-08-10T17:44:01+00:00",
+  "written_by": "benchmark_experiment.py",
+  "argv": ["--subjects", "01", "--activities", "walking"],
+  "constants": {"expected_gravity": [0.0, 9.81, 0.0], "acc_std": 0.037, "mag_std": 0.03,
+                "mag_adapt_threshold": 1000.0},
+  "method": "mag_off", "subject": "Subject01", "n_rows": 422275
+}
+```
+
+-   **`paths.py`**: Single source of truth for every filesystem path. Paths are anchored
+    to the repository root, not the working directory, so scripts resolve identically no
+    matter where they are invoked from.
 -   **`src/RelativeFilterPlus.py`**: The core implementation of the Relative Filter.
--   **`src/toolchest/`**: A collection of utility classes for handling IMU data (`IMUTrace`), motion capture data (`WorldTrace`), and synchronized trial data (`PlateTrial`).
--   **`generate_method_data_and_stats.py`**: The unified pipeline script that processes raw data, runs orientation estimation filters, outputs intermediate compressed `.npz` files (which store the root orientation and joint angles directly), aggregates the trials across subjects, and calculates the summary statistics/Pearson correlations.
--   **`plot_paper_figures.py`**: The main script for generating the statistical comparison plots presented in the paper. It loads the `all_subject_statistics.pkl` file and creates detailed figures comparing the different estimation methods.
--   **`plot_imu_data_in_world_frame.py`**: A script to visualize the raw IMU data in the world frame, useful for initial data exploration and validation.
--   **`data/`**: This directory is intended to hold the input data and the generated `.pkl` files.
+-   **`src/toolchest/`**: Utility classes for IMU data (`IMUTrace`), motion capture data
+    (`WorldTrace`), and synchronized trial data (`PlateTrial`).
+-   **`experiments/experiment_utils.py`**: The shared engine behind every experiment — data loading,
+    the oracle/physics helpers, the filter driver, error statistics, and the parallel
+    grid runner with its live status table.
+-   **`experiments/benchmark_experiment.py`**: The main pipeline. Computes joint angles
+    for every method across every subject/activity, then aggregates error statistics
+    against the marker (mocap) ground truth into
+    `results/statistics/all_subject_statistics.parquet`.
+-   **`plotting/`**: One plotting script per experiment, sharing the experiment's
+    basename (`experiments/oracle_ablation.py` -> `plotting/oracle_ablation.py`; the
+    benchmark's figures are `plotting/paper_figures.py`). Plotting never recomputes —
+    each script reads the statistics file its experiment wrote, so figures can be
+    re-tuned without re-running the pipeline. `plotting/utils.py` holds the shared
+    distribution/heatmap engine and significance testing.
 -   **`plots/`**: The default output directory for all generated figures.
+-   **`scratch/`**: Ad-hoc exploration and one-off diagnostic scripts. Not part of the
+    reproducible pipeline and not required for any paper figure.
 
 ## Installation
 
@@ -75,73 +124,150 @@ To set up the environment and run the scripts, follow these steps:
     source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
     ```
 
-3.  **Install the required libraries:** The necessary packages are listed in `requirements.txt`.
+3.  **Install the project:** An editable install puts `paths`, `src`, `experiments`, and
+    `plotting` on the import path, so scripts run from any working directory. Dependencies
+    come from `requirements.txt`, which `pyproject.toml` reads directly.
     ```bash
-    pip install -r requirements.txt
+    pip install -e .
     ```
+
+    This also installs a console command for every script below (`majic-benchmark`,
+    `majic-plot-paper-figures`, …). They are aliases: `majic-benchmark` and
+    `python -m experiments.benchmark_experiment` run the same `main()` with the same
+    flags. `pip install -r requirements.txt` still works if you only want the
+    dependencies, but then commands must be run from the repository root.
 
 ## Data Setup
 
-The scripts expect a specific directory structure for the input data. You will need to populate the `data/` directory as follows:
+Download the dataset (see the links above) and unpack it into `data/`, which the scripts
+treat as read-only:
 ```
 data/
 ├── Subject01/
 │   ├── walking/
-│   │   ├── subject01_walking.trc
-│   │   └── imu data/
-│   │       └── ... (IMU .txt files)
-│   └── complexTasks/
-│       ├── subject01_complextasks.trc
-│       └── imu data/
-│           └── ... (IMU .txt files)
+│   │   ├── walking.trc                 # Mocap ground truth
+│   │   ├── imu data/                   # Raw IMU .txt files, one per segment
+│   │   └── madgwick (al borno)/        # Optional: Al Borno et al. (2022) outputs
+│   └── complexTasks/                   # ... same structure
 ├── Subject02/
 │   └── ...
 └── ...
 ```
--   Each subject should have their own directory (e.g., `Subject01`, `Subject02`).
--   Inside each subject's directory, there should be subdirectories for each trial type (e.g., `walking`, `complexTasks`).
--   Each trial directory must contain:
-    -   A motion capture file in `.trc` format.
-    -   An `imu data` subdirectory containing the raw IMU data in `.txt` format for each segment.
+-   Each subject has their own directory (`Subject01` … `Subject11`).
+-   Inside it, one subdirectory per trial type (`walking`, `complexTasks`).
+-   Each trial directory must contain a `.trc` motion capture file and an `imu data`
+    subdirectory holding the raw per-segment IMU `.txt` files.
+
+Nothing is ever written back into `data/`; `results/` and `plots/` are created on demand.
 
 ## Usage and Workflow
 
 To reproduce the results from the publication, run the scripts in the following order.
 
-### Step 1: Run Unified Pipeline
+Every command below is written as `python -m <module>`, which requires the repository
+root as the working directory. After `pip install -e .` each one also has an equivalent
+console command that works from anywhere — `majic-<name>` for `experiments/`,
+`majic-plot-<name>` for `plotting/` (so `python -m plotting.paper_figures` is
+`majic-plot-paper-figures`). Run `majic-<tab>` to list them.
 
-This step runs orientation estimation filters, writes the precalculated joint angles into intermediate `.npz` files, and generates final statistics `.pkl`/`.csv` files.
+### Step 1: Run the benchmark pipeline
+
+Computes joint angles for every method across every subject/activity, then aggregates
+error statistics against the marker (mocap) ground truth.
 
 ```bash
-python generate_method_data_and_stats.py
+python -m experiments.benchmark_experiment
 ```
-This will create `.npz` files for each method within each subject's trial directory (e.g., `data/Subject01/walking/walking_orientations_mag_on.npz`).
 
-If intermediate `.npz` files already exist and you only want to quickly re-run the aggregation phase and regenerate summary statistics, run:
+This writes:
+
+-   `results/joint_angles/Subject<NN>/<activity>/<method>.parquet` — per-method joint
+    angles (rotation vectors), one file per subject/activity/method.
+-   `results/statistics/per_subject/all_subject/Subject<NN>/<activity>.parquet` —
+    per-subject error statistics.
+-   `results/statistics/all_subject_joint_angles.parquet` — the concatenated time series
+    across all subjects and methods (large, ~1 GB).
+-   `results/statistics/all_subject_statistics.parquet` — the summary statistics used by
+    the plotting scripts.
+
+Each of these gets a `.manifest.json` provenance sidecar alongside it.
+
+Useful flags: `--subjects`, `--activities`, `--methods` to restrict the grid, `--workers`
+to cap parallelism, and `--stats-only` to skip regeneration and re-run just the
+aggregation over the joint angles already on disk:
+
 ```bash
-python generate_method_data_and_stats.py --stats-only
+python -m experiments.benchmark_experiment --subjects 01 02 --activities walking
+python -m experiments.benchmark_experiment --stats-only
 ```
 
-This step produces three key files in the `data/` directory:
+### Step 2: Run any additional experiments (optional)
 
--   `all_subject_data.pkl`: A large file containing the full time-series data for all joints, methods, and subjects.
+Each script under `experiments/` is a variation on the same pipeline and writes its own
+summary to `results/statistics/<name>_statistics.parquet`:
 
--   `all_subject_statistics.pkl` and `all_subject_statistics.csv`: A summary file with aggregated statistics (RMSE, MAE, etc.) used for plotting.
-
--   `all_subject_pearson_correlation.pkl` and `all_subject_pearson_correlation.csv`: A file containing Pearson correlation results.
-
-
-Note: You can set REGENERATE_FILES = False in this script to load existing .pkl files and avoid reprocessing all the data.
-
-### Step 3: Generate the Paper Figures
-This is the final step to generate the plots shown in the paper.
 ```bash
-python plot_paper_figures.py
+python -m experiments.oracle_ablation          # acc/mag ground-truth ablation
+python -m experiments.threshold_sensitivity    # mag_adapt observability threshold sweep
+python -m experiments.noise_sensitivity        # gyro/acc/mag noise parameter sweep
+python -m experiments.ekf_oracle_comparison    # EKF vs. its oracle variants
+python -m experiments.drift_observability      # segment-and-reset drift diagnostic
 ```
-The output plots will be saved in the plots/ directory by default.
+
+### Step 3: Generate the paper figures
+
+```bash
+python -m plotting.paper_figures
+```
+
+Every experiment has a matching plot script under `plotting/` with the same basename, so
+each one is `python -m plotting.<experiment name>`:
+
+```bash
+python -m plotting.oracle_ablation
+python -m plotting.threshold_sensitivity
+python -m plotting.noise_sensitivity
+python -m plotting.ekf_oracle_comparison
+python -m plotting.drift_observability
+```
+
+These read only from `results/statistics/` — they never re-run the filter, so a figure
+can be re-tuned in seconds. If the statistics file is missing, the script says which
+experiment to run first. Figures are written to `plots/`, namespaced per experiment.
+
+## Tests
+
+The suite uses `unittest` from the standard library — no extra dependencies. `test/` is
+not part of the installed package, so run it from the repository root:
+
+```bash
+python -m unittest discover -s test -t . -p "Test*.py"
+```
+
+It covers the toolchest (`IMUTrace`, `WorldTrace`, `PlateTrial`) and the relative filter,
+including numerical checks of the EKF's measurement and noise Jacobians against finite
+differences of its own residual function, plus the analysis layer on top of them:
+
+| file | covers |
+| --- | --- |
+| `TestMethodSpec` | `resolve_method_spec`'s name grammar, and the round trip from every name the experiment scripts build |
+| `TestExperimentPhysics` | the acc/mag oracles, the virtual EKF ground plate, and the `o^J` observability metric |
+| `TestErrorStats` | `compute_error_stats` — error convention, every summary metric against numpy, grouping and the timestamp merge |
+| `TestPlotUtils` | `plotting/utils.py` — the block reduction that sets *n*, Holm correction, effect sizes, and the two-stage correction family |
+| `TestGravityConvention` | `EXPECTED_GRAVITY` against the real accelerometers |
+
+The emphasis is on the failures that are otherwise silent — a transposed rotation, a
+flipped gravity sign, a signed mean standing in for an RMSE, an uncorrected p-value
+reaching a significance bracket. All of those produce output of the right shape and a
+plausible magnitude, so only a value check catches them.
+
+Most tests are synthetic and run in milliseconds. Two files touch real data —
+`TestPlateTrial` loads one trial through the full `from_folder` path, and
+`TestGravityConvention` checks `EXPECTED_GRAVITY` against the accelerometers — and both
+skip cleanly if `data/` has not been populated, so the suite passes in a bare checkout.
 
 # Configuration
-The main plotting script, plot_paper_figures.py, contains a global configuration section at the top of the file where you can easily modify the analysis and plotting parameters:
+The main plotting script, `plotting/paper_figures.py`, contains a global configuration section at the top of the file where you can easily modify the analysis and plotting parameters:
 
 -   `SUBJECTS_TO_PLOT`: A list of subject IDs to include in the analysis.
 

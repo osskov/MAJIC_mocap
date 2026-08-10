@@ -25,6 +25,7 @@ from rich.table import Table
 
 import paths
 from paths import DATA_DIR, RESULTS_DIR, raw_trial_dir, ensure_parent, write_manifest
+from src.toolchest.IMUTrace import IMUTrace
 from src.toolchest.PlateTrial import PlateTrial
 from src.toolchest.WorldTrace import WorldTrace
 from src.RelativeFilterPlus import RelativeFilter
@@ -71,7 +72,26 @@ EXPECTED_GRAVITY = np.array([0.0, 9.81, 0.0])
 DEFAULT_GYRO_STD = 0.0045
 DEFAULT_ACC_STD = 0.037
 DEFAULT_MAG_STD = 0.03
-DEFAULT_MAG_ADAPT_THRESHOLD = 150.0
+
+# The o^J value above which mag_adapt stops trusting the magnetometer, in the units of
+# segment_observability, i.e. (m/s^2)(m/s^3).
+#
+# This is NOT comparable to the 150.0 used before the missing-dt fix in
+# segment_observability: that metric was ~100x too small in its difference term and
+# ranked samples differently (the two correlate only r~0.55 on real trials), so no
+# threshold reproduces the old gating exactly.
+#
+# 1000 was chosen to preserve the DUTY CYCLE the method was tuned around rather than the
+# number: 150.0 on the old metric gated 18-22% of samples across trials, and 1000 on the
+# corrected metric gates 18-22% (per-trial duty-matched values 956 / 1024 / 1228 for
+# Subject01 walking, Subject05 walking, Subject01 complexTasks). For scale, the corrected
+# metric's percentiles over a full trial are roughly p25=130, p50=300, p90=2100, and its
+# static noise floor is 15-35.
+#
+# This is a default, not a claim of optimality — experiments/threshold_sensitivity.py
+# sweeps it, and that sweep's range was rescaled alongside this constant. Re-run it
+# before quoting any threshold as chosen.
+DEFAULT_MAG_ADAPT_THRESHOLD = 1000.0
 
 
 def pipeline_constants() -> Dict[str, Any]:
@@ -118,6 +138,8 @@ def resolve_method_spec(method: str) -> Dict[str, Any]:
     'acc_source' / 'mag_source' ('real' or 'perfect', default 'real') and, for
     mag_adapt, an overridden 'mag_adapt_threshold' if a _th<value> suffix is present."""
     m = _METHOD_SUFFIX_RE.match(method)
+    if m is None:  # only reachable for an empty name; every other string has a base
+        raise ValueError(f"Unparseable method name '{method}'. Allowed bases: {list(METHODS)}")
     base = m.group('base')
     if base not in METHODS:
         raise ValueError(f"Unknown method '{method}' (base '{base}' not recognized). Allowed bases: {list(METHODS)}")
@@ -184,10 +206,10 @@ def check_gravity_convention(plates: Dict[str, PlateTrial], tol: float = 0.5,
 # ==============================================================================
 
 def _compute_expected_mag_field(plate_trials: List[PlateTrial]) -> np.ndarray:
-    """Median world-frame magnetic field across all pelvis-mounted IMU readings."""
+    """Median world-frame magnetic field across all torso-mounted IMU readings."""
     all_global_mags = [
         (plate.world_trace.rotations @ plate.imu_trace.mag[..., None])[..., 0]
-        for plate in plate_trials if 'pelvis' in plate.name
+        for plate in plate_trials if 'torso' in plate.name
     ]
     return np.median(np.concatenate(all_global_mags, axis=0), axis=0)
 
@@ -254,15 +276,54 @@ def _compute_perfect_joint_acc(parent_trial: PlateTrial, child_trial: PlateTrial
 # Physics: relative filter
 # ==============================================================================
 
+def segment_observability(imu_trace: IMUTrace) -> np.ndarray:
+    """o = |a x (d/dt a_world)|, one sensor, one value per sample, in (m/s^2)(m/s^3).
+
+    What makes a segment's orientation observable from its accelerometer is the
+    accelerometer vector CHANGING DIRECTION IN THE WORLD FRAME. Gravity alone does not:
+    a sensor rotating steadily under gravity sees its acc vector sweep around the body
+    frame, but that sweep is fully explained by the gyro, so it carries no independent
+    orientation information. The quantity that does carry information is the world-frame
+    derivative of the accelerometer vector, expressed back in the body frame:
+
+        d/dt(a_world) |_body = a_dot + w x a
+
+    which vanishes exactly when the only acceleration is gravity. Crossing it with a
+    itself drops the component along a (a change in magnitude tells us nothing about
+    direction) and leaves the part that actually rotates the measured direction.
+
+    THE dt MATTERS. a_dot is a per-second rate, so the finite difference has to be
+    divided by the sample interval. Without that division the difference term is ~100x
+    too small at this dataset's 100 Hz, the `w x a` term dominates, and the metric
+    silently degenerates into |a|^2|w_perp| — an angular-rate detector that scores pure
+    rotation under gravity (the maximally UNOBSERVABLE case) at ~190, and whose value
+    drifts with sample rate. That was the behaviour through the runs preceding this fix;
+    see test/TestExperimentPhysics.py, which now pins the corrected physics.
+
+    The difference is BACKWARD, not central, deliberately: this gates the magnetometer
+    inside a causal filter, so the value at sample t must not depend on sample t+1. The
+    cost is noise amplification (1/dt on a difference of two noisy samples), which was
+    measured rather than assumed — at this dataset's accelerometer noise the static
+    noise floor is ~15-35, against a trial median of ~300 and a gating threshold of
+    1000, so no smoothing is needed. Central differencing would halve the floor and move
+    the median by <5%, which does not buy back the loss of causality.
+
+    Sample 0 is padded with 0.0: there is no difference available there, so the first
+    sample always counts as unobservable.
+    """
+    acc, gyro = imu_trace.acc, imu_trace.gyro
+    dt = np.diff(imu_trace.timestamps)[:, None]
+    acc_dot_world = np.diff(acc, axis=0) / dt + np.cross(gyro[1:], acc[1:])
+    return np.concatenate(([0.0], np.linalg.norm(np.cross(acc[1:], acc_dot_world), axis=1)))
+
+
 def _calculate_observability_metric_(parent_trial: PlateTrial, child_trial: PlateTrial) -> np.ndarray:
-    """Computes the observability metric between parent and child IMU traces."""
-    da_parent = np.diff(parent_trial.imu_trace.acc, axis=0) + np.cross(parent_trial.imu_trace.gyro[1:], parent_trial.imu_trace.acc[1:])
-    da_child = np.diff(child_trial.imu_trace.acc, axis=0) + np.cross(child_trial.imu_trace.gyro[1:], child_trial.imu_trace.acc[1:])
-    o_parent = np.cross(parent_trial.imu_trace.acc[1:], da_parent)
-    o_child = np.cross(child_trial.imu_trace.acc[1:], da_child)
-    observability_metric = np.minimum(np.linalg.norm(o_parent, axis=1),
-                                      np.linalg.norm(o_child, axis=1))
-    return np.concatenate(([0.0], observability_metric))
+    """o^J for a joint: the worse-conditioned of its two segments.
+
+    A joint's relative orientation is only as observable as the less informative of the
+    two accelerometers, so this is a minimum and not a sum or a mean."""
+    return np.minimum(segment_observability(parent_trial.imu_trace),
+                      segment_observability(child_trial.imu_trace))
 
 
 def _run_relative_filter(parent_trial: PlateTrial,

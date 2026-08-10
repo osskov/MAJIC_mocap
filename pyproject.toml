@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "majic-mocap"
+version = "1.0.0"
+description = "MAJIC filter: estimating the magnetic field at joint centers to reduce kinematic errors in inertial motion capture"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Six Skov", email = "osskov@stanford.edu" },
+    { name = "Keenon Werling" },
+    { name = "Johanna O'Day" },
+    { name = "Jennifer Hicks" },
+    { name = "C. Karen Liu" },
+    { name = "Scott Delp" },
+]
+# requirements.txt stays the single list of dependencies, so there is only one
+# place to edit and no chance of the two drifting apart.
+dynamic = ["dependencies"]
+
+[project.urls]
+Repository = "https://github.com/osskov/MAJIC_mocap"
+Publication = "https://doi.org/10.21203/rs.3.rs-9337794/v1"
+
+# Every command in the README's "Usage and Workflow" section, as a console script.
+# `python -m experiments.<name>` and `python -m plotting.<name>` keep working
+# identically — these are just names that do not require being in the repo root.
+[project.scripts]
+majic-benchmark = "experiments.benchmark_experiment:main"
+majic-oracle-ablation = "experiments.oracle_ablation:main"
+majic-threshold-sensitivity = "experiments.threshold_sensitivity:main"
+majic-noise-sensitivity = "experiments.noise_sensitivity:main"
+majic-ekf-oracle-comparison = "experiments.ekf_oracle_comparison:main"
+majic-drift-observability = "experiments.drift_observability:main"
+majic-sensor-stats = "generate_sensor_stats:main"
+majic-plot-paper-figures = "plotting.paper_figures:main"
+majic-plot-ekf-failure-modes = "plotting.ekf_failure_modes:main"
+majic-plot-oracle-ablation = "plotting.oracle_ablation:main"
+majic-plot-threshold-sensitivity = "plotting.threshold_sensitivity:main"
+majic-plot-noise-sensitivity = "plotting.noise_sensitivity:main"
+majic-plot-ekf-oracle-comparison = "plotting.ekf_oracle_comparison:main"
+majic-plot-drift-observability = "plotting.drift_observability:main"
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+# Listed explicitly rather than auto-discovered: a bare `src/` directory makes
+# setuptools assume the src-layout convention, which would hide `experiments`,
+# `plotting`, and `paths` from the install.
+[tool.setuptools]
+py-modules = ["paths", "generate_sensor_stats"]
+
+[tool.setuptools.packages.find]
+include = ["src*", "experiments*", "plotting*"]

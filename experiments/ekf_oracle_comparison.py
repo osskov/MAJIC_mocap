@@ -13,18 +13,20 @@ here would just narrow it to this comparison's 5 methods for no benefit.
 """
 import os
 os.environ["DISABLE_TQDM"] = "True"
-import sys
 import argparse
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from experiments.experiment_utils import (
     SUBJECTS, ACTIVITIES, load_all_joint_angles, compute_error_stats, save_statistics,
     run_tracked_grid, generate_joint_angles_worker,
 )
 
 ALREADY_COMPUTED_METHODS = ['marker', 'ekf', 'mag_adapt']
-ORACLE_METHODS = ['ekf_perfect_mag', 'ekf_perfect_acc']
+# The both-oracle variant is the floor of the ablation, and it is not redundant:
+# on this dataset the mag oracle alone changes nothing (the accelerometer
+# disturbance dominates and the filter is already lost), so the only way to see
+# whether magnetic distortion costs anything is to remove it on top of a fixed
+# accelerometer.
+ORACLE_METHODS = ['ekf_perfect_mag', 'ekf_perfect_acc', 'ekf_perfect_acc_perfect_mag']
 ALL_METHODS = ALREADY_COMPUTED_METHODS + ORACLE_METHODS
 
 

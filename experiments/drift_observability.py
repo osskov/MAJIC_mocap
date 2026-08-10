@@ -20,11 +20,9 @@ caveat printed at the end.
 """
 import os
 os.environ["DISABLE_TQDM"] = "True"
-import sys
 import time
 import argparse
 from functools import partial
-from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
@@ -32,7 +30,6 @@ import pandas as pd
 from scipy.spatial.transform import Rotation
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import paths
 from experiments.experiment_utils import load_raw_data, JOINTS, _calculate_observability_metric_, run_tracked_grid
 
@@ -154,6 +151,53 @@ def detect_quiet_sitting_segments(pelvis_plate, min_duration_sec=3.0, strict=Tru
     return intervals
 
 
+def invert_segments(segments, n_samples, min_n=1):
+    """Complement of `segments` over [0, n_samples), keeping gaps of at least min_n samples.
+
+    Used to build the "not sitting" control: everything that isn't a detected quiet-sitting
+    bout. Unlike the o^J median split, this doesn't depend on a metric that oscillates at
+    stride frequency, so the resulting stretches are long enough to fit.
+    """
+    gaps = []
+    prev = 0
+    for s, e in sorted(segments):
+        if s - prev >= min_n:
+            gaps.append((prev, s))
+        prev = max(prev, e)
+    if n_samples - prev >= min_n:
+        gaps.append((prev, n_samples))
+    return gaps
+
+
+def chunk_segments(segments, window_n):
+    """Splits each segment into consecutive non-overlapping windows of exactly window_n
+    samples, discarding any tail shorter than that.
+
+    Both arms of the comparison must be chunked with the same window_n. R^2 depends on
+    the length of the window it's computed over, so fitting minutes-long not-sitting
+    stretches against ~15s sitting bouts would confound the contrast with window length.
+    Equal-length windows make the two arms directly comparable, and as a side effect give
+    the not-sitting arm many more samples than a whole-stretch fit would.
+    """
+    chunks = []
+    for s, e in segments:
+        for k in range((e - s) // window_n):
+            chunks.append((s + k * window_n, s + (k + 1) * window_n))
+    return chunks
+
+
+def clip_segments(segments, n_samples):
+    """Truncates segments to [0, n_samples), dropping any that fall entirely outside.
+    Segment indices come from the pelvis plate, which can be a few samples longer than
+    the joint-angle traces after alignment."""
+    out = []
+    for s, e in segments:
+        s, e = max(0, s), min(e, n_samples)
+        if e > s:
+            out.append((s, e))
+    return out
+
+
 def find_low_obs_segments(obs_metric, threshold, min_n, above=False):
     """obs_metric should already be smoothed by the caller: the raw per-sample o^J
     (a finite-difference-of-acceleration quantity) is extremely noisy sample-to-sample
@@ -243,33 +287,46 @@ def main():
     parser.add_argument('--obs-threshold', type=float, default=None,
                          help="Observability threshold for the obs_threshold/high_obs segment sources. "
                               "Default (None): use each joint's own median o^J for this trial, since o^J's "
-                              "scale varies a lot by joint and a fixed value (e.g. mag_adapt's 150.0) can "
+                              "scale varies a lot by joint and a fixed value (e.g. mag_adapt's 1000.0) can "
                               "land entirely on one side of a joint's distribution, producing a single "
                               "degenerate segment.")
-    parser.add_argument('--min-segment-sec', type=float, default=1.5, help="Minimum segment duration.")
+    parser.add_argument('--min-segment-sec', type=float, default=10.0,
+                         help="Minimum segment duration. A through-the-origin R^2 on a segment only a "
+                              "few samples long is dominated by noise, so the floor is set well above "
+                              "the sample period. Keep this equal to --min-sitting-sec: R^2 depends on "
+                              "window length, so mismatched floors confound the low- vs high-observability "
+                              "comparison.")
     parser.add_argument('--smooth-sec', type=float, default=0.5,
                          help="(obs_threshold/high_obs sources only): rolling-mean window applied to o^J "
                               "before thresholding/segmenting. Raw per-sample o^J is a noisy finite-difference "
                               "quantity that rarely sustains a stretch on its own (median raw run length "
                               "~0.05s at 100Hz); smoothing surfaces the slower postural-phase structure the "
                               "segment analysis actually wants.")
-    parser.add_argument('--segment-source', choices=['obs_threshold', 'quiet_sitting', 'high_obs'], default='obs_threshold',
+    parser.add_argument('--segment-source',
+                         choices=['obs_threshold', 'quiet_sitting', 'high_obs', 'not_sitting'],
+                         default='obs_threshold',
                          help="How segments are defined. 'obs_threshold' (default) thresholds each joint's "
                               "own (smoothed) o^J below its median — same segments used to define AND "
                               "explain the drift, a real circularity concern. 'quiet_sitting' instead detects "
                               "quiet-sitting intervals from the pelvis (low height, low velocity, low gyro) "
                               "independent of o^J entirely, and uses the SAME intervals for every joint. "
-                              "'high_obs' is the control for either: same smoothed-o^J segmentation as "
-                              "obs_threshold, but ABOVE each joint's median instead of below — if the drift "
-                              "fit found in low-observability segments is genuine, the same fit on "
-                              "high-observability segments should show much weaker/less confident growth.")
-    parser.add_argument('--min-sitting-sec', type=float, default=3.0,
-                         help="Minimum duration for a detected quiet-sitting interval (quiet_sitting source only).")
+                              "'not_sitting' is the paired control for quiet_sitting: the complement of those "
+                              "same intervals, chunked to the same window length. 'high_obs' is an alternative "
+                              "control that reuses the smoothed-o^J segmentation ABOVE each joint's median "
+                              "instead of below; during gait o^J oscillates at stride frequency and recrosses "
+                              "its own median about twice a second, so few high_obs runs survive a multi-second "
+                              "floor (the ankle worst of all) — prefer 'not_sitting' unless you specifically "
+                              "want the o^J-defined split.")
+    parser.add_argument('--min-sitting-sec', type=float, default=10.0,
+                         help="Minimum duration for a detected quiet-sitting interval (quiet_sitting source "
+                              "only). Matches --min-segment-sec by default so the quiet-sitting and high_obs "
+                              "arms are fit over comparable window lengths.")
     parser.add_argument('--workers', type=int, default=os.cpu_count())
     args = parser.parse_args()
 
-    if args.segment_source == 'quiet_sitting' and args.activity != 'complexTasks':
-        print(f"Warning: quiet_sitting segments are expected in 'complexTasks', not '{args.activity}' — "
+    sitting_based = args.segment_source in ('quiet_sitting', 'not_sitting')
+    if sitting_based and args.activity != 'complexTasks':
+        print(f"Warning: quiet-sitting segments are expected in 'complexTasks', not '{args.activity}' — "
               f"this activity may contain no sitting periods at all.")
 
     out_dir = OUT_DIR / f"Subject{args.subject}" / args.activity / f"mag_{args.mag_mode}"
@@ -279,7 +336,7 @@ def main():
     plates = load_raw_data(args.subject, args.activity)
 
     shared_sitting_segments = None
-    if args.segment_source == 'quiet_sitting':
+    if sitting_based:
         if 'pelvis_imu' not in plates:
             print("Error: 'pelvis_imu' plate not found — cannot detect quiet-sitting segments.")
             return
@@ -318,8 +375,14 @@ def main():
             result['timestamps'], result['R_pc_est'], result['R_pc_true'], result['obs_metric'])
 
         threshold_used = np.nan
-        if args.segment_source == 'quiet_sitting':
-            segments = shared_sitting_segments
+        if sitting_based:
+            # Both arms are chunked to the same window length so their R^2 values are
+            # comparable; see chunk_segments.
+            window_n = max(int(round(args.min_segment_sec / np.mean(np.diff(timestamps)))), 5)
+            sitting = clip_segments(shared_sitting_segments, len(timestamps))
+            if args.segment_source == 'not_sitting':
+                sitting = invert_segments(sitting, len(timestamps), window_n)
+            segments = chunk_segments(sitting, window_n)
         else:
             # Threshold and segmentation both operate on the smoothed o^J: the raw per-sample
             # metric is too noisy to sustain any stretch near min_segment_sec (see smooth_obs).
@@ -380,7 +443,9 @@ def main():
     print(f"\nSaved data to {out_dir}")
     print(f"Saved figure to {fig_path}")
     print("\nCaveat: the linear-vs-sqrt(t) comparison is only meaningful for segments with enough samples "
-          "(duration >> dt); very short segments will have noisy R^2 values.")
+          "(duration >> dt), which is what the 10s --min-segment-sec/--min-sitting-sec floor enforces. "
+          "Lowering either floor will reintroduce noisy R^2 values; check n_segments before trusting a "
+          "cell with only a handful of segments.")
 
 
 if __name__ == '__main__':

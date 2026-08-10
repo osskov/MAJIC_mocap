@@ -5,10 +5,6 @@ a continuous swept parameter, so this is a line plot (log x-axis) rather than th
 categorical distribution/heatmap comparisons in plotting.utils — it still borrows
 that module's styling and PLOTS_DIR convention.
 """
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import argparse
 import matplotlib.pyplot as plt
 import numpy as np

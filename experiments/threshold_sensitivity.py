@@ -7,20 +7,22 @@ generate+stats workers as the vanilla pipeline (benchmark_experiment.py)
 """
 import os
 os.environ["DISABLE_TQDM"] = "True"
-import sys
 import argparse
 from functools import partial
-from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from experiments.experiment_utils import (
     SUBJECTS, ACTIVITIES, load_all_joint_angles, compute_error_stats, save_statistics,
     run_tracked_grid, generate_joint_angles_worker, compute_stats_worker,
 )
 
-THRESHOLDS = np.logspace(np.log10(10), np.log10(200), 8)
+# Spans the corrected o^J scale (see segment_observability): 100 gates roughly 60% of
+# samples, 10000 roughly 2%, with the DEFAULT_MAG_ADAPT_THRESHOLD of 1000 near the middle
+# at ~20%. The previous range (10-200) was set against the pre-fix metric, whose
+# difference term was ~100x too small; on the corrected metric that range would gate
+# almost every sample and the sweep would be flat.
+THRESHOLDS = np.logspace(np.log10(100), np.log10(10000), 8)
 
 
 def threshold_method(threshold: float) -> str:

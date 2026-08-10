@@ -6,10 +6,6 @@ trial_type/method/joint_name/subject/axis, with *_rad error metrics).
 # error/correlation stats against, so it never appears as a row value — only the
 # IMU-derived methods (ekf, mag_off, mag_on, mag_adapt_15, mag_adapt_100, mag_adapt_200) do.
 """
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from typing import Optional
 
 import numpy as np

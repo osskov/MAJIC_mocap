@@ -7,19 +7,16 @@ zero (see RelativeFilter._get_measurement_update) — mag_std is provably inert.
 """
 import os
 os.environ["DISABLE_TQDM"] = "True"
-import sys
 import argparse
 import itertools
 import time
 from functools import partial
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import paths
 from experiments.experiment_utils import (
     JOINTS, SUBJECTS, ACTIVITIES,
