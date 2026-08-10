@@ -216,8 +216,8 @@ class RelativeFilter:
                                 dt: float = 0.01) -> Tuple[Rotation, Rotation]:
         """Corrects the state prediction using sensor measurements."""
 
-        vector_sensor_data_p = [v/np.linalg.norm(v) if np.linalg.norm(v) > 0. else v for v in vector_sensor_data_p]
-        vector_sensor_data_c = [v/np.linalg.norm(v) if np.linalg.norm(v) > 0. else v for v in vector_sensor_data_c]
+        # vector_sensor_data_p = [v/np.linalg.norm(v) if np.linalg.norm(v) > 0. else v for v in vector_sensor_data_p]
+        # vector_sensor_data_c = [v/np.linalg.norm(v) if np.linalg.norm(v) > 0. else v for v in vector_sensor_data_c]
 
         R_wp = q_lin_wp.as_matrix()
         R_wc = q_lin_wc.as_matrix()

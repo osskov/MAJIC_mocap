@@ -7,7 +7,7 @@ from src.toolchest.gyro_utils import (finite_difference_rotations,
                                       rotation_matrix_to_angular_velocity_python,
                                       calculate_best_fit_rotation,
                                       integrate_rotations)
-import nimblephysics as nimble
+from scipy.spatial.transform import Rotation
 
 
 class TestGyroUtils(unittest.TestCase):
@@ -26,12 +26,12 @@ class TestGyroUtils(unittest.TestCase):
         rotation_matrix = angular_velocity_to_rotation_matrix_python(omega, dt)
         np.testing.assert_array_almost_equal(rotation_matrix, expected_rotation_matrix, decimal=5)
 
-    def test_nimble_equivalence(self):
+    def test_scipy_equivalence(self):
         omega = np.array([0.1, 0.2, 0.3])
         dt = 0.1
         rotation_matrix = angular_velocity_to_rotation_matrix_python(omega, dt)
-        nimble_rotation_matrix = angular_velocity_to_rotation_matrix(omega, dt)
-        np.testing.assert_array_almost_equal(rotation_matrix, nimble_rotation_matrix, decimal=5)
+        scipy_rotation_matrix = angular_velocity_to_rotation_matrix(omega, dt)
+        np.testing.assert_array_almost_equal(rotation_matrix, scipy_rotation_matrix, decimal=5)
 
     def test_angular_velocity_invertible(self):
         omega = np.array([0.1, 0.2, 0.3])
@@ -40,7 +40,7 @@ class TestGyroUtils(unittest.TestCase):
         rotation_matrix_inv = angular_velocity_to_rotation_matrix_python(-omega, dt)
         np.testing.assert_array_almost_equal(np.dot(rotation_matrix, rotation_matrix_inv), np.eye(3), decimal=5)
 
-    def test_angular_velocity_nimble_equivalence(self):
+    def test_angular_velocity_scipy_invertible(self):
         omega = np.array([0.1, 0.2, 0.3])
         dt = 0.1
         rotation_matrix = angular_velocity_to_rotation_matrix(omega, dt)
@@ -54,7 +54,7 @@ class TestGyroUtils(unittest.TestCase):
         omega_reconstructed = rotation_matrix_to_angular_velocity_python(rotation_matrix, dt)
         np.testing.assert_array_almost_equal(omega, omega_reconstructed, decimal=5)
 
-    def test_nimble_angular_velocity_round_trip(self):
+    def test_scipy_angular_velocity_round_trip(self):
         omega = np.array([0.1, 0.2, 0.3])
         dt = 0.1
         rotation_matrix = angular_velocity_to_rotation_matrix(omega, dt)
@@ -111,7 +111,7 @@ class TestGyroUtils(unittest.TestCase):
             np.array([0, 1, 0]),
             np.array([0, 0, 1])
         ]
-        R_cp = nimble.math.eulerXYZToMatrix(np.array([np.pi / 3, np.pi / 3, np.pi / 3]))
+        R_cp = Rotation.from_euler('XYZ', [np.pi / 3, np.pi / 3, np.pi / 3]).as_matrix()
         child_vectors = [R_cp @ v for v in parent_vectors]
         assert np.allclose(calculate_best_fit_rotation(parent_vectors, child_vectors), R_cp.T)
 
@@ -122,11 +122,9 @@ class TestGyroUtils(unittest.TestCase):
             np.array([2, 3, 4]),
             np.array([0, 1, 2])
         ]
-        R_cp = nimble.math.eulerXYZToMatrix(np.array([1, 0.5, 0.25]))
+        R_cp = Rotation.from_euler('XYZ', [1, 0.5, 0.25]).as_matrix()
         child_vectors = [R_cp @ v for v in parent_vectors]
         assert np.allclose(calculate_best_fit_rotation(parent_vectors, child_vectors), R_cp.T)
-
-        print("All test cases passed!")
 
     def test_finite_difference_integration_round_trip(self):
         R_initial_i = np.eye(3)
