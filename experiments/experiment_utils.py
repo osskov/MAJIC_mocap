@@ -34,6 +34,7 @@ from src.toolchest.PlateTrial import PlateTrial
 from src.toolchest.WorldTrace import WorldTrace
 from src.toolchest import trial_io
 from src.RelativeFilterPlus import RelativeFilter
+from src import relative_filter_fast
 
 # ==============================================================================
 # CONFIGURATION
@@ -839,10 +840,6 @@ def _run_relative_filter(parent_trial: PlateTrial,
     if mag_override_child is not None:
         child_trial.imu_trace.mag = mag_override_child
 
-    # Save (possibly overridden) accelerometer readings before any projection is applied
-    acc_p_raw = parent_trial.imu_trace.acc.copy()
-    acc_c_raw = child_trial.imu_trace.acc.copy()
-
     do_project = project and acc_override_parent is None and acc_override_child is None
 
     # 1. IMU projection
@@ -869,41 +866,60 @@ def _run_relative_filter(parent_trial: PlateTrial,
         raise ValueError(f"Unknown mag_mode '{mag_mode}' specified.")
 
     # 3. Filter execution
-    joint_filter = RelativeFilter(
-        gyro_std_parent=np.ones(3) * gyro_std_parent,
-        gyro_std_child=np.ones(3) * gyro_std_child,
-        vector_sensor_stds_parent=[np.ones(3) * acc_std_parent, np.ones(3) * mag_std_parent],
-        vector_sensor_stds_child=[np.ones(3) * acc_std_child, np.ones(3) * mag_std_child],
-        r_parent=parent_offset,
-        r_child=child_offset,
-        normalize_measurements=normalize_measurements,
-        **({} if init_orientation_std is None
-           else {'init_orientation_std': init_orientation_std})
-    )
-    joint_filter.set_qs(Rotation.from_matrix(parent_trial.world_trace.rotations[0]), Rotation.from_matrix(child_trial.world_trace.rotations[0]))
-    dt = np.mean(parent_trial.imu_trace.timestamps[1:] - parent_trial.imu_trace.timestamps[:-1])
-
-    # Main update loop.
     #
-    # R_pc[t] must be the estimate *at* timestamps[t]. update() propagates the state
+    # R_pc[t] must be the estimate *at* timestamps[t]. The update propagates the state
     # forward by dt before correcting it, so the sample driving the step into time t is
     # gyro[t-1]: a filter-free check (marker-derived angular velocity over (t, t+1]
     # against gyro[t+shift]) minimises at shift=0, i.e. gyro[t] spans the interval
     # starting at t. The measurement correction uses acc/mag[t], which are valid at t.
     # Index 0 is the seeded state itself, so the error there is exactly zero.
-    N = len(parent_trial)
-    R_pc = np.empty((N, 3, 3), dtype=np.float64)
-    R_pc[0] = joint_filter.get_R_pc()
+    #
+    # This runs on the compiled kernel in src/relative_filter_fast.py, which is ~55x
+    # faster than looping RelativeFilter.update() from Python and is held to it by
+    # test/TestRelativeFilterFast.py. RelativeFilter remains the reference, and is
+    # still what runs if numba is unavailable.
+    gyro_std_p = np.ones(3) * gyro_std_parent
+    gyro_std_c = np.ones(3) * gyro_std_child
+    sensor_stds_p = [np.ones(3) * acc_std_parent, np.ones(3) * mag_std_parent]
+    sensor_stds_c = [np.ones(3) * acc_std_child, np.ones(3) * mag_std_child]
+    init_std_kwargs = ({} if init_orientation_std is None
+                       else {'init_orientation_std': init_orientation_std})
 
-    for t in range(1, N):
-        joint_filter.update(
-            parent_trial.imu_trace.gyro[t - 1], child_trial.imu_trace.gyro[t - 1],
-            [parent_trial.imu_trace.acc[t], parent_trial.imu_trace.mag[t]],
-            [child_trial.imu_trace.acc[t], child_trial.imu_trace.mag[t]], dt,
-            acc_p_raw=acc_p_raw[t],
-            acc_c_raw=acc_c_raw[t]
+    R_wp0 = parent_trial.world_trace.rotations[0]
+    R_wc0 = child_trial.world_trace.rotations[0]
+    dt = np.mean(parent_trial.imu_trace.timestamps[1:] - parent_trial.imu_trace.timestamps[:-1])
+    N = len(parent_trial)
+
+    if relative_filter_fast.NUMBA_AVAILABLE:
+        R_pc = relative_filter_fast.run_relative_filter(
+            parent_trial.imu_trace.gyro, child_trial.imu_trace.gyro,
+            np.stack([parent_trial.imu_trace.acc, parent_trial.imu_trace.mag], axis=1),
+            np.stack([child_trial.imu_trace.acc, child_trial.imu_trace.mag], axis=1),
+            dt,
+            gyro_std_parent=gyro_std_p, gyro_std_child=gyro_std_c,
+            vector_sensor_stds_parent=sensor_stds_p,
+            vector_sensor_stds_child=sensor_stds_c,
+            R_wp0=R_wp0, R_wc0=R_wc0,
+            normalize_measurements=normalize_measurements,
+            **init_std_kwargs)
+    else:
+        joint_filter = RelativeFilter(
+            gyro_std_parent=gyro_std_p, gyro_std_child=gyro_std_c,
+            vector_sensor_stds_parent=sensor_stds_p,
+            vector_sensor_stds_child=sensor_stds_c,
+            normalize_measurements=normalize_measurements,
+            **init_std_kwargs
         )
-        R_pc[t] = joint_filter.get_R_pc()
+        joint_filter.set_qs(Rotation.from_matrix(R_wp0), Rotation.from_matrix(R_wc0))
+        R_pc = np.empty((N, 3, 3), dtype=np.float64)
+        R_pc[0] = joint_filter.get_R_pc()
+        for t in range(1, N):
+            joint_filter.update(
+                parent_trial.imu_trace.gyro[t - 1], child_trial.imu_trace.gyro[t - 1],
+                [parent_trial.imu_trace.acc[t], parent_trial.imu_trace.mag[t]],
+                [child_trial.imu_trace.acc[t], child_trial.imu_trace.mag[t]], dt
+            )
+            R_pc[t] = joint_filter.get_R_pc()
 
     if return_observability:
         return R_pc, _calculate_observability_metric_(parent_trial, child_trial)

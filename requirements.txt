@@ -2,6 +2,7 @@ AHRS
 matplotlib
 mpmath
 networkx
+numba
 numpy
 pandas
 pyarrow

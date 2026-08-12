@@ -7,7 +7,8 @@ import pandas as pd
 from scipy.interpolate import interp1d
 
 # Assuming these utilities are in a relative path
-from .finite_difference_utils import central_difference, forward_difference, polynomial_fit_derivative
+from .finite_difference_utils import (backward_difference, central_difference,
+                                      forward_difference, polynomial_fit_derivative)
 from .gyro_utils import calculate_best_fit_rotation
 
 
@@ -251,37 +252,41 @@ class IMUTrace:
             mag=self.mag
         )
 
-    def _finite_difference_gyros(self, method='polyfit') -> np.ndarray:
+    def _finite_difference_gyros(self, method='backward') -> np.ndarray:
         r"""
         Private method to compute the angular acceleration (derivative of gyro).
-        
+
         This can be calculated a number of different ways.
 
         Args:
             method (str, optional): The finite difference method to use.
-                'central': Computes using a central difference.
-                'first_order': Computes using a first-order forward difference.
-                'polyfit': Computes using a 2nd-order polynomial fit.
-                Defaults to 'polyfit'.
+                'backward': (w[t] - w[t-1]) / dt. Reads no future sample.
+                'central': Computes using a central difference. Reads one sample ahead.
+                'first_order': Computes using a first-order forward difference. Reads
+                    one sample ahead.
+                'polyfit': Computes using a 2nd-order polynomial fit over a sliding
+                    window. Reads window_size - 1 samples ahead (90 ms at 100 Hz).
+                Defaults to 'backward'.
 
         Returns:
             np.ndarray: An (N, 3) numpy array representing
             angular acceleration ($\dot{\omega}$) at each timestamp.
         """
-        derivates = []
-        
-        # Calculate derivatives for each axis (x, y, z) separately
+        # Every differentiator takes the full (N, 3) array and treats the columns
+        # independently, so the three axes go through in one call.
+        if method == 'backward':
+            return backward_difference(self.gyro, self.timestamps)
         if method == 'central':
-            derivates = [central_difference(self.gyro[:, axis], self.timestamps) for axis in range(3)]
-        elif method == 'first_order':
-            derivates = [forward_difference(self.gyro[:, axis], self.timestamps) for axis in range(3)]
-        elif method == 'polyfit':
-            derivates = [polynomial_fit_derivative(self.gyro[:, axis], self.timestamps, order=2) for axis in range(3)]
-                
-        return np.column_stack(derivates)
+            return central_difference(self.gyro, self.timestamps)
+        if method == 'first_order':
+            return forward_difference(self.gyro, self.timestamps)
+        if method == 'polyfit':
+            return polynomial_fit_derivative(self.gyro, self.timestamps, order=2)
+        raise ValueError(f"Unknown finite difference method '{method}'. "
+                         f"Choose from 'backward', 'central', 'first_order', 'polyfit'.")
 
     def project_acc(self, local_offset: Union[np.ndarray, List[np.ndarray]],
-                    finite_difference_gyro_method='polyfit') -> 'IMUTrace':
+                    finite_difference_gyro_method='backward') -> 'IMUTrace':
         r"""
         Projects acceleration to a new point on the same rigid body.
 
@@ -303,7 +308,17 @@ class IMUTrace:
                 new point of interest, expressed in the IMU's local frame.
             finite_difference_gyro_method (str, optional): The method used to
                 calculate the angular acceleration ($\dot{\omega}$).
-                Passed to `_finite_difference_gyros`. Defaults to 'polyfit'.
+                Passed to `_finite_difference_gyros`. Defaults to 'backward'.
+
+        CAUSALITY. The default is 'backward' so that a_p[t] depends only on samples up
+        to t, which is what an online pipeline needs. It is NOT the most accurate choice
+        on its own: measured on joint-angle RMSE over 11 subjects, 'backward' scores
+        12.0 deg against 'polyfit''s 7.0, because differentiating without smoothing puts
+        a lot of noise into the tangential term. It only wins once the projected
+        acceleration is low-passed -- with a causal 6 Hz Butterworth it reaches 5.7 deg,
+        beating polyfit's unfiltered 7.0. That low-pass is NOT applied here; callers that
+        want accuracy rather than causality should either pass 'polyfit' or filter the
+        result.
 
         Returns:
             IMUTrace: A new IMUTrace object with the same timestamps, gyro, and

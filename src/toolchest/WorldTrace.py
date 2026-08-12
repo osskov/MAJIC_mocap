@@ -415,6 +415,266 @@ def _reconstruct_from_markers(
 
     return positions, rotations
 
+
+# ==============================================================================
+# Template-based plate reconstruction
+# ==============================================================================
+# The general form of what _reconstruct_from_markers does for the special case of a
+# RECTANGULAR four-marker plate. Fits a known rigid marker layout to each frame by
+# Kabsch/SVD, which needs no assumption about the plate's shape.
+#
+# This exists because IMoVE's clusters are not rectangles. Their six inter-marker
+# distances are 120.4 / 104.4 / 103.4 / 84.6 / 62.9 / 59.6 mm — measured across all five
+# clusters and all 21 subjects with a per-subject sd of 0.2-1.3 mm, so it is one physical
+# plate, but an irregular planar quadrilateral. _reconstruct_from_markers assumes
+# rectangularity in three places (w and h average supposedly-equal opposite edges, x_v
+# averages supposedly-parallel edges, and _compute_case rebuilds a missing marker as
+# m_d + w*x_v + h*y_v), so none of it transfers.
+#
+# The fault handling generalizes too: instead of _compute_case's four hand-written
+# branches, drop each marker in turn and keep the subset that fits best. That is the same
+# idea, expressed once rather than four times, and it is correct for any plate shape.
+
+# Per-marker fit residual above which a frame's pose is not trusted, in metres.
+#
+# Scale reference: the template itself is reproducible to 0.2-1.3 mm across subjects, and
+# an independent survey of this repo's Al Borno plates put the p99.99 of inter-marker
+# distance deviation at 14.87 mm — roughly 7 mm as a per-marker residual. 10 mm therefore
+# sits above the noise floor of both datasets while being far below a real fault, which
+# runs to tens of mm. It is a starting point, not a tuned value: the honest way to set it
+# is from the residual distribution of the data in hand, which `report` returns for exactly
+# that purpose.
+DEFAULT_PLATE_RESIDUAL_TOLERANCE_M = 0.010
+
+# Markers are reported as exactly zero by some pipelines when a gap is not filled, which is
+# a valid coordinate in principle and never one in practice — the lab origin is not on the
+# subject. Treated as missing alongside NaN.
+_MISSING_MARKER_EPS = 1e-9
+
+
+def estimate_plate_template(markers: np.ndarray) -> np.ndarray:
+    """Recovers a plate's rigid marker layout from the markers' own median geometry.
+
+    Takes (N, M, 3) world-frame marker positions and returns an (M, 3) layout in an
+    arbitrary plate-fixed frame, centred on the marker centroid.
+
+    Built from the MEDIAN inter-marker distances, so per-frame faults do not move it: a
+    marker has to be displaced in more than half the trial before it shifts the template.
+    Classical MDS turns that distance matrix back into coordinates.
+
+    The frame's orientation is arbitrary and deliberately so. Any constant rotation of the
+    template rotates every reconstructed pose identically, and that is absorbed downstream
+    by PlateTrial._align_world_trace_to_imu_trace, which solves the sensor-to-segment
+    rotation from gyros anyway. So the template needs no anatomical justification.
+    """
+    markers = np.asarray(markers, dtype=np.float64)
+    n_markers = markers.shape[1]
+
+    present = _present_mask(markers)
+    distances = np.zeros((n_markers, n_markers))
+    for i in range(n_markers):
+        for j in range(i + 1, n_markers):
+            both = present[:, i] & present[:, j]
+            if not np.any(both):
+                raise ValueError(f"Markers {i} and {j} are never both present; "
+                                 f"cannot estimate a template.")
+            d = np.linalg.norm(markers[both, i] - markers[both, j], axis=1)
+            distances[i, j] = distances[j, i] = np.median(d)
+
+    # Classical MDS: centre the squared-distance matrix, then take the leading eigenvectors.
+    centering = np.eye(n_markers) - np.ones((n_markers, n_markers)) / n_markers
+    gram = -0.5 * centering @ (distances ** 2) @ centering
+    eigenvalues, eigenvectors = np.linalg.eigh(gram)
+    order = np.argsort(eigenvalues)[::-1][:3]
+    # Clipped at zero: a planar plate's third eigenvalue is zero up to measurement noise and
+    # can come out slightly negative, which would make the sqrt nan.
+    return eigenvectors[:, order] * np.sqrt(np.clip(eigenvalues[order], 0.0, None))
+
+
+def _present_mask(markers: np.ndarray) -> np.ndarray:
+    """(N, M) bool: which markers are actually observed in each frame."""
+    finite = np.isfinite(markers).all(axis=2)
+    nonzero = (np.abs(markers) > _MISSING_MARKER_EPS).any(axis=2)
+    return finite & nonzero
+
+
+def _kabsch(template: np.ndarray, observed: np.ndarray,
+            indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Best-fit rigid transform taking `template` onto `observed`, over a marker subset.
+
+    Returns (rotations (n,3,3), translations (n,3), per-frame RMS residual (n,)) for the
+    transform x = R p + t, where p is a template point and x its world position.
+
+    `t` is the world position of the template's ORIGIN, not of the subset centroid, so it
+    means the same physical point on the plate no matter which markers the fit used. That
+    matters here: leave-one-out changes the subset frame to frame, and a position that
+    jumped whenever a marker dropped out would be worse than useless.
+    """
+    P = template[indices]                                  # (k, 3)
+    Q = observed[:, indices, :]                            # (n, k, 3)
+    p_mean, q_mean = P.mean(axis=0), Q.mean(axis=1)
+    Pc, Qc = P - p_mean, Q - q_mean[:, None, :]
+
+    covariance = np.einsum('ki,nkj->nij', Pc, Qc)
+    U, _, Vt = np.linalg.svd(covariance)
+    # Reflection guard: without it a degenerate frame can produce a det = -1 "rotation",
+    # which is a mirror image and silently flips the reconstructed segment.
+    signs = np.sign(np.linalg.det(np.einsum('nji,nkj->nik', Vt, U)))
+    correction = np.zeros((len(observed), 3, 3))
+    correction[:, 0, 0] = correction[:, 1, 1] = 1.0
+    correction[:, 2, 2] = signs
+    rotations = np.einsum('nji,njk,nlk->nil', Vt, correction, U)
+
+    translations = q_mean - np.einsum('nij,j->ni', rotations, p_mean)
+    predicted = np.einsum('nij,kj->nki', rotations, P) + translations[:, None, :]
+    residual = np.sqrt((np.linalg.norm(predicted - Q, axis=2) ** 2).mean(axis=1))
+    return rotations, translations, residual
+
+
+def fit_plate_to_template(
+    markers: np.ndarray,
+    timestamps: np.ndarray,
+    template: np.ndarray = None,
+    residual_tolerance: float = DEFAULT_PLATE_RESIDUAL_TOLERANCE_M,
+    name: str = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Reconstructs a rigid plate's pose per frame by fitting a known marker layout.
+
+    Args:
+        markers: (N, M, 3) world-frame marker positions in METRES. NaN or exactly-zero
+            rows are treated as gaps.
+        timestamps: (N,) seconds.
+        template: (M, 3) plate-fixed layout. Estimated from the data if None.
+        residual_tolerance: per-marker fit residual above which a frame is not trusted.
+        name: for warnings.
+
+    Returns (positions, rotations, valid, report), matching the shape
+    repair_reconstruction_glitches returns so the two are interchangeable to a caller.
+
+    Three things happen, in order:
+
+      1. Fit every marker present in a frame. Frames that fit within tolerance are done.
+      2. For frames that do not, and that have four markers, drop each in turn and keep the
+         best three. One displaced marker is the overwhelmingly common fault, and this
+         isolates it without assuming anything about the plate's shape.
+      3. Frames still over tolerance, or with fewer than three markers, get no pose of their
+         own: they are interpolated from their neighbours and marked INVALID.
+
+    Step 3 keeps the uniform time grid that resampling, filtering and every finite-
+    difference angular velocity in this repo assume, while `valid` keeps the invented poses
+    out of any error statistic computed against them.
+    """
+    markers = np.asarray(markers, dtype=np.float64)
+    timestamps = np.asarray(timestamps, dtype=np.float64)
+    n_frames, n_markers = markers.shape[0], markers.shape[1]
+    if n_markers < 3:
+        raise ValueError(f"A plate needs at least 3 markers to define a frame; got {n_markers}.")
+
+    present = _present_mask(markers)
+
+    # A marker that is never seen carries no information and would sink the whole plate:
+    # estimate_plate_template needs every pair co-present, and the fit would carry a column
+    # of gaps. Drop those and continue on what is left — three markers still determine a
+    # pose, just without the redundancy that makes fault isolation possible.
+    #
+    # IMoVE needs this: the treadmill trials lose whole marker groups (s2's t2 has all four
+    # LTH and all four LSH at 0% present), and a reader has to be able to tell "this segment
+    # is untracked in this trial" apart from "this segment failed to reconstruct".
+    ever_present = present.any(axis=0)
+    excluded = [int(i) for i in np.flatnonzero(~ever_present)]
+    if excluded and ever_present.sum() < 3:
+        raise ValueError(
+            f"{name or 'plate'}: only {int(ever_present.sum())} of {n_markers} markers appear "
+            f"anywhere in this trial (missing indices {excluded}); a pose needs at least 3.")
+
+    if template is None:
+        template = estimate_plate_template(markers[:, ever_present])
+        # Re-expand so template rows stay aligned with marker columns; the excluded rows are
+        # never indexed, because `present` is False for them in every frame.
+        full = np.zeros((n_markers, 3))
+        full[ever_present] = template
+        template = full
+    template = np.asarray(template, dtype=np.float64)
+    # Centred over the markers actually in use, so the origin — and therefore every reported
+    # position — means the same physical point whether or not a marker was dropped.
+    template = template - template[ever_present].mean(axis=0)
+    # Zeroed so a NaN in an unused marker cannot poison an einsum over the used ones.
+    clean = np.where(present[:, :, None], markers, 0.0)
+
+    positions = np.full((n_frames, 3), np.nan)
+    rotations = np.full((n_frames, 3, 3), np.nan)
+    residual = np.full(n_frames, np.inf)
+    dropped = np.full(n_frames, -1, dtype=int)
+
+    # --- 1. Fit each distinct availability pattern in one vectorized pass ---------------
+    # At most 2^M patterns, and in practice one or two, so this is a small loop over
+    # groups rather than a per-frame Python loop over tens of thousands of frames.
+    patterns = np.unique(present, axis=0)
+    for pattern in patterns:
+        indices = np.flatnonzero(pattern)
+        if len(indices) < 3:
+            continue
+        frames = np.flatnonzero((present == pattern).all(axis=1))
+        R, t, r = _kabsch(template, clean[frames], indices)
+        rotations[frames], positions[frames], residual[frames] = R, t, r
+
+    # --- 2. Leave-one-out on the frames that did not fit -------------------------------
+    retry = np.flatnonzero((residual > residual_tolerance) & (present.sum(axis=1) >= 4))
+    if len(retry):
+        best_r = residual[retry].copy()
+        best_R, best_t = rotations[retry].copy(), positions[retry].copy()
+        best_drop = np.full(len(retry), -1, dtype=int)
+        for drop in range(n_markers):
+            indices = np.array([i for i in range(n_markers) if i != drop])
+            usable = present[retry][:, indices].all(axis=1)
+            if len(indices) < 3 or not np.any(usable):
+                continue
+            sub = retry[usable]
+            R, t, r = _kabsch(template, clean[sub], indices)
+            improved = r < best_r[usable]
+            where = np.flatnonzero(usable)[improved]
+            best_r[where], best_drop[where] = r[improved], drop
+            best_R[where], best_t[where] = R[improved], t[improved]
+        rotations[retry], positions[retry] = best_R, best_t
+        residual[retry], dropped[retry] = best_r, best_drop
+
+    # --- 3. Everything still bad is interpolated and marked invalid --------------------
+    valid = (residual <= residual_tolerance) & np.isfinite(residual)
+    report = {
+        'n_frames': int(n_frames),
+        'n_invalid': int((~valid).sum()),
+        'n_repaired_by_dropping_a_marker': int(((dropped >= 0) & valid).sum()),
+        'n_frames_missing_a_marker': int((present.sum(axis=1) < n_markers).sum()),
+        'fault_counts_per_marker': [int(((dropped == i) & valid).sum()) for i in range(n_markers)],
+        'residual_median_mm': float(np.median(residual[np.isfinite(residual)]) * 1000)
+                              if np.any(np.isfinite(residual)) else float('nan'),
+        'residual_p95_mm': float(np.percentile(residual[np.isfinite(residual)], 95) * 1000)
+                           if np.any(np.isfinite(residual)) else float('nan'),
+        'template_distances_mm': sorted(
+            (float(np.linalg.norm(template[i] - template[j]) * 1000)
+             for i in range(n_markers) for j in range(i + 1, n_markers)), reverse=True),
+    }
+
+    if not np.any(valid):
+        print(f"Warning: {name or 'plate'} has no frame that fits its template within "
+              f"{residual_tolerance * 1000:.0f} mm; leaving the reconstruction untouched.")
+        return positions, rotations, valid, report
+
+    if not np.all(valid):
+        good = np.flatnonzero(valid)
+        query = np.clip(timestamps[~valid], timestamps[good[0]], timestamps[good[-1]])
+        slerp = Slerp(timestamps[good], Rotation.from_matrix(rotations[good]))
+        rotations[~valid] = slerp(query).as_matrix()
+        for axis in range(3):
+            positions[~valid, axis] = np.interp(query, timestamps[good], positions[good, axis])
+        if report['n_invalid'] > 0.05 * n_frames:
+            print(f"Warning: {name or 'plate'}: {report['n_invalid']} of {n_frames} frames "
+                  f"({100 * report['n_invalid'] / n_frames:.1f}%) do not fit the plate template "
+                  f"and have been interpolated and marked invalid.")
+
+    return positions, rotations, valid, report
+
+
 class WorldTrace:
     """
     This class contains a trace of a world frame over time. Optionally, this can attach an IMUTrace and manipulate it.
@@ -493,6 +753,30 @@ class WorldTrace:
         return (np.array_equal(self.timestamps, other.timestamps) and
                 np.array_equal(self.positions, other.positions) and
                 np.array_equal(self.rotations, other.rotations))
+
+    @classmethod
+    def from_markers(cls, markers: np.ndarray, timestamps: np.ndarray,
+                     template: np.ndarray = None,
+                     residual_tolerance: float = DEFAULT_PLATE_RESIDUAL_TOLERANCE_M,
+                     name: str = None) -> 'WorldTrace':
+        """One plate's markers -> one WorldTrace. The counterpart of IMUTrace.from_txt.
+
+        Args:
+            markers: (N, M, 3) world-frame marker positions in METRES, NaN or zero where
+                a marker is missing. Unit conversion belongs to the reader, not here.
+            timestamps: (N,) seconds.
+            template: (M, 3) plate-fixed marker layout; estimated from the data if None.
+            residual_tolerance: per-marker fit residual above which a frame is invalid.
+            name: for warnings.
+
+        Use `fit_plate_to_template` directly when the diagnostics matter — this returns only
+        the trace, which is what a constructor should do; the report is what a reader wants
+        for its manifest.
+        """
+        positions, rotations, valid, _ = fit_plate_to_template(
+            markers, timestamps, template=template,
+            residual_tolerance=residual_tolerance, name=name)
+        return cls(timestamps, positions, rotations, valid=valid)
 
     @classmethod
     def from_trc(cls, trc_path: Union[str, Path]) -> Dict[str, 'WorldTrace']:
@@ -658,11 +942,10 @@ class WorldTrace:
         """
         This function computes the acceleration of the world frame by finite differencing the positions.
         """
-        acc_axis = []
-        for axis in range(3):
-            vel_axis = central_difference(self.positions[:, axis], self.timestamps)
-            acc_axis.append(central_difference(vel_axis, self.timestamps))
-        return np.column_stack(acc_axis) + acc_from_gravity
+        # central_difference treats the columns of an (N, 3) array independently, so
+        # both differentiations run on all three axes at once.
+        velocity = central_difference(self.positions, self.timestamps)
+        return central_difference(velocity, self.timestamps) + acc_from_gravity
 
     def calculate_imu_trace(self,
                             acc_from_gravity: np.ndarray = np.zeros(3),

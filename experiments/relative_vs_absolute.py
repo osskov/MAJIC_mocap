@@ -224,10 +224,11 @@ results/statistics/relative_vs_absolute_statistics.parquet, which is what the co
 and the figure caption quote. Its `family` column separates the two arguments: 'direction' for
 facts 1-4 and 'invariant' for facts 5-7.
 
-Runtime is dominated by IMUTrace.project_acc's per-sample polyfit gyro derivative (the same
-cost experiments/acceleration_projection.py pays), so the grid runs one process per subject
-with both activities inside it — the magnetometer's global reference is per-subject and spans
-both activities, so they cannot be split.
+The grid runs one process per subject with both activities inside it — the magnetometer's
+global reference is per-subject and spans both activities, so they cannot be split. (This
+used to be forced by runtime as well, when IMUTrace.project_acc's gyro derivative was a
+per-sample np.polyfit loop; that is vectorised now, so the grouping is only about the
+reference.)
 """
 import argparse
 import os

@@ -7,7 +7,10 @@ name = "majic-mocap"
 version = "1.0.0"
 description = "MAJIC filter: estimating the magnetic field at joint centers to reduce kinematic errors in inertial motion capture"
 readme = "README.md"
-requires-python = ">=3.9"
+# 3.10 is numba's floor (0.67 / llvmlite 0.49). numba compiles the relative filter's
+# update loop in src/relative_filter_fast.py; without it the pipeline still runs, on
+# the pure-Python RelativeFilter, roughly 55x slower per filter step.
+requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [

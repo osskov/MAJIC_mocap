@@ -43,8 +43,6 @@ class RelativeFilter:
                  dof2_axis_child: Optional[np.ndarray] = None, 
                  dof2_angle_rad: float = np.pi/2.0, 
                  dof2_std: Optional[float] = None,
-                 r_parent: Optional[np.ndarray] = None,
-                 r_child: Optional[np.ndarray] = None,
                  normalize_measurements: bool = False,
                  init_orientation_std: float = np.deg2rad(0.1)):
         """
@@ -158,27 +156,20 @@ class RelativeFilter:
     def get_R_pc(self) -> np.ndarray:
         return self.get_q_pc().as_matrix()
 
-    def update(self, gyro_p: np.ndarray, gyro_c: np.ndarray, 
-               vector_sensor_data_p: List[np.ndarray], 
-               vector_sensor_data_c: List[np.ndarray], dt: float,
-               acc_p_raw: Optional[np.ndarray] = None,
-               acc_c_raw: Optional[np.ndarray] = None):
+    def update(self, gyro_p: np.ndarray, gyro_c: np.ndarray,
+               vector_sensor_data_p: List[np.ndarray],
+               vector_sensor_data_c: List[np.ndarray], dt: float):
         """Performs a full prediction and measurement update cycle."""
         if len(vector_sensor_data_p) != self.num_vector_sensors or len(vector_sensor_data_c) != self.num_vector_sensors:
             raise ValueError(f"Expected {self.num_vector_sensors} vector sensor readings for parent and child.")
 
         q_lin_wp, q_lin_wc = self._get_time_update(gyro_p, gyro_c, dt)
         q_lin_wp, q_lin_wc = self._get_measurement_update(
-            q_lin_wp, q_lin_wc, 
-            vector_sensor_data_p, 
+            q_lin_wp, q_lin_wc,
+            vector_sensor_data_p,
             vector_sensor_data_c,
-            gyro_p=gyro_p,
-            gyro_c=gyro_c,
-            acc_p_raw=acc_p_raw,
-            acc_c_raw=acc_c_raw,
-            dt=dt
         )
-        
+
         self.q_wp = q_lin_wp
         self.q_wc = q_lin_wc
 
@@ -253,14 +244,9 @@ class RelativeFilter:
         delta_q = Rotation.from_rotvec(dt * gyro)
         return q * delta_q
 
-    def _get_measurement_update(self, q_lin_wp: Rotation, q_lin_wc: Rotation, 
-                                vector_sensor_data_p: List[np.ndarray], 
-                                vector_sensor_data_c: List[np.ndarray],
-                                gyro_p: Optional[np.ndarray] = None,
-                                gyro_c: Optional[np.ndarray] = None,
-                                acc_p_raw: Optional[np.ndarray] = None,
-                                acc_c_raw: Optional[np.ndarray] = None,
-                                dt: float = 0.01) -> Tuple[Rotation, Rotation]:
+    def _get_measurement_update(self, q_lin_wp: Rotation, q_lin_wc: Rotation,
+                                vector_sensor_data_p: List[np.ndarray],
+                                vector_sensor_data_c: List[np.ndarray]) -> Tuple[Rotation, Rotation]:
         """Corrects the state prediction using sensor measurements."""
 
         if self.normalize_measurements:

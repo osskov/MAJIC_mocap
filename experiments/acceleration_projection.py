@@ -122,9 +122,11 @@ joint_samples is stored decimated by SAMPLE_STRIDE (see there) because the full-
 would be several hundred MB for a figure that only ever shows quantiles; the time-series
 panel reads `traces` instead, which is full rate.
 
-Runtime is dominated by IMUTrace.project_acc, whose gyro derivative is a per-sample
-np.polyfit loop: roughly a minute per trial for the 14 sensor-joint pairs, so the grid is
-run one process per trial.
+The grid is run one process per trial. This used to be the expensive experiment --
+IMUTrace.project_acc's gyro derivative was a per-sample np.polyfit loop costing roughly a
+minute per trial -- but polynomial_fit_derivative is now vectorised (the per-window fit is
+a fixed linear operator, identical for every window at uniform sampling), so the projection
+is no longer the bottleneck.
 """
 import argparse
 import os
@@ -210,19 +212,40 @@ ROLES = ('parent', 'child')
 # ways, and the choice is not obviously free: differentiation amplifies high-frequency content,
 # so the scheme trades noise against bandwidth and lag.
 #
+#   backward     (w[t] - w[t-1]) / dt. project_acc's default. The only one that reads no
+#                future sample, so it is the one an online pipeline can use; noisiest of the
+#                four, and meant to be paired with a low-pass on the projected acceleration.
 #   polyfit      sliding 10-sample 2nd-order fit, differentiated analytically, with overlapping
-#                windows averaged — a smoothed Savitzky-Golay derivative. project_acc's default,
-#                so it is what every projected result in this repo has always used, and it is
-#                ~50x slower than the alternatives (a per-sample np.polyfit loop, which is ~98%
-#                of this whole experiment's runtime).
+#                windows averaged — a smoothed Savitzky-Golay derivative. Was project_acc's
+#                default, so it is what every projected result in this repo used up to that
+#                change. It used to be ~50x slower than the alternatives;
+#                polynomial_fit_derivative is vectorised now, so cost no longer separates them.
 #   central      (w[i+1] - w[i-1]) / 2dt. Centered, so no lag; no smoothing.
 #   first_order  forward difference. Included as the case that SHOULD lose: it is biased by half
 #                a sample, and half a sample of lag on this signal is error, not lag.
 #
+# TWO CAVEATS ON READING THE TABLE THIS PRODUCES, both of which point the opposite way to its
+# headline. They are recorded here because the section title invites the wrong inference.
+#
+#   1. The metric is computed AFTER the LOWPASS_CUTOFF_HZ low-pass, and the schemes differ
+#      almost entirely above that cutoff: filtering removes ~94% of the difference between
+#      polyfit and central, and below 6 Hz their gains agree to under 1%. So this table
+#      compares them in the one band where they nearly agree. Measured on joint-angle RMSE
+#      instead — the quantity the paper reports, computed on UNFILTERED projected acc — the
+#      ranking reverses hard: polyfit 6.96 deg vs central 9.56, i.e. central is ~37% WORSE.
+#   2. The schemes do not see the same data. polyfit's kernel spans +-9 samples, so it uses
+#      90 ms of FUTURE gyro; central and first_order use one future sample. A fully causal
+#      Savitzky-Golay (same fit, evaluated at the trailing edge) scores 16.87 deg, far worse
+#      than either, so polyfit's joint-angle advantage rides substantially on that lookahead
+#      rather than on being a better estimator.
+#
+# Neither caveat makes the table wrong; it measures what it says it measures. It just does not
+# license a conclusion about which derivative the pipeline should use.
+#
 # gyro_method_table measures all three against the same mocap reference so the default is a
 # measured choice rather than an inherited one.
-GYRO_METHODS = ('polyfit', 'central', 'first_order')
-PRIMARY_GYRO_METHOD = 'polyfit'  # must stay project_acc's own default; see above
+GYRO_METHODS = ('backward', 'polyfit', 'central', 'first_order')
+PRIMARY_GYRO_METHOD = 'backward'  # must stay project_acc's own default; see above
 
 QUANTILES = [0.05, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
 
