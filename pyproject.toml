@@ -31,19 +31,27 @@ Publication = "https://doi.org/10.21203/rs.3.rs-9337794/v1"
 # identically — these are just names that do not require being in the repo root.
 [project.scripts]
 majic-benchmark = "experiments.benchmark_experiment:main"
+majic-normalized-benchmark = "experiments.normalized_benchmark:main"
 majic-oracle-ablation = "experiments.oracle_ablation:main"
 majic-threshold-sensitivity = "experiments.threshold_sensitivity:main"
 majic-noise-sensitivity = "experiments.noise_sensitivity:main"
 majic-ekf-oracle-comparison = "experiments.ekf_oracle_comparison:main"
 majic-drift-observability = "experiments.drift_observability:main"
-majic-sensor-stats = "generate_sensor_stats:main"
+majic-acceleration-projection = "experiments.acceleration_projection:main"
+majic-sensor-distributions = "experiments.sensor_distributions:main"
+majic-relative-vs-absolute = "experiments.relative_vs_absolute:main"
+majic-normalization-comparison = "experiments.normalization_comparison:main"
 majic-plot-paper-figures = "plotting.paper_figures:main"
+majic-plot-normalized-benchmark = "plotting.normalized_benchmark:main"
 majic-plot-ekf-failure-modes = "plotting.ekf_failure_modes:main"
 majic-plot-oracle-ablation = "plotting.oracle_ablation:main"
 majic-plot-threshold-sensitivity = "plotting.threshold_sensitivity:main"
 majic-plot-noise-sensitivity = "plotting.noise_sensitivity:main"
 majic-plot-ekf-oracle-comparison = "plotting.ekf_oracle_comparison:main"
 majic-plot-drift-observability = "plotting.drift_observability:main"
+majic-plot-acceleration-projection = "plotting.acceleration_projection:main"
+majic-plot-sensor-distributions = "plotting.sensor_distributions:main"
+majic-plot-relative-vs-absolute = "plotting.relative_vs_absolute:main"
 
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
@@ -52,7 +60,7 @@ dependencies = { file = ["requirements.txt"] }
 # setuptools assume the src-layout convention, which would hide `experiments`,
 # `plotting`, and `paths` from the install.
 [tool.setuptools]
-py-modules = ["paths", "generate_sensor_stats"]
+py-modules = ["paths"]
 
 [tool.setuptools.packages.find]
 include = ["src*", "experiments*", "plotting*"]

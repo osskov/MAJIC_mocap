@@ -70,8 +70,27 @@ EXPECTED_GRAVITY = np.array([0.0, 9.81, 0.0])
 # depends on whether RelativeFilter normalizes its vector measurements, which is
 # not visible from here.
 DEFAULT_GYRO_STD = 0.0045
-DEFAULT_ACC_STD = 0.037
-DEFAULT_MAG_STD = 0.03
+DEFAULT_ACC_STD = 0.018
+DEFAULT_MAG_STD = 0.05
+
+# Nominal magnitude of each vector sensor's reading, used ONLY by the '_rescaled' method
+# arm to convert the absolute stds above into the units a unit-length measurement lives
+# in (std / nominal). Without that conversion, normalizing silently retunes the filter —
+# see RelativeFilter._normalize_vector_measurements.
+#
+# These are deliberately FIXED constants rather than each sample's own |v|. Rescaling by
+# the actual per-sample magnitude would be an exact algebraic no-op: h, H and R would all
+# scale together, leaving K @ e and K @ H untouched, so that arm would reproduce the
+# unnormalized one bit for bit. Holding the nominal fixed preserves the AVERAGE weighting
+# while still discarding the per-sample magnitude — which is the geometric change
+# normalization actually makes, and the only thing the rescaled arm is meant to isolate.
+#
+# Acc is gravity's magnitude. Mag is 1.0 because these are Xsens exports, whose
+# magnetometer channels are normalized at calibration so a nominal Earth field reads 1.0
+# (see MAG_UNIT in experiments/sensor_distributions.py); measured |mag| medians across
+# this dataset run 0.4-1.1, so this is a nominal, not a per-sensor calibration.
+NOMINAL_ACC_MAGNITUDE = float(np.linalg.norm(EXPECTED_GRAVITY))
+NOMINAL_MAG_MAGNITUDE = 1.0
 
 # The o^J value above which mag_adapt stops trusting the magnetometer, in the units of
 # segment_observability, i.e. (m/s^2)(m/s^3).
@@ -94,40 +113,92 @@ DEFAULT_MAG_STD = 0.03
 DEFAULT_MAG_ADAPT_THRESHOLD = 1000.0
 
 
-def pipeline_constants() -> Dict[str, Any]:
-    """The physical/tuning constants in force, for provenance manifests."""
+STD_KEYS = ('gyro_std', 'acc_std', 'mag_std')
+
+
+def resolve_stds(stds: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+    """The three filter stds in force for a run: the DEFAULT_* constants, with any
+    key present in `stds` overriding its default.
+
+    Exists so a re-tuning is passed as data (one dict, threaded down to
+    _run_relative_filter and into every manifest) rather than by reassigning the
+    module constants, which multiprocessing workers would not see — each worker
+    re-imports this module in a fresh interpreter, so a parent-process mutation of
+    DEFAULT_ACC_STD would silently run the default tuning in every child while the
+    parent's manifest claimed the override.
+
+    Unknown keys raise: 'acc_stdev' or 'mag' would otherwise be dropped on the floor
+    and the run would quietly use the default for that sensor."""
+    resolved = {'gyro_std': DEFAULT_GYRO_STD, 'acc_std': DEFAULT_ACC_STD, 'mag_std': DEFAULT_MAG_STD}
+    if stds:
+        unknown = sorted(set(stds) - set(STD_KEYS))
+        if unknown:
+            raise ValueError(f"Unknown filter std key(s) {unknown}. Allowed: {list(STD_KEYS)}")
+        resolved.update({key: float(value) for key, value in stds.items()})
+    return resolved
+
+
+def pipeline_constants(stds: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    """The physical/tuning constants in force, for provenance manifests.
+
+    `stds` records an override rather than the defaults — a manifest that reported
+    DEFAULT_ACC_STD next to a run tuned elsewhere is worse than no manifest."""
     return {
         'expected_gravity': EXPECTED_GRAVITY.tolist(),
-        'gyro_std': DEFAULT_GYRO_STD,
-        'acc_std': DEFAULT_ACC_STD,
-        'mag_std': DEFAULT_MAG_STD,
+        **resolve_stds(stds),
         'mag_adapt_threshold': DEFAULT_MAG_ADAPT_THRESHOLD,
     }
 
+# Per-base defaults. 'normalize_measurements' is set here rather than being uniformly
+# False because the EKF needs a different accelerometer weighting than the relative
+# filters do — see the note below.
 METHODS = {
     'marker':      {'kind': 'marker'},
     'mag_on':      {'kind': 'filter', 'project': True,  'mag_mode': 'on'},
     'mag_off':     {'kind': 'filter', 'project': True,  'mag_mode': 'off'},
     'mag_adapt':   {'kind': 'filter', 'project': True,  'mag_mode': 'adapt'},
-    'ekf':         {'kind': 'ekf'},
+    'ekf':         {'kind': 'ekf', 'normalize_measurements': True},
 }
 
 # ==============================================================================
 # Method name resolution
 # ==============================================================================
 # A method name is a base (one of METHODS) plus optional suffixes, in this fixed
-# order: an observability threshold override (mag_adapt only), then an accelerometer
-# oracle flag, then a magnetometer oracle flag. Examples:
+# order: a measurement-normalization flag, then an observability threshold override
+# (mag_adapt only), then a magnetic-distortion scale, then an accelerometer oracle flag,
+# then a magnetometer oracle flag.
+# Examples:
 #   'mag_adapt_th50.00'                    -> base mag_adapt, threshold=50.0
+#   'mag_on_dist0.50'                       -> base mag_on with the magnetometer's estimated
+#                                              distortion halved (see _compute_scaled_mag).
+#                                              'dist0.00' IS the mag oracle and 'dist1.00'
+#                                              IS the real reading, both exactly, so the
+#                                              sweep's endpoints coincide with existing arms
 #   'ekf_perfect_acc_perfect_mag'           -> base ekf, both oracle
 #   'mag_on_real_acc_perfect_mag'           -> base mag_on, mag oracle only
 #   'mag_off_perfect_acc'                   -> base mag_off, acc oracle only (mag_off
 #                                              always zeroes mag regardless, so a mag
 #                                              suffix would be a no-op and is omitted)
+#   'mag_off_normalized'                    -> base mag_off, unit-length acc/mag into
+#                                              the measurement update
+#   'mag_off_unnormalized'                  -> base mag_off, raw-magnitude acc/mag; the
+#                                              same thing a bare 'mag_off' does, spelled
+#                                              out so a normalization comparison can name
+#                                              every arm symmetrically
+#   'ekf_unnormalized'                      -> base ekf with normalization turned OFF. Not
+#                                              the same as a bare 'ekf', which normalizes
+#                                              by default (see the METHODS note above) —
+#                                              the suffix overrides the base default
+#   'mag_off_rescaled'                      -> base mag_off, unit-length acc/mag AND each
+#                                              std divided by that sensor's nominal
+#                                              magnitude, so the weighting matches the
+#                                              unnormalized arm and only the geometry moves
 
 _METHOD_SUFFIX_RE = re.compile(
     r'^(?P<base>.+?)'
+    r'(?:_(?P<norm>unnormalized|normalized|rescaled))?'
     r'(?:_th(?P<threshold>[\d.]+))?'
+    r'(?:_dist(?P<distortion>[\d.]+))?'
     r'(?:_(?P<acc_src>real|perfect)_acc)?'
     r'(?:_(?P<mag_src>real|perfect)_mag)?$'
 )
@@ -135,8 +206,13 @@ _METHOD_SUFFIX_RE = re.compile(
 
 def resolve_method_spec(method: str) -> Dict[str, Any]:
     """Parses a method name into a spec dict: the base METHODS entry plus
-    'acc_source' / 'mag_source' ('real' or 'perfect', default 'real') and, for
-    mag_adapt, an overridden 'mag_adapt_threshold' if a _th<value> suffix is present."""
+    'acc_source' / 'mag_source' ('real', 'perfect' or 'scaled', default 'real'),
+    'normalize_measurements' / 'rescale_stds' (both default False), for mag_adapt an
+    overridden 'mag_adapt_threshold' if a _th<value> suffix is present, and for a
+    _dist<value> suffix a 'mag_distortion_scale' with mag_source set to 'scaled'.
+
+    The '_rescaled' arm sets both normalization flags: it is '_normalized' plus the std
+    conversion that keeps its sensor weighting equal to the '_unnormalized' arm's."""
     m = _METHOD_SUFFIX_RE.match(method)
     if m is None:  # only reachable for an empty name; every other string has a base
         raise ValueError(f"Unparseable method name '{method}'. Allowed bases: {list(METHODS)}")
@@ -146,8 +222,27 @@ def resolve_method_spec(method: str) -> Dict[str, Any]:
     spec = dict(METHODS[base])
     spec['acc_source'] = m.group('acc_src') or 'real'
     spec['mag_source'] = m.group('mag_src') or 'real'
+    # The base may carry its own normalization default (the EKF does); an explicit suffix
+    # overrides it, and its absence leaves the base default alone.
+    spec.setdefault('normalize_measurements', False)
+    spec.setdefault('rescale_stds', False)
+    if m.group('norm') is not None:
+        spec['normalize_measurements'] = m.group('norm') in ('normalized', 'rescaled')
+        spec['rescale_stds'] = m.group('norm') == 'rescaled'
     if m.group('threshold') is not None:
         spec['mag_adapt_threshold'] = float(m.group('threshold'))
+    if m.group('distortion') is not None:
+        # Both suffixes replace the magnetometer wholesale, so a name carrying both asks for
+        # two different readings at once. Raising is the only safe answer: silently letting
+        # one win would run 'mag_on_dist0.50_perfect_mag' as an oracle arm under a name that
+        # says it is a 50%-distortion arm, and the sweep would read a flat curve off it.
+        if m.group('mag_src') == 'perfect':
+            raise ValueError(
+                f"Method '{method}' asks for both a distortion scale and the mag oracle. "
+                f"They are the same knob: '_dist0.00' IS '_perfect_mag'. Use one."
+            )
+        spec['mag_source'] = 'scaled'
+        spec['mag_distortion_scale'] = float(m.group('distortion'))
     return spec
 
 # ==============================================================================
@@ -245,6 +340,83 @@ def _compute_perfect_mag(plate: PlateTrial, expected_mag: np.ndarray) -> np.ndar
     return np.einsum('nji,j->ni', plate.world_trace.rotations, expected_mag)
 
 
+def _compute_scaled_mag(plate: PlateTrial, expected_mag: np.ndarray,
+                        distortion_scale: float) -> np.ndarray:
+    """The plate's magnetometer with its estimated distortion multiplied by
+    `distortion_scale` — a dial between the mag oracle and the real reading.
+
+    THE DEFINITION. Rotate the reading into the world frame with ground truth, where the
+    undistorted field would be the constant `expected_mag` (e). Whatever is left over,
+    d(t) = m_world(t) - e, is this sensor's estimated distortion at that instant. Scale
+    only that, and rotate back:
+
+        m_body(t; a) = R(t)^T [ e + a * ( R(t) m_body(t) - e ) ]
+
+    The two ends are exact, not approximate, and that is the point of writing it this way:
+      a = 0  reproduces _compute_perfect_mag bit for bit (the d term vanishes);
+      a = 1  reproduces the raw reading bit for bit (R^T R = I, verified to 1e-15 on real
+             trials — the world round trip is a pure rotation).
+    So a sweep over a interpolates continuously between the 'perfect_mag' oracle arm and
+    the ordinary real-magnetometer arm, and both endpoints are checkable against arms the
+    pipeline already runs rather than being a separate code path. a > 1 extrapolates:
+    the same distortion pattern, amplified, which is how the sweep finds a breaking point
+    that a >= 1 alone would not reach if the real field is already tolerable.
+
+    WHAT IS ACTUALLY BEING SCALED. Everything that makes this sensor's reading differ from
+    one common rigid field — the lab's ferrous distortion (which is what dominates: it
+    scales with sensor height and is localized in lab coordinates, see
+    experiments/sensor_distributions.py), plus that sensor's own calibration gain error and
+    noise, plus any error in e itself. It is an upper bound on the field anomaly rather
+    than an isolate of it, so read the sweep's x-axis as "total inconsistency between this
+    sensor and the assumed field", not as "milligauss of ferrous distortion". The
+    experiment reports that x-axis in degrees of field disagreement for exactly this
+    reason (experiments/distortion_tolerance.py).
+
+    NOT A ROTATION. Scaling shortens the vector as well as turning it, so |m| moves with a
+    — at a = 0 every sensor reads |e| exactly. That matters because the relative filter is
+    fed raw-magnitude measurements (normalize_measurements=False), so its magnetometer
+    weighting drifts slightly across the sweep along with the magnitude. The alternative,
+    renormalizing to the original |m|, would hold the weighting fixed but would no longer
+    reduce to either endpoint, and would keep a magnitude error the filter treats as
+    signal. The endpoints are worth more than the constant weighting, so this is a plain
+    linear interpolation.
+    """
+    world_rots = plate.world_trace.rotations
+    world_mag = np.einsum('nij,nj->ni', world_rots, plate.imu_trace.mag)
+    scaled_world = expected_mag + distortion_scale * (world_mag - expected_mag)
+    return np.einsum('nji,nj->ni', world_rots, scaled_world)
+
+
+def _mag_override(plate: PlateTrial, mag_source: str, expected_mag: Optional[np.ndarray],
+                  mag_distortion_scale: Optional[float]) -> Optional[np.ndarray]:
+    """The magnetometer reading to hand the filter in place of the plate's own, or None to
+    leave it alone.
+
+    Shared by the relative-filter and EKF paths so the three mag sources are resolved in
+    exactly one place: both paths take the same '_perfect_mag' / '_dist<a>' method suffixes,
+    and a source honoured on one path but silently ignored on the other would run the
+    requested configuration under one name and the default under another."""
+    if mag_source == 'real':
+        return None
+    if mag_source == 'perfect':
+        return _compute_perfect_mag(plate, expected_mag)
+    if mag_source == 'scaled':
+        if mag_distortion_scale is None:
+            raise ValueError(
+                "mag_source='scaled' needs a mag_distortion_scale; got None. The scale is "
+                "the multiplier on the estimated distortion (0 = the mag oracle, 1 = the "
+                "real reading), so there is no sensible default to fall back on."
+            )
+        return _compute_scaled_mag(plate, expected_mag, mag_distortion_scale)
+    raise ValueError(f"Unknown mag_source '{mag_source}'")
+
+
+def _needs_expected_mag(mag_source: str) -> bool:
+    """Whether a mag source is measured against the world field reference. Both the oracle
+    and the distortion sweep are; the real reading is not."""
+    return mag_source in ('perfect', 'scaled')
+
+
 def _compute_perfect_joint_acc(parent_trial: PlateTrial, child_trial: PlateTrial,
                                 gravity: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
     """Oracle acc for a joint pair (relative-filter path): the true linear
@@ -317,6 +489,26 @@ def segment_observability(imu_trace: IMUTrace) -> np.ndarray:
     return np.concatenate(([0.0], np.linalg.norm(np.cross(acc[1:], acc_dot_world), axis=1)))
 
 
+def project_pair_to_joint_center(parent_trial: PlateTrial, child_trial: PlateTrial
+                                 ) -> Tuple[PlateTrial, PlateTrial]:
+    """Both plates with their IMU traces rigid-body projected to the shared joint center —
+    the same step _run_relative_filter(project=True) performs before the EKF sees the data.
+
+    Factored out because o^J is only comparable to the value the filter gates on if it is
+    computed after the identical projection, and the analysis scripts that want o^J without
+    running the EKF (experiments/drift_observability.py,
+    experiments/sensor_distributions.py) would otherwise each carry their own copy of these
+    four lines. Returns copies: projection replaces imu_trace, so operating in place would
+    silently change every later use of the caller's plates.
+    """
+    parent_trial = parent_trial.copy()
+    child_trial = child_trial.copy()
+    parent_offset, child_offset, _ = parent_trial.world_trace.get_joint_center(child_trial.world_trace)
+    parent_trial.imu_trace = parent_trial.project_imu_trace(parent_offset)
+    child_trial.imu_trace = child_trial.project_imu_trace(child_offset)
+    return parent_trial, child_trial
+
+
 def _calculate_observability_metric_(parent_trial: PlateTrial, child_trial: PlateTrial) -> np.ndarray:
     """o^J for a joint: the worse-conditioned of its two segments.
 
@@ -341,6 +533,9 @@ def _run_relative_filter(parent_trial: PlateTrial,
                          acc_std_child: float = DEFAULT_ACC_STD,
                          mag_std_child: float = DEFAULT_MAG_STD,
                          mag_adapt_threshold: float = DEFAULT_MAG_ADAPT_THRESHOLD,
+                         normalize_measurements: bool = False,
+                         rescale_stds: bool = False,
+                         init_orientation_std: Optional[float] = None,
                          return_observability: bool = False):
     """Estimates joint orientations between parent and child trials using specified filter configurations.
 
@@ -350,10 +545,35 @@ def _run_relative_filter(parent_trial: PlateTrial,
     interest, so `project` is forced off in that case — otherwise the rigid-body
     projection would be double-applied.
 
+    normalize_measurements scales the acc/mag vectors to unit length inside the filter's
+    measurement update while leaving the *_std arguments untouched, which changes how far
+    the filter trusts them relative to the gyro prediction — read
+    RelativeFilter._normalize_vector_measurements before comparing across this flag.
+
+    rescale_stds undoes exactly that side effect, dividing each vector sensor's std by its
+    NOMINAL_*_MAGNITUDE so a unit-length measurement carries the same weight the raw one
+    did. Set together (the '_rescaled' method arm), the two isolate the geometric effect of
+    normalizing from the retuning it otherwise smuggles in. It is meaningless on its own,
+    so it raises rather than quietly running a filter nobody asked for.
+
     If return_observability, also returns the o^J observability metric (see
     _calculate_observability_metric_), computed post-projection regardless of
     mag_mode — used by experiments/drift_observability.py to relate drift to
     observability independent of whether the magnetometer was used."""
+    if rescale_stds and not normalize_measurements:
+        raise ValueError(
+            "rescale_stds=True with normalize_measurements=False divides the sensor stds "
+            "by their nominal magnitudes while the measurements keep their raw scale, "
+            "which is not a configuration anything wants — it just over-trusts every "
+            "sensor by that factor. Use both together (the '_rescaled' method arm) or "
+            "neither."
+        )
+    if rescale_stds:
+        acc_std_parent /= NOMINAL_ACC_MAGNITUDE
+        acc_std_child /= NOMINAL_ACC_MAGNITUDE
+        mag_std_parent /= NOMINAL_MAG_MAGNITUDE
+        mag_std_child /= NOMINAL_MAG_MAGNITUDE
+
     parent_trial = parent_trial.copy()
     child_trial = child_trial.copy()
 
@@ -402,18 +622,29 @@ def _run_relative_filter(parent_trial: PlateTrial,
         vector_sensor_stds_parent=[np.ones(3) * acc_std_parent, np.ones(3) * mag_std_parent],
         vector_sensor_stds_child=[np.ones(3) * acc_std_child, np.ones(3) * mag_std_child],
         r_parent=parent_offset,
-        r_child=child_offset
+        r_child=child_offset,
+        normalize_measurements=normalize_measurements,
+        **({} if init_orientation_std is None
+           else {'init_orientation_std': init_orientation_std})
     )
     joint_filter.set_qs(Rotation.from_matrix(parent_trial.world_trace.rotations[0]), Rotation.from_matrix(child_trial.world_trace.rotations[0]))
     dt = np.mean(parent_trial.imu_trace.timestamps[1:] - parent_trial.imu_trace.timestamps[:-1])
 
-    # Main update loop
+    # Main update loop.
+    #
+    # R_pc[t] must be the estimate *at* timestamps[t]. update() propagates the state
+    # forward by dt before correcting it, so the sample driving the step into time t is
+    # gyro[t-1]: a filter-free check (marker-derived angular velocity over (t, t+1]
+    # against gyro[t+shift]) minimises at shift=0, i.e. gyro[t] spans the interval
+    # starting at t. The measurement correction uses acc/mag[t], which are valid at t.
+    # Index 0 is the seeded state itself, so the error there is exactly zero.
     N = len(parent_trial)
     R_pc = np.empty((N, 3, 3), dtype=np.float64)
+    R_pc[0] = joint_filter.get_R_pc()
 
-    for t in range(N):
+    for t in range(1, N):
         joint_filter.update(
-            parent_trial.imu_trace.gyro[t], child_trial.imu_trace.gyro[t],
+            parent_trial.imu_trace.gyro[t - 1], child_trial.imu_trace.gyro[t - 1],
             [parent_trial.imu_trace.acc[t], parent_trial.imu_trace.mag[t]],
             [child_trial.imu_trace.acc[t], child_trial.imu_trace.mag[t]], dt,
             acc_p_raw=acc_p_raw[t],
@@ -458,11 +689,17 @@ def _joint_angles_from_marker(plates: Dict[str, PlateTrial]) -> pd.DataFrame:
 
 def _joint_angles_from_filter(plates: Dict[str, PlateTrial], project: bool, mag_mode: str,
                                acc_source: str = 'real', mag_source: str = 'real',
-                               mag_adapt_threshold: float = DEFAULT_MAG_ADAPT_THRESHOLD) -> pd.DataFrame:
+                               mag_adapt_threshold: float = DEFAULT_MAG_ADAPT_THRESHOLD,
+                               normalize_measurements: bool = False,
+                               rescale_stds: bool = False,
+                               mag_distortion_scale: Optional[float] = None,
+                               stds: Optional[Dict[str, float]] = None) -> pd.DataFrame:
     all_joint_data = []
     any_plate = next(iter(plates.values()))
     timestamps = any_plate.imu_trace.timestamps
-    expected_mag = _compute_expected_mag_field(list(plates.values())) if mag_source == 'perfect' else None
+    expected_mag = (_compute_expected_mag_field(list(plates.values()))
+                    if _needs_expected_mag(mag_source) else None)
+    tuning = resolve_stds(stds)
 
     for joint_name, (parent, child) in JOINTS.items():
         if parent not in plates or child not in plates:
@@ -478,18 +715,20 @@ def _joint_angles_from_filter(plates: Dict[str, PlateTrial], project: bool, mag_
         elif acc_source != 'real':
             raise ValueError(f"Unknown acc_source '{acc_source}'")
 
-        mag_override_parent = mag_override_child = None
-        if mag_source == 'perfect':
-            mag_override_parent = _compute_perfect_mag(parent_plate, expected_mag)
-            mag_override_child = _compute_perfect_mag(child_plate, expected_mag)
-        elif mag_source != 'real':
-            raise ValueError(f"Unknown mag_source '{mag_source}'")
+        mag_override_parent = _mag_override(parent_plate, mag_source, expected_mag, mag_distortion_scale)
+        mag_override_child = _mag_override(child_plate, mag_source, expected_mag, mag_distortion_scale)
 
         R_pc = _run_relative_filter(
             parent_plate, child_plate, project=project, mag_mode=mag_mode,
             acc_override_parent=acc_override_parent, acc_override_child=acc_override_child,
             mag_override_parent=mag_override_parent, mag_override_child=mag_override_child,
-            mag_adapt_threshold=mag_adapt_threshold
+            mag_adapt_threshold=mag_adapt_threshold,
+            normalize_measurements=normalize_measurements,
+            rescale_stds=rescale_stds,
+            gyro_std_parent=tuning['gyro_std'], acc_std_parent=tuning['acc_std'],
+            mag_std_parent=tuning['mag_std'],
+            gyro_std_child=tuning['gyro_std'], acc_std_child=tuning['acc_std'],
+            mag_std_child=tuning['mag_std'],
         )
         rotvec = Rotation.from_matrix(R_pc).as_rotvec()
 
@@ -505,18 +744,33 @@ def _joint_angles_from_filter(plates: Dict[str, PlateTrial], project: bool, mag_
     return pd.concat(all_joint_data, ignore_index=True) if all_joint_data else pd.DataFrame()
 
 
-def _joint_angles_from_ekf(plates: Dict[str, PlateTrial], acc_source: str = 'real', mag_source: str = 'real') -> pd.DataFrame:
+def _joint_angles_from_ekf(plates: Dict[str, PlateTrial], acc_source: str = 'real', mag_source: str = 'real',
+                            normalize_measurements: bool = False,
+                            rescale_stds: bool = False,
+                            mag_distortion_scale: Optional[float] = None,
+                            stds: Optional[Dict[str, float]] = None) -> pd.DataFrame:
     plate_trials = list(plates.values())
     ground_plate = _setup_ekf_ground_plate_(plate_trials)
-    expected_mag = _compute_expected_mag_field(plate_trials) if mag_source == 'perfect' else None
+    expected_mag = _compute_expected_mag_field(plate_trials) if _needs_expected_mag(mag_source) else None
+    tuning = resolve_stds(stds)
 
     segment_orientations = {}
     for plate_name, plate in plates.items():
         acc_override = _compute_perfect_segment_acc(plate) if acc_source == 'perfect' else None
-        mag_override = _compute_perfect_mag(plate, expected_mag) if mag_source == 'perfect' else None
+        mag_override = _mag_override(plate, mag_source, expected_mag, mag_distortion_scale)
+        # The virtual ground plate is noiseless by construction, but its stds are set to the
+        # same values as the real sensor's: the filter estimates a RELATIVE orientation, so
+        # zeroing the parent's stds would make its perfect readings infinitely trusted and the
+        # state unidentifiable. Symmetric stds are what the unswept pipeline has always run.
         segment_orientations[plate_name] = _run_relative_filter(
             ground_plate, plate, project=False, mag_mode='on',
-            acc_override_child=acc_override, mag_override_child=mag_override
+            acc_override_child=acc_override, mag_override_child=mag_override,
+            normalize_measurements=normalize_measurements,
+            rescale_stds=rescale_stds,
+            gyro_std_parent=tuning['gyro_std'], acc_std_parent=tuning['acc_std'],
+            mag_std_parent=tuning['mag_std'],
+            gyro_std_child=tuning['gyro_std'], acc_std_child=tuning['acc_std'],
+            mag_std_child=tuning['mag_std'],
         )
 
     all_joint_data = []
@@ -544,19 +798,30 @@ def _joint_angles_from_ekf(plates: Dict[str, PlateTrial], acc_source: str = 'rea
     return pd.concat(all_joint_data, ignore_index=True) if all_joint_data else pd.DataFrame()
 
 
-def compute_joint_angles(plates: Dict[str, PlateTrial], method: str) -> pd.DataFrame:
+def compute_joint_angles(plates: Dict[str, PlateTrial], method: str,
+                          stds: Optional[Dict[str, float]] = None) -> pd.DataFrame:
+    """Joint angles for one method. `stds` overrides the DEFAULT_*_STD tuning per
+    sensor (see resolve_stds); it is inert for 'marker', which runs no filter."""
     spec = resolve_method_spec(method)
     if spec['kind'] == 'marker':
         return _joint_angles_from_marker(plates)
     if spec['kind'] == 'ekf':
-        return _joint_angles_from_ekf(plates, acc_source=spec['acc_source'], mag_source=spec['mag_source'])
+        return _joint_angles_from_ekf(plates, acc_source=spec['acc_source'], mag_source=spec['mag_source'],
+                                      normalize_measurements=spec['normalize_measurements'],
+                                      rescale_stds=spec['rescale_stds'],
+                                      mag_distortion_scale=spec.get('mag_distortion_scale'),
+                                      stds=stds)
     return _joint_angles_from_filter(
         plates,
         project=spec['project'],
         mag_mode=spec['mag_mode'],
         acc_source=spec['acc_source'],
         mag_source=spec['mag_source'],
-        mag_adapt_threshold=spec.get('mag_adapt_threshold', DEFAULT_MAG_ADAPT_THRESHOLD)
+        mag_adapt_threshold=spec.get('mag_adapt_threshold', DEFAULT_MAG_ADAPT_THRESHOLD),
+        normalize_measurements=spec['normalize_measurements'],
+        rescale_stds=spec['rescale_stds'],
+        mag_distortion_scale=spec.get('mag_distortion_scale'),
+        stds=stds
     )
 
 # ==============================================================================
@@ -566,30 +831,37 @@ def compute_joint_angles(plates: Dict[str, PlateTrial], method: str) -> pd.DataF
 joint_angles_path = paths.joint_angles_path
 
 
-def save_joint_angles(df: pd.DataFrame, subject: str, activity: str, method: str):
-    path = ensure_parent(joint_angles_path(subject, activity, method))
+def save_joint_angles(df: pd.DataFrame, subject: str, activity: str, method: str,
+                      variant: Optional[str] = None, stds: Optional[Dict[str, float]] = None):
+    """`variant` and `stds` travel together: the first namespaces the output so a
+    re-tuned run does not overwrite the default-tuned one, the second is what the
+    manifest records as the tuning in force (see paths.joint_angles_path)."""
+    path = ensure_parent(joint_angles_path(subject, activity, method, variant=variant))
     df.to_parquet(path, engine='pyarrow')
     spec = resolve_method_spec(method)
     write_manifest(
         path,
-        constants=pipeline_constants(),
+        constants=pipeline_constants(stds),
         subject=f"Subject{subject}", activity=activity, method=method, method_spec=spec,
+        variant=variant,
         source=str(raw_trial_dir(subject, activity).relative_to(paths.REPO_ROOT)),
         n_rows=len(df),
     )
 
 
-def load_joint_angles(subject: str, activity: str, method: str) -> Optional[pd.DataFrame]:
-    path = joint_angles_path(subject, activity, method)
+def load_joint_angles(subject: str, activity: str, method: str,
+                      variant: Optional[str] = None) -> Optional[pd.DataFrame]:
+    path = joint_angles_path(subject, activity, method, variant=variant)
     return pd.read_parquet(path, engine='pyarrow') if path.exists() else None
 
 
-def load_all_joint_angles(subjects: List[str], activities: List[str], methods: List[str]) -> pd.DataFrame:
+def load_all_joint_angles(subjects: List[str], activities: List[str], methods: List[str],
+                          variant: Optional[str] = None) -> pd.DataFrame:
     frames = []
     for subject in subjects:
         for activity in activities:
             for method in methods:
-                df = load_joint_angles(subject, activity, method)
+                df = load_joint_angles(subject, activity, method, variant=variant)
                 if df is None:
                     if os.environ.get("DISABLE_TQDM") != "True":
                         print(f"Warning: missing joint angles for Subject{subject}/{activity}/{method} — skipping")
@@ -674,12 +946,15 @@ def compute_error_stats(df: pd.DataFrame) -> pd.DataFrame:
     return summary_df
 
 
-def save_statistics(df: pd.DataFrame, name: str, **manifest_extra: Any) -> Path:
-    """Saves a summary-statistics DataFrame to results/statistics/<name>_statistics.parquet."""
+def save_statistics(df: pd.DataFrame, name: str, stds: Optional[Dict[str, float]] = None,
+                    **manifest_extra: Any) -> Path:
+    """Saves a summary-statistics DataFrame to results/statistics/<name>_statistics.parquet.
+
+    `stds` records a filter re-tuning in the manifest (see pipeline_constants)."""
     path = ensure_parent(paths.statistics_path(name))
     df.to_parquet(path, engine='pyarrow')
     write_manifest(
-        path, constants=pipeline_constants(), experiment=name,
+        path, constants=pipeline_constants(stds), experiment=name,
         methods=sorted(df['method'].unique().tolist()) if 'method' in df.columns else None,
         subjects=sorted(df['subject'].unique().tolist()) if 'subject' in df.columns else None,
         n_rows=len(df), **manifest_extra,
@@ -786,31 +1061,50 @@ def run_tracked_grid(row_keys: List[Any], row_labels: List[str], stage_labels: L
 # passed straight to run_tracked_grid as the worker_fn, with stage_labels = the
 # method names to run for that call.
 
-def generate_joint_angles_worker(row_key: Tuple[str, str], stage_labels: List[str], shared_state: Dict) -> None:
+def generate_joint_angles_worker(row_key: Tuple[str, str], stage_labels: List[str], shared_state: Dict,
+                                  stds: Optional[Dict[str, float]] = None,
+                                  variant: Optional[str] = None) -> None:
     """stage_labels = ['load'] + method names. Loads raw data once, then computes
-    and saves joint angles for every method, reusing the loaded data across methods."""
+    and saves joint angles for every method, reusing the loaded data across methods.
+
+    `stds` re-tunes the filter (see resolve_stds) and `variant` namespaces the output
+    tree; bind both with functools.partial. Pass them together — a re-tuned run with
+    variant=None overwrites the default-tuned pipeline's parquets in place.
+
+    Also usable with run_tracked_grid(per_cell=True), where each call receives a single
+    method and no 'load' stage: the load then happens once per method instead of once per
+    trial, which costs ~3 s against a method's ~3 min of filter time and buys parallelism
+    across methods. That matters when a sweep has many arms and few trials — the default
+    shape serializes every arm of a trial behind one process, so a one-subject sweep would
+    use two cores no matter how many are free. Pass the method names WITHOUT a leading
+    'load' in that mode; the load's own status is folded into the method's cell, since a
+    per-cell grid has nowhere to show a stage the trial no longer has one of."""
     subject, activity = row_key
-    methods = stage_labels[1:]
+    methods = [stage for stage in stage_labels if stage != 'load']
+    tracks_load = 'load' in stage_labels
 
     t_start = time.time()
-    shared_state[(row_key, 'load')] = "Running"
+    if tracks_load:
+        shared_state[(row_key, 'load')] = "Running"
     try:
         plates = load_raw_data(subject, activity)
-        shared_state[(row_key, 'load_time')] = time.time() - t_start
-        shared_state[(row_key, 'load')] = "Success"
+        if tracks_load:
+            shared_state[(row_key, 'load_time')] = time.time() - t_start
+            shared_state[(row_key, 'load')] = "Success"
     except Exception as e:
-        shared_state[(row_key, 'load')] = f"Failed ({e})"
+        if tracks_load:
+            shared_state[(row_key, 'load')] = f"Failed ({e})"
         for method in methods:
-            shared_state[(row_key, method)] = "Failed"
+            shared_state[(row_key, method)] = f"Failed (load: {e})"
         return None
 
     for method in methods:
         t_method = time.time()
         shared_state[(row_key, method)] = "Running"
         try:
-            df = compute_joint_angles(plates, method)
+            df = compute_joint_angles(plates, method, stds=stds)
             if df is not None and not df.empty:
-                save_joint_angles(df, subject, activity, method)
+                save_joint_angles(df, subject, activity, method, variant=variant, stds=stds)
                 shared_state[(row_key, f"{method}_time")] = time.time() - t_method
                 shared_state[(row_key, method)] = "Success"
             else:
@@ -821,7 +1115,9 @@ def generate_joint_angles_worker(row_key: Tuple[str, str], stage_labels: List[st
 
 
 def compute_stats_worker(row_key: Tuple[str, str], stage_labels: List[str], shared_state: Dict,
-                          methods: List[str], stats_name: str) -> None:
+                          methods: List[str], stats_name: str,
+                          variant: Optional[str] = None,
+                          stds: Optional[Dict[str, float]] = None) -> None:
     """Single-stage worker (stage_labels should be a single name, e.g. ['stats']).
     Reads back whatever per-method parquets generate_joint_angles_worker managed to
     save for this row and computes error stats against 'marker'. Naturally
@@ -831,7 +1127,10 @@ def compute_stats_worker(row_key: Tuple[str, str], stage_labels: List[str], shar
     `stats_name` namespaces the output under results/statistics/per_subject/<stats_name>/.
     It is required rather than defaulted: benchmark, oracle-ablation and
     threshold-sweep runs each produce per-subject stats over a different method
-    set, and a shared default filename meant whichever ran last silently won."""
+    set, and a shared default filename meant whichever ran last silently won.
+
+    `variant` must match the one the generation phase wrote under, and `stds` is
+    recorded in the manifest — both default to the untuned pipeline's."""
     subject, activity = row_key
     stage = stage_labels[0]
 
@@ -840,7 +1139,7 @@ def compute_stats_worker(row_key: Tuple[str, str], stage_labels: List[str], shar
     try:
         frames = []
         for method in methods:
-            df = load_joint_angles(subject, activity, method)
+            df = load_joint_angles(subject, activity, method, variant=variant)
             if df is not None:
                 frames.append(df.assign(subject=f"Subject{subject}", trial_type=activity, method=method))
 
@@ -853,8 +1152,9 @@ def compute_stats_worker(row_key: Tuple[str, str], stage_labels: List[str], shar
         if not stats_df.empty:
             stats_path = ensure_parent(paths.per_subject_statistics_path(stats_name, subject, activity))
             stats_df.to_parquet(stats_path, engine='pyarrow')
-            write_manifest(stats_path, constants=pipeline_constants(), experiment=stats_name,
-                           subject=f"Subject{subject}", activity=activity, methods=methods)
+            write_manifest(stats_path, constants=pipeline_constants(stds), experiment=stats_name,
+                           subject=f"Subject{subject}", activity=activity, methods=methods,
+                           variant=variant)
 
         shared_state[(row_key, f"{stage}_time")] = time.time() - t_start
         shared_state[(row_key, stage)] = "Success"

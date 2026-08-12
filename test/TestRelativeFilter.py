@@ -1,3 +1,4 @@
+import inspect
 import unittest
 
 import numpy as np
@@ -86,8 +87,18 @@ class TestRelativeFilterSetup(unittest.TestCase):
         filt = make_filter()
         np.testing.assert_allclose(filt.q_wp.as_matrix(), np.eye(3))
         np.testing.assert_allclose(filt.q_wc.as_matrix(), np.eye(3))
-        np.testing.assert_allclose(filt.P, np.eye(6))
         np.testing.assert_allclose(filt.get_R_pc(), np.eye(3))
+
+        # Read the default rather than pin it: the value is a tuning choice that may be
+        # re-swept, but P always has to be built from it. It must stay far below eye(6) —
+        # see test_a_confident_seed_is_not_yanked_by_one_bad_sample for why.
+        default_std = inspect.signature(RelativeFilter).parameters['init_orientation_std'].default
+        np.testing.assert_allclose(filt.P, np.eye(6) * default_std ** 2)
+        self.assertLess(default_std, np.deg2rad(5.0))
+
+    def test_init_orientation_std_sets_p(self):
+        filt = make_filter(init_orientation_std=np.deg2rad(30.0))
+        np.testing.assert_allclose(filt.P, np.eye(6) * np.deg2rad(30.0) ** 2)
 
     def test_process_noise_is_gyro_variance(self):
         filt = make_filter()
@@ -373,6 +384,132 @@ class TestRelativeFilterMeasurementUpdate(unittest.TestCase):
         self.assertLess(np.trace(self.filter.P), trace_before)
 
 
+class TestNormalizedMeasurements(unittest.TestCase):
+    """normalize_measurements scales each vector sensor reading to unit length before
+    the update. Every failure here is silent: a wrong flag default, a NaN from the
+    zeroed magnetometer, or a scaling that also moves R would all still produce
+    finite rotations of the right shape."""
+
+    def test_normalization_is_off_by_default(self):
+        self.assertFalse(make_filter().normalize_measurements)
+
+    def test_readings_reach_the_update_at_unit_length(self):
+        scaled = [9.81 * WORLD_GRAVITY, 40.0 * WORLD_MAG]
+        normalized = RelativeFilter._normalize_vector_measurements(scaled)
+        for v in normalized:
+            self.assertAlmostEqual(np.linalg.norm(v), 1.0, places=12)
+        np.testing.assert_allclose(normalized[0], WORLD_GRAVITY, atol=1e-12)
+        np.testing.assert_allclose(normalized[1], WORLD_MAG, atol=1e-12)
+
+    def test_a_zeroed_sensor_stays_zero_instead_of_going_nan(self):
+        """mag_off zeroes the magnetometer on every sample and mag_adapt on gated ones,
+        so the zero vector is the normal path here, not an edge case. A NaN would
+        propagate through K and destroy the state for the rest of the trial."""
+        normalized = RelativeFilter._normalize_vector_measurements(
+            [9.81 * WORLD_GRAVITY, np.zeros(3)])
+        np.testing.assert_array_equal(normalized[1], np.zeros(3))
+        self.assertFalse(np.any(np.isnan(np.concatenate(normalized))))
+
+    def test_a_zeroed_magnetometer_still_runs_a_finite_update(self):
+        filt = make_filter(normalize_measurements=True)
+        filt.set_qs(Rotation.identity(), Rotation.identity())
+        for _ in range(10):
+            filt.update(np.zeros(3), np.zeros(3),
+                        [9.81 * WORLD_GRAVITY, np.zeros(3)],
+                        [9.81 * WORLD_GRAVITY, np.zeros(3)], 0.01)
+        self.assertTrue(np.all(np.isfinite(filt.get_R_pc())))
+        np.testing.assert_allclose(filt.get_R_pc(), np.eye(3), atol=1e-8)
+
+    def test_it_is_a_no_op_on_already_unit_measurements(self):
+        """The synthetic references are unit vectors, so both arms must agree exactly
+        here — this pins that the flag changes the measurement scale and nothing else."""
+        q_wp = Rotation.from_rotvec([np.pi / 2, 0., 0.])
+        q_wc = Rotation.from_rotvec([0., np.pi / 2, 0.])
+        data_p, data_c = consistent_measurements(q_wp.as_matrix(), q_wc.as_matrix())
+
+        plain = make_filter()._get_measurement_update(q_wp, q_wc, data_p, data_c)
+        normalized = make_filter(normalize_measurements=True)._get_measurement_update(
+            q_wp, q_wc, data_p, data_c)
+
+        for a, b in zip(plain, normalized):
+            np.testing.assert_allclose(a.as_matrix(), b.as_matrix(), atol=1e-12)
+
+    def test_rescaling_the_std_by_the_nominal_restores_the_raw_update(self):
+        """The premise of the '_rescaled' arm: normalizing and dividing the std by the
+        same magnitude leaves the update untouched, because h, H and R then all scale
+        together. Verified at |a| exactly nominal — where the two are algebraically
+        identical — so any difference the arm shows on real data is the per-sample
+        magnitude variation it is designed to isolate, not a weighting change."""
+        nominal = 9.81
+        q_wp = Rotation.identity()
+        drifted_q_wc = Rotation.from_rotvec([0.05, 0.05, 0.05])
+        raw_p = [nominal * WORLD_GRAVITY, WORLD_MAG]
+        raw_c = [nominal * WORLD_GRAVITY, WORLD_MAG]
+
+        plain = RelativeFilter(
+            gyro_std_parent=GYRO_STD, gyro_std_child=GYRO_STD,
+            vector_sensor_stds_parent=[ACC_STD, MAG_STD],
+            vector_sensor_stds_child=[ACC_STD, MAG_STD],
+        )._get_measurement_update(q_wp, drifted_q_wc, raw_p, raw_c)
+
+        rescaled = RelativeFilter(
+            gyro_std_parent=GYRO_STD, gyro_std_child=GYRO_STD,
+            vector_sensor_stds_parent=[ACC_STD / nominal, MAG_STD],
+            vector_sensor_stds_child=[ACC_STD / nominal, MAG_STD],
+            normalize_measurements=True,
+        )._get_measurement_update(q_wp, drifted_q_wc, raw_p, raw_c)
+
+        for a, b in zip(plain, rescaled):
+            np.testing.assert_allclose(a.as_matrix(), b.as_matrix(), atol=1e-10)
+
+    def test_rescaling_still_differs_once_the_magnitude_leaves_nominal(self):
+        """The other half of the premise. If the rescaled arm matched the control at ALL
+        magnitudes it would be an exact no-op and the experiment would be measuring
+        nothing — the arm only means something because off-nominal samples still differ."""
+        nominal = 9.81
+        q_wp = Rotation.identity()
+        drifted_q_wc = Rotation.from_rotvec([0.05, 0.05, 0.05])
+        # A hard foot-strike: acc well above gravity, which is exactly the sample the
+        # normalized arms throw information away about.
+        raw_p = [3.0 * nominal * WORLD_GRAVITY, WORLD_MAG]
+        raw_c = [3.0 * nominal * WORLD_GRAVITY, WORLD_MAG]
+
+        plain = RelativeFilter(
+            gyro_std_parent=GYRO_STD, gyro_std_child=GYRO_STD,
+            vector_sensor_stds_parent=[ACC_STD, MAG_STD],
+            vector_sensor_stds_child=[ACC_STD, MAG_STD],
+        )._get_measurement_update(q_wp, drifted_q_wc, raw_p, raw_c)
+
+        rescaled = RelativeFilter(
+            gyro_std_parent=GYRO_STD, gyro_std_child=GYRO_STD,
+            vector_sensor_stds_parent=[ACC_STD / nominal, MAG_STD],
+            vector_sensor_stds_child=[ACC_STD / nominal, MAG_STD],
+            normalize_measurements=True,
+        )._get_measurement_update(q_wp, drifted_q_wc, raw_p, raw_c)
+
+        self.assertFalse(np.allclose(plain[1].as_matrix(), rescaled[1].as_matrix(), atol=1e-6))
+
+    def test_normalizing_weakens_the_correction_at_a_fixed_std(self):
+        """The documented consequence of holding the stds fixed: scaling a 9.81 m/s^2
+        reading to unit length shrinks its residual and its Jacobian but not its entry
+        in R, so the same geometric error pulls the estimate back less far. If this
+        ever stopped being true, the two arms of the normalization comparison would no
+        longer differ in tuning and the caveat around it would be wrong."""
+        q_wp = Rotation.identity()
+        true_q_wc = Rotation.identity()
+        data_p = [9.81 * WORLD_GRAVITY, WORLD_MAG]
+        data_c = [9.81 * WORLD_GRAVITY, WORLD_MAG]
+        drifted_q_wc = true_q_wc * Rotation.from_rotvec([0.05, 0.05, 0.05])
+
+        _, plain_wc = make_filter()._get_measurement_update(q_wp, drifted_q_wc, data_p, data_c)
+        _, norm_wc = make_filter(normalize_measurements=True)._get_measurement_update(
+            q_wp, drifted_q_wc, data_p, data_c)
+
+        plain_error = (true_q_wc.inv() * plain_wc).magnitude()
+        norm_error = (true_q_wc.inv() * norm_wc).magnitude()
+        self.assertLess(plain_error, norm_error)
+
+
 class TestRelativeFilterUpdate(unittest.TestCase):
     def setUp(self):
         self.filter = make_filter()
@@ -418,21 +555,44 @@ class TestRelativeFilterUpdate(unittest.TestCase):
 
     def test_update_converges_from_a_wrong_initial_guess(self):
         # Stationary bodies, measurements consistent with the truth, filter started at a
-        # large error: the vector-sensor updates should pull it in.
+        # large error: the vector-sensor updates should pull it in. P has to be told the
+        # seed is unreliable — the default assumes a state seeded from a known orientation
+        # and would (correctly) refuse to move far from it.
+        filt = make_filter(init_orientation_std=np.deg2rad(60.0))
         true_q_wp = Rotation.from_rotvec([0.2, -0.1, 0.05])
         true_q_wc = Rotation.from_rotvec([-0.3, 0.15, 0.4])
         data_p, data_c = consistent_measurements(true_q_wp.as_matrix(), true_q_wc.as_matrix())
 
         true_R_pc = true_q_wp.as_matrix().T @ true_q_wc.as_matrix()
-        self.filter.set_qs(true_q_wp * Rotation.from_rotvec([0.3, 0.3, 0.3]), true_q_wc)
-        error_before = Rotation.from_matrix(true_R_pc.T @ self.filter.get_R_pc()).magnitude()
+        filt.set_qs(true_q_wp * Rotation.from_rotvec([0.3, 0.3, 0.3]), true_q_wc)
+        error_before = Rotation.from_matrix(true_R_pc.T @ filt.get_R_pc()).magnitude()
 
         for _ in range(500):
-            self.filter.update(np.zeros(3), np.zeros(3), data_p, data_c, 0.01)
+            filt.update(np.zeros(3), np.zeros(3), data_p, data_c, 0.01)
 
-        error_after = Rotation.from_matrix(true_R_pc.T @ self.filter.get_R_pc()).magnitude()
+        error_after = Rotation.from_matrix(true_R_pc.T @ filt.get_R_pc()).magnitude()
         self.assertLess(error_after, error_before)
         self.assertLess(error_after, np.deg2rad(1.0))
+
+    def test_a_confident_seed_is_not_yanked_by_one_bad_sample(self):
+        # The regression the default P guards against: with P = eye(6) a single
+        # inconsistent measurement is applied almost in full as a state correction.
+        true_q_wp = Rotation.from_rotvec([0.2, -0.1, 0.05])
+        true_q_wc = Rotation.from_rotvec([-0.3, 0.15, 0.4])
+        data_p, data_c = consistent_measurements(true_q_wp.as_matrix(), true_q_wc.as_matrix())
+        data_c = [data_c[0] + np.array([4.0, -3.0, 2.0]), data_c[1]]   # dynamic acceleration
+
+        true_R_pc = true_q_wp.as_matrix().T @ true_q_wc.as_matrix()
+
+        def one_step_error(**kwargs):
+            filt = make_filter(**kwargs)
+            filt.set_qs(true_q_wp, true_q_wc)
+            filt.update(np.zeros(3), np.zeros(3), data_p, data_c, 0.01)
+            return Rotation.from_matrix(true_R_pc.T @ filt.get_R_pc()).magnitude()
+
+        # 1.3 deg with the default; 92 deg if P is left at eye(6).
+        self.assertLess(one_step_error(), np.deg2rad(2.0))
+        self.assertGreater(one_step_error(init_orientation_std=1.0), np.deg2rad(45.0))
 
 
 if __name__ == "__main__":

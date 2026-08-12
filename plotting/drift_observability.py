@@ -16,13 +16,15 @@ Both arms are chunked into equal-length windows (WINDOW_SEC) before fitting, sin
 depends on the length of the window it is computed over and raw not-sitting stretches run
 minutes against sitting bouts of ~15s.
 
-Three figures, using the shared plotting.utils style. Figures 1 and 3 pool segments across
-every subject with data for the given activity; figure 2 illustrates single-subject
-example segments (EXAMPLE_SUBJECT).
+All figures pool across every subject with data for the given activity. Figures 1 and 3 are
+also produced in a _by_side variant that keeps left and right separate instead of folding
+them into one Hip/Knee/Ankle row, which is what shows whether an effect is bilateral.
   1. dumbbell_r2_by_joint.png   - R^2 (linear fit) for sitting vs not-sitting windows,
                                    grouped by joint, mag-off vs mag-on, all subjects.
-  2. segment_examples.png       - best-, median-, and worst-fitting example windows
-                                   (drift vs. time, mag-off vs mag-on, with linear fits).
+  2. segment_examples.png       - best-, median-, and worst-fitting windows ranked across
+                                   all subjects, so the three panels may come from three
+                                   different ones (drift vs. time, mag-off vs mag-on,
+                                   with linear fits).
   3. heatmap_r2.png             - mean linear-fit R^2 by joint x condition, all subjects,
                                    red-blue diverging scale (R^2 can be negative).
 
@@ -59,7 +61,6 @@ JOINT_GROUP_ORDER = ['Lumbar', 'Hip', 'Knee', 'Ankle']
 WINDOW_SEC = 10.0
 # Sitting bouts shorter than one window would contribute nothing after chunking.
 MIN_SITTING_SEC = WINDOW_SEC
-EXAMPLE_SUBJECT = '06'
 
 COLOR_OFF, COLOR_ON = sns.color_palette('Set2', 2)
 
@@ -111,40 +112,51 @@ def compute_for_subject(subject: str, activity: str):
     return results
 
 
-def compute_pooled(subjects, activity):
-    """Runs compute_for_subject for every subject that has `activity` data, then pools
-    each joint-group x mag_mode's per-window rows (sitting / not-sitting) across subjects
-    AND across left/right (via RENAME_JOINTS) into one concatenated DataFrame, so R^2 /
-    drift-rate stats reflect all subjects and both sides at once."""
-    pooled = {group: {mag_mode: {'sit_dfs': [], 'move_dfs': []} for mag_mode in ['off', 'on']}
-              for group in JOINT_GROUP_ORDER}
-    used_subjects = []
+def compute_all(subjects, activity):
+    """Runs compute_for_subject once per subject. Loading the raw IMU data dominates the
+    runtime, so this is kept separate from pooling — the same per-subject results can then
+    be aggregated several ways (see pool) without paying for the load again."""
+    all_results, used_subjects = {}, []
     for subject in subjects:
         print(f"\n--- Subject{subject} ---")
         try:
-            results = compute_for_subject(subject, activity)
+            all_results[subject] = compute_for_subject(subject, activity)
         except Exception as e:
             print(f"Skipping Subject{subject}: {e}")
             continue
         used_subjects.append(subject)
+    return all_results, used_subjects
+
+
+def pool(all_results, group_order, group_map):
+    """Concatenates each group x mag_mode's per-window rows (sitting / not-sitting) across
+    subjects into one DataFrame.
+
+    group_map decides what a group is. Pass RENAME_JOINTS to fold left and right into a
+    single Hip/Knee/Ankle row; pass {} to keep the two sides separate, which is what shows
+    whether an effect is bilateral or one-sided."""
+    pooled = {group: {mag_mode: {'sit_dfs': [], 'move_dfs': []} for mag_mode in ['off', 'on']}
+              for group in group_order}
+    for results in all_results.values():
         for joint in JOINT_ORDER:
-            group = RENAME_JOINTS.get(joint, joint)
+            group = group_map.get(joint, joint)
             for mag_mode in ['off', 'on']:
                 pooled[group][mag_mode]['sit_dfs'].append(results[joint][mag_mode]['sit_df'])
                 pooled[group][mag_mode]['move_dfs'].append(results[joint][mag_mode]['move_df'])
 
-    for group in JOINT_GROUP_ORDER:
+    for group in group_order:
         for mag_mode in ['off', 'on']:
             pooled[group][mag_mode]['sit_df'] = pd.concat(pooled[group][mag_mode]['sit_dfs'], ignore_index=True)
             pooled[group][mag_mode]['move_df'] = pd.concat(pooled[group][mag_mode]['move_dfs'], ignore_index=True)
-    return pooled, used_subjects
+    return pooled
 
 
 # ==============================================================================
 # Figure 1: dumbbell plot of R^2 (linear), sitting vs not-sitting, by joint x mag mode
 # ==============================================================================
 
-def plot_dumbbell_r2(results, subject_label, activity, joint_order=JOINT_ORDER, save=True, show=False):
+def plot_dumbbell_r2(results, subject_label, activity, joint_order=JOINT_ORDER,
+                     filename="dumbbell_r2_by_joint.png", save=True, show=False):
     fig, ax = plt.subplots(figsize=(7, 1.4 * len(joint_order) + 1))
     row_labels, row_ypos = [], []
     y = 0
@@ -184,7 +196,7 @@ def plot_dumbbell_r2(results, subject_label, activity, joint_order=JOINT_ORDER, 
     plot_utils.finalize_and_save_plot(
         fig, f"Segment-and-reset $R^2$: sitting vs not sitting "
              f"({int(WINDOW_SEC)}s windows, {subject_label}, {activity})",
-        "dumbbell_r2_by_joint.png", PLOTS_DIR, save=save, show=show,
+        filename, PLOTS_DIR, save=save, show=show,
     )
 
 
@@ -192,10 +204,10 @@ def plot_dumbbell_r2(results, subject_label, activity, joint_order=JOINT_ORDER, 
 # Figure 2: best- and worst-fitting example segments
 # ==============================================================================
 
-def extract_segment_timeseries(results, joint_name, seg_idx):
+def extract_segment_timeseries(subject_results, joint_name, seg_idx):
     out = {}
     for mag_mode in ['off', 'on']:
-        r = results[joint_name][mag_mode]
+        r = subject_results[joint_name][mag_mode]
         s, e = r['sit_windows'][seg_idx]
         timestamps, R_pc_est, R_pc_true = r['timestamps'], r['R_pc_est'], r['R_pc_true']
         t_rel = timestamps[s:e] - timestamps[s]
@@ -212,38 +224,45 @@ def extract_segment_timeseries(results, joint_name, seg_idx):
     return out
 
 
-def find_best_median_worst(results):
-    """Ranks every (joint, sitting window) pair for mag-off by its linear-fit R^2, and
-    returns the best-, median-, and worst-fitting one as an illustrative spread rather
-    than just the two extremes."""
+def find_best_median_worst(all_results):
+    """Ranks every (subject, joint, sitting window) triple for mag-off by its linear-fit
+    R^2 and returns the best-, median-, and worst-fitting one as an illustrative spread
+    rather than just the two extremes.
+
+    Ranking across all subjects rather than within one means the three panels can come
+    from three different subjects — the point is to show the range of fit quality the
+    pooled statistics are averaging over, and restricting that to one subject understates
+    it."""
     all_r2 = []
-    for j in JOINT_ORDER:
-        off_sit = results[j]['off']['sit_df']
-        for idx, row in off_sit.iterrows():
-            r2 = row['r2_linear']
-            if not np.isnan(r2):
-                all_r2.append((r2, j, idx))
+    for subject, results in all_results.items():
+        for j in JOINT_ORDER:
+            for idx, row in results[j]['off']['sit_df'].iterrows():
+                if not np.isnan(row['r2_linear']):
+                    all_r2.append((row['r2_linear'], subject, j, idx))
     all_r2.sort(key=lambda x: x[0])
-    worst = {'r2': all_r2[0][0], 'joint': all_r2[0][1], 'seg_idx': all_r2[0][2]}
-    best = {'r2': all_r2[-1][0], 'joint': all_r2[-1][1], 'seg_idx': all_r2[-1][2]}
-    mid_r2, mid_j, mid_idx = all_r2[len(all_r2) // 2]
-    median = {'r2': mid_r2, 'joint': mid_j, 'seg_idx': mid_idx}
-    return best, median, worst
+
+    def entry(rec):
+        r2, subject, joint, seg_idx = rec
+        return {'r2': r2, 'subject': subject, 'joint': joint, 'seg_idx': seg_idx}
+
+    return entry(all_r2[-1]), entry(all_r2[len(all_r2) // 2]), entry(all_r2[0]), len(all_r2)
 
 
-def plot_segment_examples(results, subject, activity, save=True, show=False):
-    best, median, worst = find_best_median_worst(results)
+def plot_segment_examples(all_results, subject_label, activity, save=True, show=False):
+    best, median, worst, n_windows = find_best_median_worst(all_results)
     fig, axes = plt.subplots(1, 3, figsize=(17, 5), sharey=False)
     panels = [(axes[0], best, 'Best fit'), (axes[1], median, 'Median fit'), (axes[2], worst, 'Worst fit')]
     for ax, info, title in panels:
-        ts = extract_segment_timeseries(results, info['joint'], info['seg_idx'])
+        ts = extract_segment_timeseries(all_results[info['subject']], info['joint'], info['seg_idx'])
         for mag_mode, color in [('off', COLOR_OFF), ('on', COLOR_ON)]:
             d = ts[mag_mode]
             label = 'Mag Off' if mag_mode == 'off' else 'Mag On'
             ax.plot(d['t'], d['y'], color=color, lw=1.2, alpha=0.85, label=f"{label} (observed)")
             ax.plot(d['t'], d['k_lin_deg_s'] * d['t'], color=color, lw=2, linestyle='--',
                      label=f"{label} (linear fit)")
-        ax.set_title(f"{title}: {info['joint']} ($R^2$={info['r2']:.2f})")
+        # Two lines: joint + subject + R^2 on one line overruns the panel width and the
+        # three titles collide.
+        ax.set_title(f"{title}: {info['joint']}\nSubject{info['subject']} ($R^2$={info['r2']:.2f})")
         ax.set_xlabel("Time (s)")
         sns.despine(ax=ax)
     axes[0].set_ylabel("Drift (deg)")
@@ -251,7 +270,7 @@ def plot_segment_examples(results, subject, activity, save=True, show=False):
 
     plot_utils.finalize_and_save_plot(
         fig, f"Best-, median-, and worst-fitting {int(WINDOW_SEC)}s sitting windows "
-             f"(Subject{subject}, {activity})",
+             f"of {n_windows} ({subject_label}, {activity})",
         "segment_examples.png", PLOTS_DIR, save=save, show=show,
     )
 
@@ -260,7 +279,8 @@ def plot_segment_examples(results, subject, activity, save=True, show=False):
 # Figure 3: heatmap of median linear drift rate (deg/s), colored by mean R^2
 # ==============================================================================
 
-def plot_heatmap_r2(results, subject_label, activity, joint_order=JOINT_ORDER, save=True, show=False):
+def plot_heatmap_r2(results, subject_label, activity, joint_order=JOINT_ORDER,
+                    filename="heatmap_r2.png", save=True, show=False):
     columns = ['Mag Off\nsitting', 'Mag On\nsitting', 'Mag Off\nnot sitting', 'Mag On\nnot sitting']
     rate_data = np.full((len(joint_order), len(columns)), np.nan)
     r2_data = np.full((len(joint_order), len(columns)), np.nan)
@@ -289,7 +309,7 @@ def plot_heatmap_r2(results, subject_label, activity, joint_order=JOINT_ORDER, s
     plot_utils.finalize_and_save_plot(
         fig, f"Median linear drift rate (deg/s), colored by $R^2$ "
              f"({int(WINDOW_SEC)}s windows, {subject_label}, {activity})",
-        "heatmap_r2.png", PLOTS_DIR, save=save, show=show,
+        filename, PLOTS_DIR, save=save, show=show,
     )
 
 
@@ -301,14 +321,23 @@ def main():
 
     subjects = subjects_with_data(args.activity)
     print(f"Subjects with {args.activity} data: {subjects}")
-    pooled, used_subjects = compute_pooled(subjects, args.activity)
+    all_results, used_subjects = compute_all(subjects, args.activity)
     subject_label = f"All subjects (N={len(used_subjects)})"
-    plot_dumbbell_r2(pooled, subject_label, args.activity, joint_order=JOINT_GROUP_ORDER, show=args.show)
-    plot_heatmap_r2(pooled, subject_label, args.activity, joint_order=JOINT_GROUP_ORDER, show=args.show)
 
-    print(f"\n--- Segment examples: Subject{EXAMPLE_SUBJECT} ({args.activity}) ---")
-    example_results = compute_for_subject(EXAMPLE_SUBJECT, args.activity)
-    plot_segment_examples(example_results, EXAMPLE_SUBJECT, args.activity, show=args.show)
+    # Two aggregations of the same per-subject results: sides folded together, and sides
+    # kept apart. The split-sides version is what shows whether an effect is bilateral.
+    for group_order, group_map, suffix in [
+        (JOINT_GROUP_ORDER, RENAME_JOINTS, ""),
+        (JOINT_ORDER, {}, "_by_side"),
+    ]:
+        pooled = pool(all_results, group_order, group_map)
+        plot_dumbbell_r2(pooled, subject_label, args.activity, joint_order=group_order,
+                         filename=f"dumbbell_r2_by_joint{suffix}.png", show=args.show)
+        plot_heatmap_r2(pooled, subject_label, args.activity, joint_order=group_order,
+                        filename=f"heatmap_r2{suffix}.png", show=args.show)
+
+    print(f"\n--- Segment examples: all subjects ({args.activity}) ---")
+    plot_segment_examples(all_results, subject_label, args.activity, show=args.show)
 
 
 if __name__ == '__main__':

@@ -22,7 +22,8 @@ class RelativeFilter:
     R: np.ndarray
     P: np.ndarray
     num_vector_sensors: int
-    
+    normalize_measurements: bool = False
+
     # Joint Constraint parameters
     joint_type: Optional[str] = None
     joint_params: Dict = {}
@@ -43,10 +44,12 @@ class RelativeFilter:
                  dof2_angle_rad: float = np.pi/2.0, 
                  dof2_std: Optional[float] = None,
                  r_parent: Optional[np.ndarray] = None,
-                 r_child: Optional[np.ndarray] = None):
+                 r_child: Optional[np.ndarray] = None,
+                 normalize_measurements: bool = False,
+                 init_orientation_std: float = np.deg2rad(0.1)):
         """
         Initializes the filter matrices.
-        
+
         Args:
             gyro_std_parent: (3,) array of gyroscope standard deviations (rad/s) for the parent.
             gyro_std_child: (3,) array of gyroscope standard deviations (rad/s) for the child.
@@ -55,6 +58,19 @@ class RelativeFilter:
             vector_sensor_stds_child: List of (3,) arrays, one for each 1DOF vector
                                       sensor's std dev (e.g., accelerometer) on the child body.
             joint_type: Optional string, either '1dof' or '2dof'. Specifies the joint constraint.
+            normalize_measurements: If True, every vector sensor reading is scaled to unit
+                                    length before the measurement update, so only its
+                                    direction is used. The vector_sensor_stds are NOT
+                                    rescaled to match — see _normalize_vector_measurements
+                                    for what that does to the acc/gyro trust ratio.
+            init_orientation_std: Per-axis std dev (rad) of the initial orientation state,
+                                  used to build P. The default assumes the caller seeds the
+                                  state with set_qs from a known orientation; leaving P at
+                                  eye(6) (~57 deg/axis) instead makes the first measurement
+                                  update apply nearly the whole residual as a correction,
+                                  which shows up as a tens-of-seconds startup transient —
+                                  far worse without the magnetometer, since relative heading
+                                  is then only observable through motion.
             
             dof1_axis_parent: (3,) vector for 1DOF joint on parent (y^J in paper).
             dof1_axis_child: (3,) vector for 1DOF joint on child (y^K in paper).
@@ -79,6 +95,7 @@ class RelativeFilter:
         self.num_vector_sensors = len(vector_sensor_stds_parent)
         self.joint_type = joint_type
         self.joint_params = {}
+        self.normalize_measurements = normalize_measurements
 
         # --- Process Noise Matrix Q ---
         gyro_diag = np.concatenate([gyro_std_parent, gyro_std_child])
@@ -131,7 +148,7 @@ class RelativeFilter:
         self.R = np.diag(np.concatenate(all_variances))
         
         # --- Covariance and State Initialization ---
-        self.P = np.eye(6)
+        self.P = np.eye(6) * init_orientation_std ** 2
         self.q_wp = Rotation.identity()
         self.q_wc = Rotation.identity()
 
@@ -168,6 +185,36 @@ class RelativeFilter:
     def set_qs(self, q_wp: Rotation, q_wc: Rotation):
         self.q_wp = q_wp
         self.q_wc = q_wc
+
+    @staticmethod
+    def _normalize_vector_measurements(vectors: List[np.ndarray]) -> List[np.ndarray]:
+        """Scales each vector sensor reading to unit length, keeping only its direction.
+
+        A zero vector is passed through untouched rather than producing a NaN. This is
+        not a numerical edge case but the normal path: mag_off zeroes the magnetometer
+        for every sample and mag_adapt zeroes it on gated ones, and a zeroed sensor must
+        stay zeroed so its residual and its H block both drop out of the update.
+
+        THIS CHANGES THE SENSOR/GYRO TRUST RATIO, it is not a pure change of units. The
+        residual h and the Jacobian H are both linear in the measurement, so scaling a
+        reading by 1/|v| scales that sensor's block of both by 1/|v| — while R, built
+        from the vector_sensor_stds at construction, does not move. In
+        S = H P H^T + M R M^T the first term shrinks by 1/|v|^2 and the second does not,
+        so the sensor is trusted LESS relative to the gyro prediction. For the
+        accelerometer at |a| ~ 9.81 m/s^2 that is a factor of ~96 in variance: running
+        normalized at acc_std s is equivalent to running unnormalized at acc_std ~9.81*s.
+        The magnetometer is barely affected, since Xsens reports it in calibrated units
+        where a nominal Earth field already reads ~1.0.
+
+        So a normalized-vs-unnormalized comparison at fixed stds is a comparison of two
+        different tunings, not of the geometry alone. To vary only the geometry, scale
+        each sensor's std by its own nominal magnitude when enabling this.
+        """
+        normalized = []
+        for v in vectors:
+            norm = np.linalg.norm(v)
+            normalized.append(v / norm if norm > 0.0 else v)
+        return normalized
 
     @staticmethod
     def skew_symmetric(v: np.ndarray) -> np.ndarray:
@@ -216,8 +263,9 @@ class RelativeFilter:
                                 dt: float = 0.01) -> Tuple[Rotation, Rotation]:
         """Corrects the state prediction using sensor measurements."""
 
-        # vector_sensor_data_p = [v/np.linalg.norm(v) if np.linalg.norm(v) > 0. else v for v in vector_sensor_data_p]
-        # vector_sensor_data_c = [v/np.linalg.norm(v) if np.linalg.norm(v) > 0. else v for v in vector_sensor_data_c]
+        if self.normalize_measurements:
+            vector_sensor_data_p = self._normalize_vector_measurements(vector_sensor_data_p)
+            vector_sensor_data_c = self._normalize_vector_measurements(vector_sensor_data_c)
 
         R_wp = q_lin_wp.as_matrix()
         R_wc = q_lin_wc.as_matrix()

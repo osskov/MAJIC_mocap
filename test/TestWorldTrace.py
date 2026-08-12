@@ -6,7 +6,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from src.toolchest.IMUTrace import IMUTrace
-from src.toolchest.WorldTrace import WorldTrace, _reconstruct_from_markers
+from src.toolchest.WorldTrace import (WorldTrace, _reconstruct_from_markers,
+                                      repair_reconstruction_glitches)
 
 # Marker layout of a plate, in the plate's own frame. This has to agree with the
 # convention _reconstruct_from_markers reconstructs against: +x runs d->x and y->o,
@@ -263,9 +264,110 @@ class TestWorldTrace(unittest.TestCase):
         np.testing.assert_allclose(positions, expected_positions, atol=1e-6)
         np.testing.assert_allclose(rotations, expected_rotations, atol=1e-6)
 
+    def test_repair_glitches_fixes_a_swapped_marker_flip(self):
+        # Swapping two marker labels for a few frames is invisible to the distance-based
+        # fault isolation — every inter-marker distance is preserved — but it flips the
+        # reconstructed frame by 180 deg. This is the real failure seen on Subject06's
+        # femur_l plate, reproduced here by swapping the o/d and x/y labels.
+        num_samples = 60
+        timestamps = np.arange(num_samples) / 100.0
+        expected_rotations = Rotation.from_rotvec(
+            np.linspace(0.0, 0.6, num_samples)[:, None] * np.array([0.0, 0.0, 1.0])).as_matrix()
+        expected_positions = np.tile(np.array([0.1, 1.2, -0.3]), (num_samples, 1))
+        marker_o, marker_d, marker_x, marker_y = _markers_from_poses(expected_positions,
+                                                                    expected_rotations)
+        bad = slice(30, 34)
+        swapped_o, swapped_d = marker_o.copy(), marker_d.copy()
+        swapped_x, swapped_y = marker_x.copy(), marker_y.copy()
+        swapped_o[bad], swapped_d[bad] = marker_d[bad], marker_o[bad]
+        swapped_x[bad], swapped_y[bad] = marker_y[bad], marker_x[bad]
+
+        _, glitched = _reconstruct_from_markers(swapped_o, swapped_d, swapped_x, swapped_y)
+        flip_deg = np.degrees(np.linalg.norm(Rotation.from_matrix(
+            np.matmul(expected_rotations.transpose(0, 2, 1), glitched)).as_rotvec(), axis=1))
+        self.assertGreater(flip_deg[bad].min(), 179.0,
+                           "fixture is not reproducing the 180 deg flip it is meant to")
+        self.assertLess(flip_deg[:30].max(), 1e-6)
+
+        positions, rotations, report = repair_reconstruction_glitches(
+            expected_positions.copy(), glitched, timestamps, name='femur_l')
+
+        self.assertGreaterEqual(report['flipped'] + report['interpolated'], 4)
+        # The repair interpolates across the burst, so it cannot be exact — but it must
+        # land within a degree, versus the 180 deg it replaced.
+        repaired_deg = np.degrees(np.linalg.norm(Rotation.from_matrix(
+            np.matmul(expected_rotations.transpose(0, 2, 1), rotations)).as_rotvec(), axis=1))
+        self.assertLess(repaired_deg.max(), 1.0)
+        np.testing.assert_allclose(positions, expected_positions, atol=1e-6)
+
+    def test_repair_glitches_unflips_a_sustained_swap(self):
+        # The real Subject06 femur_l failure: the swap PERSISTS, holding a 180 deg flip for
+        # thousands of frames rather than glitching for a few. Interpolating the boundaries
+        # of such a block leaves its interior corrupt, so it has to be un-flipped instead.
+        num_samples = 400
+        timestamps = np.arange(num_samples) / 100.0
+        expected_rotations = Rotation.from_rotvec(
+            np.linspace(0.0, 2.0, num_samples)[:, None] * np.array([0.2, 1.0, -0.4])).as_matrix()
+        expected_positions = np.tile(np.array([0.0, 1.1, 0.2]), (num_samples, 1))
+
+        # A half turn about the plate's y axis, applied on the right — what an o<->d, x<->y
+        # label swap produces — held for 250 of the 400 frames.
+        flipped_block = slice(100, 350)
+        corrupted = expected_rotations.copy()
+        corrupted[flipped_block] = corrupted[flipped_block] @ np.diag([-1.0, 1.0, -1.0])
+
+        positions, rotations, report = repair_reconstruction_glitches(
+            expected_positions.copy(), corrupted, timestamps, name='femur_l')
+
+        self.assertGreater(report['flipped'], 200,
+                           "the sustained block should be un-flipped, not just its edges")
+        self.assertEqual(report['unresolved'], 0)
+        error_deg = np.degrees(np.linalg.norm(Rotation.from_matrix(
+            np.matmul(expected_rotations.transpose(0, 2, 1), rotations)).as_rotvec(), axis=1))
+        # Every frame recovered, including deep inside the block where edge interpolation
+        # would have left a full 180 deg of error.
+        self.assertLess(error_deg.max(), 1.0)
+        self.assertLess(error_deg[200], 1e-9)
+        np.testing.assert_allclose(positions, expected_positions, atol=1e-6)
+
+    def test_repair_glitches_leaves_an_unexplained_jump_alone(self):
+        # A discontinuity that is not a half turn is a tracking dropout, not a swap. It must
+        # be reported rather than "corrected" by inventing a rotation that fits.
+        num_samples = 200
+        timestamps = np.arange(num_samples) / 100.0
+        rotations = Rotation.from_rotvec(
+            np.linspace(0.0, 0.4, num_samples)[:, None] * np.array([0.0, 0.0, 1.0])).as_matrix()
+        positions = np.tile(np.array([0.0, 1.0, 0.0]), (num_samples, 1))
+        # 70 deg is far past the speed limit but nowhere near a half turn.
+        rotations[100:] = rotations[100:] @ Rotation.from_euler('y', 70.0, degrees=True).as_matrix()
+
+        _, _, report = repair_reconstruction_glitches(positions, rotations, timestamps)
+
+        self.assertEqual(report['flipped'], 0)
+        self.assertEqual(report['unresolved'], 1)
+
+    def test_repair_glitches_leaves_clean_data_untouched(self):
+        # Fast but physical motion must not be "repaired". 600 deg/s is brisk for a
+        # segment and still an order of magnitude under the threshold.
+        num_samples = 50
+        timestamps = np.arange(num_samples) / 100.0
+        rotations = Rotation.from_rotvec(
+            timestamps[:, None] * np.deg2rad(600.0) * np.array([0.0, 1.0, 0.0])).as_matrix()
+        positions = np.random.rand(num_samples, 3)
+
+        out_positions, out_rotations, report = repair_reconstruction_glitches(
+            positions, rotations, timestamps)
+
+        self.assertEqual(report, {'flipped': 0, 'interpolated': 0, 'unresolved': 0})
+        np.testing.assert_array_equal(out_rotations, rotations)
+        np.testing.assert_array_equal(out_positions, positions)
+
     def test_from_trc(self):
         num_samples = 6
-        expected_rotations = Rotation.from_euler('XYZ', np.random.rand(num_samples, 3) * 0.5).as_matrix()
+        # 0.05 rad of random attitude per axis at 10 ms spacing is a few hundred deg/s —
+        # brisk but physical. The scale used to be 0.5, which is >3000 deg/s and trips
+        # from_trc's glitch detector, so the whole fixture got flagged as corrupt.
+        expected_rotations = Rotation.from_euler('XYZ', np.random.rand(num_samples, 3) * 0.05).as_matrix()
         expected_positions = np.random.rand(num_samples, 3)
         # Lift the plate to a realistic height: from_trc infers millimetres from the
         # magnitude of the coordinates, so the values have to exceed 1000 mm for the

@@ -48,8 +48,13 @@ PLOTS_DIR = paths.plots_dir("ekf_oracle_comparison")
 
 # --- What's compared ---------------------------------------------------------
 
-PANEL_A_METHODS = ['ekf', 'ekf_perfect_mag', 'ekf_perfect_acc',
-                   'ekf_perfect_acc_perfect_mag', 'mag_adapt']
+BASELINE_METHOD = 'ekf_rescaled'
+ACC_ORACLE_METHOD = 'ekf_rescaled_perfect_acc'
+MAG_ORACLE_METHOD = 'ekf_rescaled_perfect_mag'
+BOTH_ORACLE_METHOD = 'ekf_rescaled_perfect_acc_perfect_mag'
+
+PANEL_A_METHODS = [BASELINE_METHOD, MAG_ORACLE_METHOD, ACC_ORACLE_METHOD,
+                   BOTH_ORACLE_METHOD, 'mag_on']
 
 # The two zoom panels are a *nested* ablation, not two parallel ones, because the
 # disturbances are not symmetric on this dataset: the accelerometer disturbance
@@ -58,16 +63,19 @@ PANEL_A_METHODS = ['ekf', 'ekf_perfect_mag', 'ekf_perfect_acc',
 # asks "once the accelerometer is fixed, does fixing the magnetometer help too?".
 # Pairing the mag panel against the raw EKF instead would show a flat null and
 # say nothing about whether magnetic distortion costs anything.
-PANEL_B_METHODS = ['ekf', 'ekf_perfect_acc', 'mag_adapt']
-PANEL_C_METHODS = ['ekf_perfect_acc', 'ekf_perfect_acc_perfect_mag', 'mag_adapt']
+PANEL_B_METHODS = [BASELINE_METHOD, ACC_ORACLE_METHOD, 'mag_on']
+PANEL_C_METHODS = [ACC_ORACLE_METHOD, BOTH_ORACLE_METHOD, 'mag_on']
+# Carried through both zoom panels as a reference rather than as half of an
+# ablation pair, so it's drawn dashed and lighter than the pair being compared.
+REFERENCE_METHOD = 'mag_on'
 ZOOM_METHODS = sorted(set(PANEL_B_METHODS) | set(PANEL_C_METHODS))
 
 METHOD_LABELS = {
-    'ekf': 'EKF (real/real)',
-    'ekf_perfect_mag': 'EKF (oracle mag)',
-    'ekf_perfect_acc': 'EKF (oracle acc)',
-    'ekf_perfect_acc_perfect_mag': 'EKF (oracle acc + mag)',
-    'mag_adapt': 'MAJIC (real/real)',
+    BASELINE_METHOD: 'EKF (real/real)',
+    MAG_ORACLE_METHOD: 'EKF (oracle mag)',
+    ACC_ORACLE_METHOD: 'EKF (oracle acc)',
+    BOTH_ORACLE_METHOD: 'EKF (oracle acc + mag)',
+    'mag_on': 'MAJIC (real/real)',
 }
 
 RENAME_JOINTS = {'R_Hip': 'Hip', 'L_Hip': 'Hip', 'R_Knee': 'Knee', 'L_Knee': 'Knee',
@@ -249,7 +257,7 @@ def select_acc_window(plates: Dict, disturb: Dict, errors: Dict, joint: str) -> 
 
         i0 = max(onset - int(ACC_PRE_SEC * fs), start)
         i1 = min(onset + int(ACC_POST_SEC * fs), len(timestamps) - 1)
-        score = _gap_at_end(errors, 'ekf', 'ekf_perfect_acc', i0, i1, fs)
+        score = _gap_at_end(errors, BASELINE_METHOD, ACC_ORACLE_METHOD, i0, i1, fs)
         if score is None:
             continue
 
@@ -313,7 +321,7 @@ def select_mag_window(plates: Dict, disturb: Dict, errors: Dict, joint: str,
         if high - low < MAG_MIN_TREND_DEG:
             continue
 
-        score = _gap_at_end(errors, 'ekf_perfect_acc', 'ekf_perfect_acc_perfect_mag',
+        score = _gap_at_end(errors, ACC_ORACLE_METHOD, BOTH_ORACLE_METHOD,
                             start, stop, fs)
         if score is None:
             continue
@@ -333,11 +341,11 @@ def rank_subjects_by_oracle_gap(stats_df: pd.DataFrame, activity: str) -> List[s
     metric_col = f"{METRIC}_{METRIC_UNITS}"
     df = stats_df[(stats_df['axis'] == AXIS_TO_PLOT) & (stats_df['trial_type'] == activity)]
     pivot = df.pivot_table(index='subject', columns='method', values=metric_col, aggfunc='mean')
-    oracles = [m for m in ('ekf_perfect_acc', 'ekf_perfect_mag') if m in pivot.columns]
-    if 'ekf' not in pivot.columns or not oracles:
+    oracles = [m for m in (ACC_ORACLE_METHOD, MAG_ORACLE_METHOD) if m in pivot.columns]
+    if BASELINE_METHOD not in pivot.columns or not oracles:
         return []
 
-    gap = (pivot['ekf'].to_frame().values - pivot[oracles].values).mean(axis=1)
+    gap = (pivot[BASELINE_METHOD].to_frame().values - pivot[oracles].values).mean(axis=1)
     gap = pd.Series(gap, index=pivot.index).dropna()
     if gap.empty:
         return []
@@ -420,10 +428,10 @@ def _draw_error_traces(ax, errors: Dict, window: Dict, methods: List[str],
         start_error[method] = float(np.degrees(error_rot[i0].magnitude()))
         ax.plot(timestamps[i0:i1], growth[i0:i1],
                 color=colors.get(method, 'gray'),
-                linewidth=1.6 if method == 'mag_adapt' else 2.4,
-                linestyle='--' if method == 'mag_adapt' else '-',
+                linewidth=1.6 if method == REFERENCE_METHOD else 2.4,
+                linestyle='--' if method == REFERENCE_METHOD else '-',
                 label=METHOD_LABELS.get(method, method),
-                zorder=2 if method == 'mag_adapt' else 3)
+                zorder=2 if method == REFERENCE_METHOD else 3)
     ax.set_ylabel('Error growth\nsince $t_0$ (deg)')
     ax.set_xlim(window['t0'], window['t1'])
     ax.margins(x=0)
@@ -510,8 +518,8 @@ def figure_2(stats_df: pd.DataFrame, display: Dict, joint: str, activity: str,
                        "Magnetometer departs from the global field", loc='left', fontsize=14)
     ax_c_err.legend(loc='upper left', fontsize=10, ncol=2)
 
-    for ax, start, baseline in ((ax_b_err, b_start, 'ekf'),
-                                (ax_c_err, c_start, 'ekf_perfect_acc')):
+    for ax, start, baseline in ((ax_b_err, b_start, BASELINE_METHOD),
+                                (ax_c_err, c_start, ACC_ORACLE_METHOD)):
         ax.annotate(f"{METHOD_LABELS[baseline]} absolute error at $t_0$: "
                     f"{start.get(baseline, float('nan')):.0f}°",
                     xy=(0.99, 0.03), xycoords='axes fraction', ha='right', fontsize=9,

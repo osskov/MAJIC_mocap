@@ -4,6 +4,8 @@ mpmath
 networkx
 numpy
 pandas
+pyarrow
+rich
 scipy
 seaborn
 statsmodels

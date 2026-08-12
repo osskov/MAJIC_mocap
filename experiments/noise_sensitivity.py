@@ -59,14 +59,16 @@ def combo_tag(gyro_std: float, acc_std: float, mag_std: Optional[float]) -> str:
     return tag
 
 
-def joint_angles_path(subject: str, activity: str, method: str, tag: str):
-    return OUT_DIR / "joint_angles" / f"Subject{subject}" / activity / f"{method}__{tag}.parquet"
+def joint_angles_path(subject: str, activity: str, method: str, tag: str, normalize_measurements: bool = False):
+    norm_dir = "normalized" if normalize_measurements else "unnormalized"
+    return OUT_DIR / "joint_angles" / norm_dir / f"Subject{subject}" / activity / f"{method}__{tag}.parquet"
 
 # ==============================================================================
 # Joint-angle generation for one noise combo
 # ==============================================================================
 
-def joint_angles_with_noise(plates: Dict, mag_mode: str, gyro_std: float, acc_std: float, mag_std: float) -> pd.DataFrame:
+def joint_angles_with_noise(plates: Dict, mag_mode: str, gyro_std: float, acc_std: float, mag_std: float,
+                             normalize_measurements: bool = False) -> pd.DataFrame:
     all_joint_data = []
     any_plate = next(iter(plates.values()))
     timestamps = any_plate.imu_trace.timestamps
@@ -78,6 +80,7 @@ def joint_angles_with_noise(plates: Dict, mag_mode: str, gyro_std: float, acc_st
             plates[parent], plates[child], project=True, mag_mode=mag_mode,
             gyro_std_parent=gyro_std, acc_std_parent=acc_std, mag_std_parent=mag_std,
             gyro_std_child=gyro_std, acc_std_child=acc_std, mag_std_child=mag_std,
+            normalize_measurements=normalize_measurements,
         )
         rotvec = Rotation.from_matrix(R_pc).as_rotvec()
         df = pd.DataFrame({
@@ -94,7 +97,8 @@ def joint_angles_with_noise(plates: Dict, mag_mode: str, gyro_std: float, acc_st
 # ==============================================================================
 
 def _combo_worker(row_key, stage_labels: List[str], shared_state: Dict, method: str, mag_mode: str,
-                   tag_to_combo: Dict[str, Tuple[float, float, Optional[float]]]) -> pd.DataFrame:
+                   tag_to_combo: Dict[str, Tuple[float, float, Optional[float]]],
+                   normalize_measurements: bool = False) -> pd.DataFrame:
     """Each combo is its own filter pass over all 7 joints (~minutes), so this is
     called with run_tracked_grid(per_cell=True) — one process per (subject,
     activity, combo) triple, matching how fine the original flat task list was.
@@ -121,12 +125,13 @@ def _combo_worker(row_key, stage_labels: List[str], shared_state: Dict, method: 
         shared_state[(row_key, tag)] = "Running"
         try:
             effective_mag_std = mag_std if mag_std is not None else FIXED_MAG_STD
-            imu_df = joint_angles_with_noise(plates, mag_mode, gyro_std, acc_std, effective_mag_std)
+            imu_df = joint_angles_with_noise(plates, mag_mode, gyro_std, acc_std, effective_mag_std,
+                                              normalize_measurements=normalize_measurements)
             if imu_df.empty:
                 shared_state[(row_key, tag)] = "Skipped"
                 continue
 
-            path = joint_angles_path(subject, activity, method, tag)
+            path = joint_angles_path(subject, activity, method, tag, normalize_measurements=normalize_measurements)
             path.parent.mkdir(parents=True, exist_ok=True)
             imu_df.to_parquet(path, engine='pyarrow')
 
@@ -177,13 +182,21 @@ def main():
                          help="Filter method to sweep. 'mag_off' skips the mag_std sweep entirely "
                               "since the magnetometer measurement is zeroed before the filter runs.")
     parser.add_argument('--workers', type=int, default=os.cpu_count(), help="Parallel workers across all tasks.")
+    parser.add_argument('--normalize', action='store_true',
+                         help="Scale acc/mag vectors to unit length before the measurement update "
+                              "(RelativeFilter's normalize_measurements). NOTE: this is a different "
+                              "tuning, not a pure geometry-only ablation — normalizing at a fixed std "
+                              "changes the sensor/gyro trust ratio (see "
+                              "RelativeFilter._normalize_vector_measurements). A run at the same "
+                              "gyro/acc/mag std grid is not directly comparable to the unnormalized run.")
     args = parser.parse_args()
 
     mag_mode = METHOD_MAG_MODES[args.method]
     combos = build_combos(args.method)
     tags = [combo_tag(g, a, m) for g, a, m in combos]
-    print(f"Method: {args.method} ({len(combos)} combos, gyro/acc std in {STD_MIN}..{STD_MAX}, {N_STEPS} log steps each"
-          f"{', mag std swept too' if args.method == 'mag_on' else ''}):")
+    norm_label = "normalized" if args.normalize else "unnormalized"
+    print(f"Method: {args.method} ({norm_label}, {len(combos)} combos, gyro/acc std in {STD_MIN}..{STD_MAX}, "
+          f"{N_STEPS} log steps each{', mag std swept too' if args.method == 'mag_on' else ''}):")
     for tag in tags:
         print(f"  {tag}")
 
@@ -191,27 +204,31 @@ def main():
     row_keys = [(subject, activity) for subject in subjects for activity in args.activities]
 
     tag_to_combo = dict(zip(tags, combos))
-    worker = partial(_combo_worker, method=args.method, mag_mode=mag_mode, tag_to_combo=tag_to_combo)
+    worker = partial(_combo_worker, method=args.method, mag_mode=mag_mode, tag_to_combo=tag_to_combo,
+                      normalize_measurements=args.normalize)
     _, results = run_tracked_grid(row_keys, ['Subject', 'Activity'], tags, worker, args.workers,
-                                   title=f"NOISE SENSITIVITY ({args.method})", per_cell=True)
+                                   title=f"NOISE SENSITIVITY ({args.method}, {norm_label})", per_cell=True)
 
     row_frames = [df for df in results.values() if df is not None and not df.empty]
     if not row_frames:
         print("No results produced.")
         return
     combined_stats = pd.concat(row_frames, ignore_index=True)
+    combined_stats['normalize_measurements'] = args.normalize
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     run_tag = "all" if args.all else args.subject
+    run_tag = f"{run_tag}_{norm_label}"
 
     for (subject_name, activity), group in combined_stats.groupby(['subject', 'trial_type']):
         out_path = paths.ensure_parent(
-            OUT_DIR / "per_subject_stats" / subject_name / activity / f"{args.method}.parquet")
+            OUT_DIR / "per_subject_stats" / subject_name / activity / f"{args.method}_{norm_label}.parquet")
         group.to_parquet(out_path, engine='pyarrow')
 
     # Saved under data/statistics/ like every other experiment's summary stats, but
-    # named per (method, subject-scope) since mag_on/mag_off and single-subject/--all
-    # runs are independent sweeps that shouldn't clobber each other.
+    # named per (method, subject-scope, normalization) since mag_on/mag_off,
+    # single-subject/--all, and normalized/unnormalized runs are independent sweeps
+    # that shouldn't clobber each other.
     stats_name = f"noise_sensitivity_{args.method}_{run_tag}"
     stats_path = save_statistics(combined_stats, stats_name)
     print(f"\nSaved combined stats ({args.method}, {run_tag}) to {stats_path}")
@@ -219,7 +236,7 @@ def main():
     ranking = rank_combos(combined_stats)
     ranking_csv_path = paths.ensure_parent(OUT_DIR / f"ranking_{args.method}_{run_tag}.csv")
     ranking.to_csv(ranking_csv_path, index=False)
-    paths.write_manifest(ranking_csv_path, method=args.method, run_tag=run_tag,
+    paths.write_manifest(ranking_csv_path, method=args.method, run_tag=run_tag, normalize_measurements=args.normalize,
                          gyro_stds=GYRO_STDS.tolist(), acc_stds=ACC_STDS.tolist(),
                          mag_stds=MAG_STDS.tolist() if args.method == 'mag_on' else None)
     print(f"Saved ranking ({args.method}, {run_tag}) to {ranking_csv_path}")

@@ -92,8 +92,23 @@ def raw_trial_dir(subject: str, activity: str) -> Path:
 # Outputs: joint angles
 # ==============================================================================
 
-def joint_angles_path(subject: str, activity: str, method: str) -> Path:
-    return JOINT_ANGLES_DIR / f"Subject{subject}" / activity / f"{method}.parquet"
+def joint_angles_path(subject: str, activity: str, method: str,
+                      variant: Optional[str] = None) -> Path:
+    """Per-method joint angles for one trial. `variant` namespaces an alternative
+    filter TUNING under its own subdirectory.
+
+    A method NAME already encodes everything the method-spec grammar can express —
+    mag mode, oracles, normalization, threshold, distortion scale — so those need no
+    namespacing: they produce distinct filenames. The gyro/acc/mag standard
+    deviations live outside the name (they are module constants, see
+    experiment_utils.DEFAULT_*_STD), so two runs at different stds would otherwise
+    write the same filename and the second would silently overwrite the first under a
+    name that says nothing about which tuning produced it. Anything that overrides
+    those stds passes a variant; the default-tuned pipeline passes None and keeps the
+    flat layout the README documents.
+    """
+    root = JOINT_ANGLES_DIR if variant is None else JOINT_ANGLES_DIR / variant
+    return root / f"Subject{subject}" / activity / f"{method}.parquet"
 
 # ==============================================================================
 # Outputs: statistics

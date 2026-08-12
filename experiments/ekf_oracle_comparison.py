@@ -20,13 +20,18 @@ from experiments.experiment_utils import (
     run_tracked_grid, generate_joint_angles_worker,
 )
 
-ALREADY_COMPUTED_METHODS = ['marker', 'ekf', 'mag_adapt']
+# The EKF arms are the '_rescaled' variants (normalize + convert the stds into the units
+# a unit-length measurement lives in). Plain 'ekf' normalizes without rescaling, which
+# silently de-weights the accelerometer by ~96x in variance and is not the configuration
+# the comparison means to test.
+ALREADY_COMPUTED_METHODS = ['marker', 'ekf_rescaled', 'mag_on']
 # The both-oracle variant is the floor of the ablation, and it is not redundant:
 # on this dataset the mag oracle alone changes nothing (the accelerometer
 # disturbance dominates and the filter is already lost), so the only way to see
 # whether magnetic distortion costs anything is to remove it on top of a fixed
 # accelerometer.
-ORACLE_METHODS = ['ekf_perfect_mag', 'ekf_perfect_acc', 'ekf_perfect_acc_perfect_mag']
+ORACLE_METHODS = ['ekf_rescaled_perfect_mag', 'ekf_rescaled_perfect_acc',
+                  'ekf_rescaled_perfect_acc_perfect_mag']
 ALL_METHODS = ALREADY_COMPUTED_METHODS + ORACLE_METHODS
 
 

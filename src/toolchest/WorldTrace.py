@@ -86,11 +86,247 @@ def _compute_case(m_o, m_d, m_x, m_y, w, h, faulty_idx=None):
     return loc, rot
 
 
+# Angular speed above which a reconstructed pose is judged corrupt rather than fast.
+# 3000 deg/s is an order of magnitude past any human body segment; for scale, the 99.9th
+# percentile of clean plates in this dataset is 500-800 deg/s.
+#
+# This exists because the distance-based fault isolation in _reconstruct_from_markers
+# cannot see a marker SWAP. Swapping two labels leaves every inter-marker distance
+# unchanged, so fault_scores stays clean, but the reconstructed frame flips: if x_v -> -x_v
+# then z_v = x_v X yt -> -z_v while y_v = z_v X x_v is unchanged, which is exactly a 180 deg
+# rotation about y. Subject06's femur_l plate does this in five short bursts.
+MAX_RECONSTRUCTION_ANGULAR_SPEED_DEG_S = 3000.0
+
+# Frames of dilation around each detected glitch. A single corrupt frame produces two large
+# steps (into it and out of it), so both neighbours are already flagged; this covers the
+# partially-corrupted frames on the shoulders of a longer burst.
+GLITCH_DILATION_FRAMES = 2
+
+
+# A marker label swap corrupts the reconstructed frame by a CONSTANT half turn in the
+# plate's own frame, and only these four values are reachable. Swapping o<->d and x<->y
+# sends x_v -> -x_v, hence z_v = x_v X yt -> -z_v while y_v = z_v X x_v is unchanged, so
+# R_bad = R_true @ diag(-1, 1, -1) — a half turn about the plate's y axis, applied on the
+# RIGHT because rot is built with the basis vectors as columns. The other swap pairings give
+# the x and z half turns. Each is its own inverse, so applying it again undoes it.
+_HALF_TURN_CANDIDATES = {
+    'none': np.eye(3),
+    'x': np.diag([1.0, -1.0, -1.0]),
+    'y': np.diag([-1.0, 1.0, -1.0]),
+    'z': np.diag([-1.0, -1.0, 1.0]),
+}
+
+# How closely a block's boundary discontinuity must match a half turn before it is treated
+# as a marker swap. Generous because a few frames of real motion elapse across the gap; the
+# discrimination is easy regardless, since the wrong choice leaves ~180 deg and the right one
+# leaves a few.
+MAX_FLIP_SNAP_RESIDUAL_DEG = 20.0
+
+# Interpolation bridges a discontinuity only if that discontinuity was EXPLAINED — either it
+# was small to begin with, or the blocks either side were reconciled by a marker swap. An
+# unexplained jump is left exactly as it is.
+#
+# The reason is that interpolating across one manufactures a smooth ramp of motion that never
+# happened and, worse, spreads the jump thin enough that it no longer trips the detector that
+# found it. Subject08's calcn_l does this: a 176 deg jump about an axis that is NOT a
+# marker-rectangle symmetry (the plates measure 86x104 mm, so only the three coordinate half
+# turns are distance-preserving relabelings) became a 30-frame ramp whose every step sat under
+# the speed limit.
+#
+# Note the gate cannot be the jump's SIZE: the leftover transition frames beside a
+# successfully un-flipped block are themselves still flipped, so they show ~180 deg steps and
+# are nonetheless safe to interpolate, being a handful of frames bracketed by known-good poses.
+
+
+def _rotation_angle_deg(matrix: np.ndarray) -> float:
+    """Geodesic magnitude of a single rotation matrix, in degrees."""
+    return float(np.degrees(np.arccos(np.clip((np.trace(matrix) - 1.0) / 2.0, -1.0, 1.0))))
+
+
+def _step_angles_deg(rotations: np.ndarray) -> np.ndarray:
+    """Rotation angle of each of the N-1 frame-to-frame transitions, in degrees.
+
+    Uses the trace identity cos(theta) = (trace(R[t]^T R[t+1]) - 1) / 2 with
+    trace(A^T B) = sum(A * B): exact to ~1e-9 deg but ~120x faster than building a Rotation,
+    which matters because this runs on every plate of every trial. arccos is imprecise near
+    zero, which is irrelevant against thresholds of tens of degrees.
+    """
+    cos_theta = (np.einsum('tij,tij->t', rotations[:-1], rotations[1:]) - 1.0) / 2.0
+    return np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
+
+
+def _offending_steps(rotations: np.ndarray, timestamps: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """(mask of transitions exceeding the physical speed limit, their angles in degrees)."""
+    step_deg = _step_angles_deg(rotations)
+    dt = np.diff(timestamps)
+    speed = step_deg / np.where(dt > 0, dt, np.inf)
+    return speed > MAX_RECONSTRUCTION_ANGULAR_SPEED_DEG_S, step_deg
+
+
+def _transition_mask(offending: np.ndarray, n_frames: int) -> np.ndarray:
+    """Frames on either side of an offending step, dilated — the untrustworthy transitions."""
+    bad = np.zeros(n_frames, dtype=bool)
+    bad[:-1] |= offending    # the frame entering the jump
+    bad[1:] |= offending     # the frame leaving it
+    for _ in range(GLITCH_DILATION_FRAMES):
+        # Sliced rather than np.roll: roll wraps, which would let a glitch in the last
+        # frame flag the first one.
+        dilated = bad.copy()
+        dilated[1:] |= bad[:-1]
+        dilated[:-1] |= bad[1:]
+        bad = dilated
+    return bad
+
+
+def _unflip_swapped_blocks(rotations: np.ndarray, bad: np.ndarray,
+                           name: str = None) -> Tuple[np.ndarray, int, int]:
+    """Undoes SUSTAINED marker swaps: whole blocks sitting a constant half turn off.
+
+    A swap persists until the labels are corrected, which in this dataset means blocks
+    thousands of frames long — Subject06's femur_l holds a 180 deg flip for 4214 frames
+    (42 s). Interpolating the boundaries of such a block is worse than doing nothing: it
+    silences the detector while leaving the interior corrupt.
+
+    So the trace is split into clean runs at the detected discontinuities, and each run is
+    compared with the previous, already-corrected one. The apparent body-frame change across
+    the gap is snapped to the nearest of _HALF_TURN_CANDIDATES; if it matches one within
+    MAX_FLIP_SNAP_RESIDUAL_DEG, that half turn is applied to the whole run.
+
+    The first run anchors the chain and is never corrected, which costs nothing: a constant
+    flip applied to an entire trial is absorbed by the sensor-to-segment alignment in
+    PlateTrial._align_world_trace_to_imu_trace. Only flips RELATIVE to the rest of the trial
+    corrupt anything.
+
+    Returns (rotations, frames un-flipped, unexplained gaps as (last_good, next_good) index
+    pairs). Those gaps are what the caller must refuse to interpolate across.
+    """
+    clean_idx = np.flatnonzero(~bad)
+    if len(clean_idx) == 0:
+        return rotations, 0, []
+
+    runs = np.split(clean_idx, np.flatnonzero(np.diff(clean_idx) > 1) + 1)
+    out = np.array(rotations, dtype=np.float64, copy=True)
+    n_flipped = 0
+    unexplained = []
+    previous_end = runs[0][-1]
+
+    for run in runs[1:]:
+        discontinuity = out[previous_end].T @ out[run[0]]
+        label, correction, residual = min(
+            ((label, candidate, _rotation_angle_deg(discontinuity.T @ candidate))
+             for label, candidate in _HALF_TURN_CANDIDATES.items()),
+            key=lambda item: item[2])
+
+        if residual > MAX_FLIP_SNAP_RESIDUAL_DEG:
+            # Neither continuous nor a marker swap, so this is a genuine reconstruction
+            # failure. Applying a half turn would invent data, and so would interpolating
+            # across it, so the gap is handed back to the caller untouched.
+            unexplained.append((int(previous_end), int(run[0])))
+        elif label != 'none':
+            out[run] = out[run] @ correction
+            n_flipped += len(run)
+
+        previous_end = run[-1]
+
+    return out, n_flipped, unexplained
+
+
+def repair_reconstruction_glitches(
+    positions: np.ndarray,
+    rotations: np.ndarray,
+    timestamps: np.ndarray,
+    name: str = None,
+) -> Tuple[np.ndarray, np.ndarray, dict]:
+    """Repairs non-physical marker-plate reconstruction failures.
+
+    Two distinct faults, which need different fixes and are easy to conflate:
+
+      * SUSTAINED SWAPS. Two marker labels are exchanged for a stretch of the trial,
+        rotating the reconstructed frame by a constant half turn until the labels recover.
+        These blocks run to thousands of frames, so they are un-flipped, not interpolated.
+        Invisible to the distance-based fault isolation in _reconstruct_from_markers,
+        because a swap leaves every inter-marker distance unchanged.
+      * TRANSITION FRAMES. The few frames either side of each discontinuity, where the
+        reconstruction is genuinely mid-failure and neither pose is meaningful. These are
+        rebuilt from the nearest clean frames: SLERP for rotation, linear for position.
+
+    Order matters — un-flip first, then interpolate — because the blocks are separated by
+    exactly the discontinuities that flag the transitions, and interpolating first would
+    smear a 180 deg step into the surrounding frames.
+
+    Interpolating rather than deleting keeps the uniform time grid that resampling,
+    filtering and every finite-difference angular velocity in this repo assume. Only
+    transition frames get their position replaced: a swap leaves the marker centroid
+    unchanged, so a flipped block's positions are already correct.
+
+    Returns (positions, rotations, report) where report counts 'flipped', 'interpolated'
+    and 'unresolved' frames. Callers should surface a nonzero report — a silent repair
+    would hide a marker-labelling problem that is a real property of the .trc.
+    """
+    empty = {'flipped': 0, 'interpolated': 0, 'unresolved': 0}
+    if len(rotations) < 3:
+        return positions, rotations, empty
+
+    rotations = np.asarray(rotations, dtype=np.float64)
+    offending, _ = _offending_steps(rotations, timestamps)
+    if not np.any(offending):
+        return positions, rotations, empty
+
+    bad = _transition_mask(offending, len(rotations))
+    if bad.all():
+        print(f"Warning: {name or 'segment'} looks corrupt in every frame; leaving it "
+              f"untouched rather than interpolating from nothing.")
+        return positions, rotations, empty
+
+    # 1. Un-flip sustained swaps, then re-detect: the surviving discontinuities are the
+    #    genuine transitions, and the flips no longer masquerade as them.
+    rotations, n_flipped, unexplained = _unflip_swapped_blocks(rotations, bad, name=name)
+    offending, _ = _offending_steps(rotations, timestamps)
+    bad = _transition_mask(offending, len(rotations))
+
+    # 2. Withhold the unexplained gaps from interpolation, so a genuine reconstruction
+    #    failure stays visible instead of being smoothed into plausible-looking invention.
+    for last_good, next_good in unexplained:
+        bad[last_good + 1:next_good] = False
+
+    report = {'flipped': n_flipped, 'interpolated': int(bad.sum()),
+              'unresolved': len(unexplained)}
+    if unexplained:
+        print(f"Warning: {name or 'segment'}: {len(unexplained)} discontinuity(ies) are "
+              f"neither a marker swap nor safely interpolable, and have been LEFT IN PLACE. "
+              f"This segment is corrupt around frames "
+              f"{[gap[0] for gap in unexplained[:5]]}; treat any joint using it with suspicion.")
+    if not np.any(bad):
+        return positions, rotations, report
+
+    good_idx = np.flatnonzero(~bad)
+    if len(good_idx) < 2:
+        print(f"Warning: {name or 'segment'} has too few clean frames to interpolate from.")
+        report['interpolated'] = 0
+        return positions, rotations, report
+
+    # Only here, once a repair is known to be needed, is a Rotation object built — the
+    # common clean case above stays pure numpy.
+    rot = Rotation.from_matrix(rotations)
+    # Clamp so a glitch at either end holds the nearest clean pose instead of failing.
+    query = np.clip(timestamps[bad], timestamps[good_idx[0]], timestamps[good_idx[-1]])
+
+    repaired_rotations = rotations.copy()
+    repaired_rotations[bad] = Slerp(timestamps[good_idx], rot[good_idx])(query).as_matrix()
+
+    repaired_positions = np.array(positions, dtype=np.float64, copy=True)
+    for axis in range(3):
+        repaired_positions[bad, axis] = np.interp(
+            query, timestamps[good_idx], np.asarray(positions)[good_idx, axis])
+
+    return repaired_positions, repaired_rotations, report
+
+
 def _reconstruct_from_markers(
-    marker_o: np.ndarray, 
-    marker_d: np.ndarray, 
-    marker_x: np.ndarray, 
-    marker_y: np.ndarray, 
+    marker_o: np.ndarray,
+    marker_d: np.ndarray,
+    marker_x: np.ndarray,
+    marker_y: np.ndarray,
     threshold: float = 2.0
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Reconstructs rigid body coordinate frames with fault isolation."""
@@ -230,6 +466,14 @@ class WorldTrace:
             positions, rotations = _reconstruct_from_markers(
                 o_loc, d_loc, x_loc, y_loc, threshold=2.0
             )
+            positions, rotations, report = repair_reconstruction_glitches(
+                positions, rotations, timestamps, name=clean_name)
+            if any(report.values()):
+                print(f"Warning: {trc_path.name}/{clean_name}: marker reconstruction repaired "
+                      f"({report['flipped']} frame(s) un-flipped from swapped marker labels, "
+                      f"{report['interpolated']} transition frame(s) interpolated, "
+                      f"{report['unresolved']} discontinuity(ies) not attributable to a swap) "
+                      f"— see repair_reconstruction_glitches.")
             world_traces[clean_name] = WorldTrace(timestamps, positions, rotations)
         return world_traces
 

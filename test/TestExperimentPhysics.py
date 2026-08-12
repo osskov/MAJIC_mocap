@@ -434,5 +434,35 @@ class TestObservabilityMetric(unittest.TestCase):
             atol=1e-12)
 
 
+class TestNormalizationConstants(unittest.TestCase):
+    """The nominal magnitudes the '_rescaled' arm divides the sensor stds by. Both are
+    silent if wrong: the arm would still run, just at a weighting that no longer matches
+    the control it exists to be compared against."""
+
+    def test_the_acc_nominal_is_gravity(self):
+        self.assertAlmostEqual(experiment_utils.NOMINAL_ACC_MAGNITUDE,
+                               float(np.linalg.norm(EXPECTED_GRAVITY)), places=12)
+        self.assertAlmostEqual(experiment_utils.NOMINAL_ACC_MAGNITUDE, 9.81, places=6)
+
+    def test_the_mag_nominal_is_the_xsens_calibrated_unit(self):
+        """These exports are normalized at calibration so a nominal Earth field reads 1.0
+        (see MAG_UNIT in experiments/sensor_distributions.py), NOT microtesla. A ~50x
+        value here would silently de-weight the magnetometer in the rescaled arm only."""
+        self.assertEqual(experiment_utils.NOMINAL_MAG_MAGNITUDE, 1.0)
+
+
+class TestRescaleStdsGuard(unittest.TestCase):
+    def test_rescaling_without_normalizing_raises(self):
+        """Dividing the stds while the measurements keep their raw scale over-trusts every
+        sensor by the nominal magnitude — a configuration with no use, and one that would
+        otherwise run happily and produce plausible-looking numbers. The guard fires before
+        any data is touched, so None plates are enough to reach it."""
+        with self.assertRaises(ValueError) as ctx:
+            experiment_utils._run_relative_filter(
+                None, None, project=True, mag_mode='off',
+                normalize_measurements=False, rescale_stds=True)
+        self.assertIn('rescale_stds', str(ctx.exception))
+
+
 if __name__ == '__main__':
     unittest.main()

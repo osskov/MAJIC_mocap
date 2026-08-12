@@ -31,7 +31,8 @@ from scipy.spatial.transform import Rotation
 import matplotlib.pyplot as plt
 
 import paths
-from experiments.experiment_utils import load_raw_data, JOINTS, _calculate_observability_metric_, run_tracked_grid
+from experiments.experiment_utils import (load_raw_data, JOINTS, _calculate_observability_metric_,
+                                          project_pair_to_joint_center, run_tracked_grid)
 
 OUT_DIR = paths.experiment_dir("drift_observability")
 
@@ -55,15 +56,10 @@ def load_joint_angles(subject, activity, method, joint_name):
 
 
 def compute_obs_metric(parent_trial, child_trial):
-    """Mirrors the projection step in experiment_utils._run_relative_filter
-    (project=True), then computes o^J — the part of the filter pass that this analysis
-    actually needs, without running the EKF itself."""
-    parent_trial = parent_trial.copy()
-    child_trial = child_trial.copy()
-    parent_offset, child_offset, error = parent_trial.world_trace.get_joint_center(child_trial.world_trace)
-    parent_trial.imu_trace = parent_trial.project_imu_trace(parent_offset)
-    child_trial.imu_trace = child_trial.project_imu_trace(child_offset)
-    return _calculate_observability_metric_(parent_trial, child_trial)
+    """Projects both plates to the joint center exactly as
+    experiment_utils._run_relative_filter(project=True) does, then computes o^J — the part
+    of the filter pass that this analysis actually needs, without running the EKF itself."""
+    return _calculate_observability_metric_(*project_pair_to_joint_center(parent_trial, child_trial))
 
 # ==============================================================================
 # Live-table worker: one row per joint (load precomputed joint angles + o^J)

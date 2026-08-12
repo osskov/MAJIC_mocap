@@ -313,14 +313,20 @@ def draw_distribution(
     color_map = dict(zip(order, sns.color_palette(palette, n_colors=len(order))))
     grouped = data.groupby(group_col)[y_col]
 
-    if plot_type == 'bar':
+    if plot_type in ('bar', 'bar_sd'):
+        # 'bar' shows the precision of the mean (95% CI), 'bar_sd' the spread of the
+        # data itself (±1 SD) — the latter is what a "mean and std" table reports.
         sns.barplot(data=data, x=group_col, y=y_col, order=order, hue=group_col, palette=color_map,
-                    legend=False, ax=ax, errorbar=('ci', 95), capsize=0.1, zorder=2)
-        n = grouped.count().reindex(order)
-        t_crit = (n - 1).clip(lower=1).apply(lambda dof: stats.t.ppf(0.975, dof))
-        half_ci = grouped.sem().reindex(order) * t_crit
+                    legend=False, ax=ax, errorbar='sd' if plot_type == 'bar_sd' else ('ci', 95),
+                    capsize=0.1, zorder=2)
         center = grouped.mean().reindex(order)
-        lower, upper = center - half_ci, center + half_ci
+        if plot_type == 'bar_sd':
+            half = grouped.std().reindex(order)
+        else:
+            n = grouped.count().reindex(order)
+            t_crit = (n - 1).clip(lower=1).apply(lambda dof: stats.t.ppf(0.975, dof))
+            half = grouped.sem().reindex(order) * t_crit
+        lower, upper = center - half, center + half
     else:
         if plot_type == 'box':
             sns.boxplot(data=data, x=group_col, y=y_col, order=order, hue=group_col, palette=color_map,
@@ -412,14 +418,19 @@ def plot_metric_distribution(
     df: pd.DataFrame, metric: str, group_col: str, group_order: List[str], plots_dir: Path,
     labels: Optional[Dict[str, str]] = None, plot_type: str = 'strip', facet_by: Optional[str] = None,
     facet_order: Optional[List[str]] = None, palette: str = DEFAULT_PALETTE, save: bool = True, show: bool = True,
-    block_cols: Optional[List[str]] = None, alpha: float = 0.05
+    block_cols: Optional[List[str]] = None, alpha: float = 0.05,
+    ylabel: Optional[str] = None, title: Optional[str] = None, filename: Optional[str] = None
 ) -> None:
     """One figure comparing `group_order` for `metric`, optionally faceted (e.g.
     one panel per joint).
 
     All panels are tested as one Holm family (see test_panels), blocking on
     `block_cols` (default: subject x joint). A `<figure>_stats.csv` with n, effect
-    magnitudes and corrected p-values is written beside the figure."""
+    magnitudes and corrected p-values is written beside the figure.
+
+    `ylabel`/`title`/`filename` override the names derived from `metric` — paper
+    figures want a typeset axis label and a stable `figure_N_*.png`, exploratory
+    sweeps are happy with the defaults."""
     order = order_present(df[group_col].unique(), group_order)
     if len(order) < 1:
         print(f"No requested {group_col} values present for '{metric}'. Skipping distribution plot.")
@@ -442,21 +453,22 @@ def plot_metric_distribution(
                               results[str(level)].significant_pairs, plot_type, labels, palette)
             ax.set_title(str(level))
             ax.set_xlabel('')
-        axes[0].set_ylabel(metric)
+        axes[0].set_ylabel(ylabel or metric)
         for ax in axes[1:]:
             ax.set_ylabel('')
     else:
         fig, ax = plt.subplots(figsize=(1.6 * len(order) + 2, 6))
         draw_distribution(ax, df, metric, group_col, order, results['all'].significant_pairs,
                           plot_type, labels, palette)
-        ax.set_ylabel(metric)
+        ax.set_ylabel(ylabel or metric)
         ax.set_xlabel('')
 
-    plot_kind = {'strip': 'Median + IQR', 'box': 'Boxplot', 'bar': 'Mean ' + u'±' + ' 95% CI'}[plot_type]
+    plot_kind = {'strip': 'Median + IQR', 'box': 'Boxplot',
+                 'bar': 'Mean ' + u'±' + ' 95% CI', 'bar_sd': 'Mean ' + u'±' + ' SD'}[plot_type]
     facet_suffix = f" by {facet_by}" if facet_by else ""
-    out_name = f"distribution_{metric}{('_by_' + facet_by) if facet_by else ''}_{plot_type}.png"
+    out_name = filename or f"distribution_{metric}{('_by_' + facet_by) if facet_by else ''}_{plot_type}.png"
     finalize_and_save_plot(
-        fig, f"{metric}{facet_suffix} ({plot_kind})", out_name, plots_dir,
+        fig, title if title is not None else f"{metric}{facet_suffix} ({plot_kind})", out_name, plots_dir,
         epilog=_significance_epilog(results, alpha), save=save, show=show
     )
     _emit_significance_report(significance_report(results, metric), out_name, plots_dir, save=save)
