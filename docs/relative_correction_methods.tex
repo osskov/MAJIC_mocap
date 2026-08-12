@@ -1,0 +1,220 @@
+% ---------------------------------------------------------------------------------------------
+% Manuscript text for the relative-vs-absolute correction argument.
+%
+% Every number below comes from results/statistics/relative_vs_absolute_statistics.parquet, and
+% is reproduced by:
+%     python -m experiments.relative_vs_absolute
+%     python -m plotting.relative_vs_absolute
+% The console report of the first command prints each number in the same order it appears here.
+% Coverage: 19 trials, 11 subjects, 7 joints, 56,951,835 samples.
+%
+% Notation follows the filter: J is the parent segment, K the child, matching y^J / y^K in the
+% method section and vector_sensor_stds_parent / _child in src/RelativeFilterPlus.py.
+% ---------------------------------------------------------------------------------------------
+
+\subsection{Why the correction is applied relatively}
+\label{sec:relative-correction}
+
+Two IMUs spanning a joint measure the same physical field twice, once in each sensor's body
+frame, and there are two ways to turn that into an orientation measurement. A per-segment
+attitude filter compares each sensor against a single global reference $\mathbf{m}_G$, giving
+residuals $\hat{R}_J \mathbf{m}_J - \mathbf{m}_G$ and $\hat{R}_K \mathbf{m}_K - \mathbf{m}_G$.
+The relative filter compares the two sensors against \emph{each other},
+$\hat{R}_J \mathbf{m}_J - \hat{R}_K \mathbf{m}_K$, with no global reference anywhere in it.
+Both residuals vanish only if the field is uniform over the two sensor sites; neither is, so
+both are non-zero at the true orientation and each filter responds by rotating its estimate away
+from truth until the residual it sees is nulled. We quantify how much rotation each residual
+demands, and we do so from the data alone: no filter is run, and the ground-truth marker
+orientations are used to place both measurements in a common frame.
+
+For each joint, field and sample we rotate the two body-frame readings into the world frame
+using the marker orientations and normalise, giving unit vectors $\mathbf{u}_J$ and
+$\mathbf{u}_K$ on $S^2$, and we write $\mathbf{g}$ for the unit global reference (the subject's
+median world-frame field for the magnetometer, gravity for the accelerometer; the accelerometer
+is first rigid-body projected to the shared joint centre, as the filter does). Let $C_J$ be the
+minimum rotation carrying $\mathbf{u}_J$ onto $\mathbf{g}$ and $C_K$ likewise for
+$\mathbf{u}_K$; these are the world-frame orientation errors the per-segment route incurs, of
+magnitudes $\theta_J$ and $\theta_K$. The relative residual instead demands only
+$\theta_{rel} = \angle(\mathbf{u}_J,\mathbf{u}_K)$. Because the per-segment route reports a
+relative orientation of $R_J^{\top} C_J^{\top} C_K R_K$, the joint angle it returns is wrong by
+a conjugate of $C_{\mathrm{comp}} = C_J^{\top} C_K$, and so by the angle
+$\theta_{\mathrm{comp}} = \lVert \log C_{\mathrm{comp}} \rVert$. Four exact statements follow,
+each verified on every sample (Sec.~\ref{sec:relative-results}):
+
+\begin{enumerate}
+  \item \textbf{Geodesic triangle inequality.}
+    $\theta_{rel} \le \theta_J + \theta_K$. Great-circle distance is a metric on $S^2$, so the
+    direct route from $\mathbf{u}_J$ to $\mathbf{u}_K$ is never longer than the detour through
+    $\mathbf{g}$. The relative correction never exceeds the total correction the per-segment
+    route must apply across the two segments.
+
+  \item \textbf{Minimum rotation property.}
+    $\theta_{rel} \le \theta_{\mathrm{comp}}$. Since $C_K \mathbf{u}_K = \mathbf{g}$ and
+    $C_J^{\top}\mathbf{g} = \mathbf{u}_J$, the composed correction $C_{\mathrm{comp}}$ carries
+    $\mathbf{u}_K$ onto $\mathbf{u}_J$; any rotation doing so must turn by at least the angle
+    between them. The relative residual's demand is therefore the exact lower bound on the joint
+    angle error achievable by \emph{any} reference-based correction of the same pair. The
+    quantifier matters: the bound holds pointwise for every $\mathbf{g}$, so it cannot be evaded
+    by calibrating the global reference better.
+
+  \item \textbf{An exact closed form.} Writing $\psi$ for the angle of
+    $C_{\mathrm{comp}} C_{\min}^{\top}$, where $C_{\min}$ is the minimum rotation carrying
+    $\mathbf{u}_K$ onto $\mathbf{u}_J$,
+    \begin{equation}
+      \cos\!\left(\tfrac{\theta_{\mathrm{comp}}}{2}\right)
+        = \cos\!\left(\tfrac{\theta_{rel}}{2}\right)\cos\!\left(\tfrac{\psi}{2}\right).
+      \label{eq:closed-form}
+    \end{equation}
+    Both rotations carry $\mathbf{u}_K$ onto $\mathbf{u}_J$, so their ratio fixes
+    $\mathbf{u}_J$ and is a rotation \emph{about} it --- the per-segment route's excess is a pure
+    twist about the measured field direction, which is precisely the direction a single vector
+    measurement cannot observe. That twist axis is orthogonal to $C_{\min}$'s, so the half-angle
+    formula for composed rotations loses its cross term and collapses to
+    Eq.~\eqref{eq:closed-form}, from which statement 2 follows again with equality if and only if
+    $\psi = 0$.
+
+  \item \textbf{The excess is a spherical area.} $\psi$ is the spherical excess, equivalently the
+    signed area, of the triangle $(\mathbf{u}_J, \mathbf{g}, \mathbf{u}_K)$, wrapped to
+    $(-180^\circ, 180^\circ]$. The penalty for routing through a global reference is therefore
+    exactly zero when that reference lies on the great circle through the two measurements, and
+    grows with how far off that plane it lies.
+\end{enumerate}
+
+Nothing above is specific to magnetism, and we apply it to both fields, which fail the
+uniform-field assumption for unrelated reasons. The magnetometer's $\mathbf{u}_J$ and
+$\mathbf{u}_K$ depart from $\mathbf{g}$ because the field is locally distorted by ferrous
+material; distortion is spatially correlated, so two sensors a segment apart see similar fields.
+The accelerometer's depart from gravity because the body accelerates --- and here the mechanism
+is sharper, since once both readings are projected to the shared joint centre both sensors
+measure the specific force at the same physical point, so linear acceleration is exactly
+common-mode and cancels from the relative residual while surviving in full in the absolute one.
+We therefore carry the unprojected accelerometer through the whole analysis as a control.
+
+\paragraph{The irreducible component.}
+Statements 1--4 bound the rotation a residual demands, and a demanded rotation can cancel
+between the two segments. To bound the error that \emph{cannot} be removed we use the angle
+between the accelerometer and magnetometer vectors,
+$\beta = \angle(\mathbf{a}, \mathbf{m})$, which is a rotation invariant: it is measured in the
+sensor's own body frame, so no orientation estimate enters it and none can change it. Writing
+$\beta_J$, $\beta_K$ for the two sensors and $\beta_G = \angle(\mathbf{g}, \mathbf{m}_G)$ for
+the global reference pair, three further statements hold:
+
+\begin{enumerate}\setcounter{enumi}{4}
+  \item \textbf{An invariant mismatch is irreducible, and splits evenly.} For two unit
+    observation pairs whose inter-vector angles differ by $\Delta\beta$, the rotation minimising
+    the summed squared alignment error leaves each vector misaligned by exactly
+    $\Delta\beta/2$, and no rotation does better than $\Delta\beta/2$ on the worse of the two.
+    Hence $\Delta\beta/2$ is a floor on the orientation error, not a bound on one estimator.
+
+  \item \textbf{The floors obey the same triangle inequality}, now on the real line:
+    $|\beta_J - \beta_K| \le |\beta_J - \beta_G| + |\beta_G - \beta_K|$. The relative residual
+    must reconcile $\beta_J$ against $\beta_K$; the absolute residual must reconcile each of them
+    against $\beta_G$. Unlike statements 1--4 this survives translation into a statement about
+    joint angles, because the mismatch cannot be shuffled between the two segments.
+
+  \item \textbf{Both corrupting mechanisms are common-mode across a joint and absent from the
+    reference pair.} A distorted local field tilts $\mathbf{m}$ similarly at both sensors, and
+    after projection to the joint centre linear acceleration tilts $\mathbf{a}$ identically at
+    both, so $\beta_J - \beta_K$ is small while $\beta_J - \beta_G$ and $\beta_K - \beta_G$ are
+    not.
+\end{enumerate}
+
+This component is also the one part of the analysis independent of the marker data: $\beta$ is
+computed from raw body-frame readings, so the residual sensor-to-segment alignment that inflates
+$\theta_{rel}$, $\theta_J$ and $\theta_K$ cannot touch it.
+
+\paragraph{What these quantities are not.}
+They are the orientation error each residual \emph{demands} at the true orientation, not a
+filter's realised error. A real filter sees both fields and a gyroscope prediction and
+distributes the correction across the two segments according to its covariance; to first order at
+equal trust the Kalman update takes the minimum-norm state correction consistent with the
+residual, which is what makes $\theta_{rel}$ attained rather than merely a bound. Three further
+limits are worth stating. First, a single vector measurement leaves rotation about its own
+direction unobserved, so these are the components the measurement constrains and the gyroscope
+carries the rest. Second, the marker-based alignment inflates $\theta_{rel}$ by both segments'
+residual misalignment but each of $\theta_J$, $\theta_K$ by only one, so it biases every measured
+gap \emph{against} the conclusion drawn here and the reported gaps are lower bounds. Third, the
+relative correction is not bounded by $\min(\theta_J, \theta_K)$ and we do not claim it is: if
+one sensor happens to sit on the global field its absolute correction vanishes while
+$\theta_{rel}$ is the other sensor's full deviation. That case occurs on 56\% of magnetometer
+samples and is reported, but it is not an implementable method, since nothing tells a
+per-segment filter which of its two sensors to trust.
+
+\subsection{Results}
+\label{sec:relative-results}
+
+All seven statements held on every one of the $5.70\times10^{7}$ samples across 19 trials, 11
+subjects and 7 joints, in all 917 joint\,$\times$\,field\,$\times$\,reference cells: the worst
+violation of statement~1 was $1.1\times10^{-11}$ deg and of statement~2 $9.4\times10^{-10}$ deg,
+the closed form of Eq.~\eqref{eq:closed-form} was satisfied to $4.2\times10^{-14}$, and $\psi$
+matched the spherical excess of statement~4 to $2.8\times10^{-6}$ deg --- floating-point noise in
+every case, against a tolerance of $10^{-4}$ deg.
+
+The two bounds differ enormously in size, and we report them separately. Across both segments,
+the per-segment route costs a median of $20.5^\circ$ ($\mathrm{IQR}$ $11.9$--$40.9$) for the
+magnetometer and $18.7^\circ$ ($8.5$--$40.0$) for the projected accelerometer, against
+$7.9^\circ$ ($4.4$--$14.8$) and $5.6^\circ$ ($2.5$--$11.9$) for the relative correction: gaps of
+$12.6^\circ$ and $13.1^\circ$ at the median, with the relative correction smaller in 131/131
+trial\,$\times$\,joint cells ($p = 1.5\times10^{-23}$, Wilcoxon). In the \emph{joint angle},
+however, the same comparison gives $7.87^\circ$ versus $7.85^\circ$ and $5.65^\circ$ versus
+$5.61^\circ$ --- gaps of $0.02^\circ$ and $0.04^\circ$. This is a negative result and we report
+it as one: correcting both sensors to a shared global reference produces two orientation errors
+that are largely common-mode and cancel in the joint angle between them.
+Equation~\eqref{eq:closed-form} explains it quantitatively, since for small angles it reduces to
+$\theta_{\mathrm{comp}} \approx \sqrt{\theta_{rel}^2 + \psi^2}$, so the out-of-plane twist adds
+in \emph{quadrature}; with a median $|\psi|$ of $0.23^\circ$ (magnetometer) and $0.20^\circ$
+(accelerometer) against a $\theta_{rel}$ of several degrees, it costs almost nothing. The
+measured excess tracks $|\psi|$ closely (Spearman $\rho = 0.96$ and $0.98$ over the per-cell
+medians) and follows Eq.~\eqref{eq:closed-form} across six orders of magnitude in the excess
+with no fitted parameter (Fig.~\ref{fig:relative-vs-absolute}C). None of this depends on how the global
+reference is chosen: substituting the torso-only field the per-segment baseline actually uses,
+or a per-joint least-squares-optimal constant direction, changes the gap by less than
+$0.02^\circ$.
+
+The joint-angle advantage instead appears in the irreducible component. The acc--mag angle was
+$149.6^\circ$ at the parent sensor and $147.8^\circ$ at the child against $152.8^\circ$ for the
+global reference pair, giving a relative mismatch of $6.9^\circ$ ($3.0$--$14.2$) against absolute
+mismatches of $8.1^\circ$ and $10.3^\circ$. By statement~5 the corresponding floors are
+$3.5^\circ$ ($1.5$--$7.1$) for the relative route and $6.5^\circ$ ($3.4$--$11.7$) for the
+per-segment route: a factor of $1.9$, or $3.1^\circ$ of orientation error that no choice of
+orientation can remove. The relative floor was smaller in all 44 subject\,$\times$\,joint blocks
+(rank-biserial $-1.00$, Holm-corrected Wilcoxon $p < 10^{-4}$; blocked by subject and joint type,
+averaged over side and activity), and the ratio held at every joint, from $1.9\times$ at the
+lumbar joint to $1.6$--$2.2\times$ at the ankles and knees. Removing the joint-centre projection
+raises the relative floor from $3.5^\circ$ to $4.5^\circ$ ($p < 10^{-4}$, rank-biserial $-0.97$)
+while moving the absolute floor only from $6.5^\circ$ to $6.9^\circ$, confirming that pairing the
+sensors \emph{at a common physical point} --- and not merely pairing them --- is what makes the
+relative residual consistent.
+
+% ---------------------------------------------------------------------------------------------
+% Figure caption
+% ---------------------------------------------------------------------------------------------
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{relative_vs_absolute}
+  \caption{\textbf{A relative correction is bounded below a global-reference correction, and its
+    irreducible part is half the size.}
+    \textbf{(A)} The geometry. The two world-frame measurement directions $\mathbf{u}_J$,
+    $\mathbf{u}_K$ and the global reference $\mathbf{m}_G$ form a spherical triangle whose area
+    is $\psi$; Eq.~\eqref{eq:closed-form} makes the per-segment route's excess an exact function
+    of $\psi$, which vanishes when $\mathbf{m}_G$ lies on the great circle through the two
+    measurements (dashed). Angles are exaggerated for legibility.
+    \textbf{(B)} Both bounds against the identity line. The joint-angle bound
+    ($\theta_{\mathrm{comp}}$) is tight --- the two per-segment errors are common-mode and cancel
+    --- while the both-segments bound ($\theta_J + \theta_K$) is not.
+    \textbf{(C)} The measured excess against the out-of-plane twist, in bands of $\theta_{rel}$,
+    with Eq.~\eqref{eq:closed-form} overlaid (dashed, no fitted parameters).
+    \textbf{(D,\,E)} Correction angles by joint for the magnetometer and for the accelerometer
+    after projection to the joint centre: the same geometry driven by field distortion and by
+    rigid-body kinematics respectively.
+    \textbf{(F)} Pooled distributions; $\theta_{rel}$ and $\theta_{\mathrm{comp}}$ coincide.
+    \textbf{(G)} The irreducible floors by joint, half the acc--mag angle mismatch, with the
+    unprojected control (open triangles).
+    \textbf{(H)} The same per subject\,$\times$\,joint cell against the identity line.
+    \textbf{(I)} One trial at full rate through its busiest window: the two per-segment angles
+    rise and fall together with each stride. Boxes show the IQR with p5--p95 whiskers.
+    Panels B--H pool $4.9\times10^{6}$ stored samples from 19 trials, 11 subjects and 7 joints;
+    ground-truth orientations are from markers and no filter is run.}
+  \label{fig:relative-vs-absolute}
+\end{figure}

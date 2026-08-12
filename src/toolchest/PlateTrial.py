@@ -71,6 +71,24 @@ class PlateTrial:
         """Returns the number of samples (timesteps) in the trial."""
         return len(self.imu_trace)
 
+    @property
+    def valid(self) -> np.ndarray:
+        """Per-frame boolean: is this sample usable as GROUND TRUTH?
+
+        False where the marker reconstruction interpolated a pose or left a corrupt one
+        in place (see WorldTrace.repair_reconstruction_glitches). The arrays themselves are
+        never gapped — a filter still runs straight through these frames, because the
+        uniform time grid is what makes its integration and every finite difference in this
+        repo well defined. The mask is what keeps a manufactured pose out of the error
+        statistics computed against it.
+
+        Delegates to the world trace because ground-truth validity is a mocap property. If
+        IMU-side validity is ever needed — the IMoVE BioStamp data has a saturated
+        accelerometer channel and dropped-sample logs — this is where the two would be
+        AND-ed, and every consumer of `plate.valid` would pick it up unchanged.
+        """
+        return self.world_trace.valid
+
     def __getitem__(self, key: slice) -> 'PlateTrial':
         """
         Enables slicing of the PlateTrial object.
@@ -128,9 +146,12 @@ class PlateTrial:
         #    new_R_world = old_R_world @ R_wt_it
         world_rots_np = self.world_trace.rotations
         new_world_rotations = np.matmul(world_rots_np, R_wt_it)
-        
+
         # 4. Create a new WorldTrace and PlateTrial with the aligned data.
-        new_world_trace = WorldTrace(self.world_trace.timestamps, self.world_trace.positions, new_world_rotations)
+        #    The validity mask carries through unchanged: applying a constant rotation to
+        #    every frame cannot make a corrupt pose trustworthy or the reverse.
+        new_world_trace = WorldTrace(self.world_trace.timestamps, self.world_trace.positions,
+                                     new_world_rotations, valid=self.world_trace.valid)
         return PlateTrial(self.name, self.imu_trace, new_world_trace)
 
     def project_imu_trace(self, local_offset: np.ndarray) -> IMUTrace:

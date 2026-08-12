@@ -61,6 +61,7 @@ JOINT_ANGLES_DIR = RESULTS_DIR / "joint_angles"
 STATISTICS_DIR = RESULTS_DIR / "statistics"
 PER_SUBJECT_STATS_DIR = STATISTICS_DIR / "per_subject"
 EXPERIMENTS_DIR = RESULTS_DIR / "experiments"
+TRIALS_DIR = RESULTS_DIR / "trials"
 
 
 def _reject_if_under_data(path: Path) -> Path:
@@ -87,6 +88,27 @@ def ensure_parent(path: Path) -> Path:
 def raw_trial_dir(subject: str, activity: str) -> Path:
     """Source data folder for one subject/activity: IMU .txt files, the .trc, etc."""
     return DATA_DIR / f"Subject{subject}" / activity
+
+# ==============================================================================
+# Outputs: cached trials
+# ==============================================================================
+
+def cached_trial_path(dataset: str, subject: str, trial: str) -> Path:
+    """One trial's fully-loaded PlateTrials, cached as a flat table.
+
+    Materializes the expensive half of loading: marker reconstruction, IMU/mocap
+    cross-correlation sync and sensor-to-segment alignment. Parsing the source files
+    is the cheap part (a 184 MB CSV reads in 0.7 s); it is these derived steps that
+    cost seconds per trial, and — more importantly — they are *decisions* that are
+    otherwise recomputed silently on every run and never written down. The sidecar
+    manifest is what makes them auditable.
+
+    `subject` and `trial` are taken verbatim rather than templated, because the
+    datasets disagree on how a subject is named: this repo's own tree uses
+    'Subject01', IMoVE's motion-capture half uses 's13l'. `dataset` is the namespace
+    that keeps them from colliding — the source trees both contain a 'Subject01'.
+    """
+    return TRIALS_DIR / dataset / subject / f"{trial}.parquet"
 
 # ==============================================================================
 # Outputs: joint angles

@@ -236,7 +236,7 @@ def repair_reconstruction_glitches(
     rotations: np.ndarray,
     timestamps: np.ndarray,
     name: str = None,
-) -> Tuple[np.ndarray, np.ndarray, dict]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Repairs non-physical marker-plate reconstruction failures.
 
     Two distinct faults, which need different fixes and are easy to conflate:
@@ -259,24 +259,59 @@ def repair_reconstruction_glitches(
     transition frames get their position replaced: a swap leaves the marker centroid
     unchanged, so a flipped block's positions are already correct.
 
-    Returns (positions, rotations, report) where report counts 'flipped', 'interpolated'
-    and 'unresolved' frames. Callers should surface a nonzero report — a silent repair
-    would hide a marker-labelling problem that is a real property of the .trc.
+    Returns (positions, rotations, valid, report).
+
+    `report` counts 'flipped', 'interpolated' and 'unresolved' frames. Callers should
+    surface a nonzero report — a silent repair would hide a marker-labelling problem that
+    is a real property of the .trc.
+
+    `valid` is a per-frame boolean: False wherever this function did not leave a MEASURED
+    pose behind. Two cases, and note that they are the two the repair could not fully fix:
+
+      * Interpolated transition frames. SLERP output is plausible, not observed. Using it
+        as ground truth scores a filter against a guess.
+      * Unresolved gaps. Left deliberately corrupt, because inventing a pose there would
+        be worse than admitting the failure.
+
+    Un-flipped frames stay VALID. A swap is a labelling error the repair genuinely undoes;
+    the resulting pose is the measured one, correctly labelled.
+
+    The mask is what separates the interval a filter RUNS over from the interval it is
+    SCORED over. Interpolation exists to keep the uniform time grid every finite-difference
+    in this repo assumes, so those frames must stay in the array — the mask is how they
+    stay out of the error statistics.
+
+    WHAT THIS MASK DOES NOT CATCH. It is built from angular SPEED (see
+    MAX_RECONSTRUCTION_ANGULAR_SPEED_DEG_S), so it only sees faults that make the pose jump.
+    A marker COLLISION — two labels resolving to one detected point — does not: the merged
+    point lands near a centroid, roughly 23 mm from the marker's true location, which yields
+    a pose that is wrong but perfectly smooth. Subject06/walking pelvis frames 58486-58497
+    are such a window, and they peak at 1460 deg/s against this function's 3000 deg/s
+    threshold, so nothing here fires and those frames come back marked valid.
+    Catching them needs the other detector — marker-to-marker distance violation, as in
+    _reconstruct_from_markers' fault isolation — fed in as a second input to this mask. Note
+    that detector must be thresholded above the dataset's own noise floor: pairwise deviation
+    reaches 14.87 mm at p99.99, so a 10 mm gate flags ~17,600 frames, of which the
+    overwhelming majority are single-marker displacements the existing 3-marker path already
+    reconstructs correctly (median pose error 1.00 deg).
     """
     empty = {'flipped': 0, 'interpolated': 0, 'unresolved': 0}
+    all_valid = np.ones(len(rotations), dtype=bool)
     if len(rotations) < 3:
-        return positions, rotations, empty
+        return positions, rotations, all_valid, empty
 
     rotations = np.asarray(rotations, dtype=np.float64)
     offending, _ = _offending_steps(rotations, timestamps)
     if not np.any(offending):
-        return positions, rotations, empty
+        return positions, rotations, all_valid, empty
 
     bad = _transition_mask(offending, len(rotations))
     if bad.all():
         print(f"Warning: {name or 'segment'} looks corrupt in every frame; leaving it "
               f"untouched rather than interpolating from nothing.")
-        return positions, rotations, empty
+        # Every frame is suspect, but the caller gets the data untouched and a mask that
+        # says so, rather than a silently empty repair report.
+        return positions, rotations, ~bad, empty
 
     # 1. Un-flip sustained swaps, then re-detect: the surviving discontinuities are the
     #    genuine transitions, and the flips no longer masquerade as them.
@@ -286,8 +321,15 @@ def repair_reconstruction_glitches(
 
     # 2. Withhold the unexplained gaps from interpolation, so a genuine reconstruction
     #    failure stays visible instead of being smoothed into plausible-looking invention.
+    #    Those frames keep their corrupt poses, so they are the other half of the mask.
+    unresolved_frames = np.zeros(len(rotations), dtype=bool)
     for last_good, next_good in unexplained:
         bad[last_good + 1:next_good] = False
+        unresolved_frames[last_good + 1:next_good] = True
+
+    # `bad` is now exactly the set that will be interpolated below, so the mask can be
+    # built here and is correct on both the early return and the repaired path.
+    valid = ~(bad | unresolved_frames)
 
     report = {'flipped': n_flipped, 'interpolated': int(bad.sum()),
               'unresolved': len(unexplained)}
@@ -297,13 +339,15 @@ def repair_reconstruction_glitches(
               f"This segment is corrupt around frames "
               f"{[gap[0] for gap in unexplained[:5]]}; treat any joint using it with suspicion.")
     if not np.any(bad):
-        return positions, rotations, report
+        return positions, rotations, valid, report
 
     good_idx = np.flatnonzero(~bad)
     if len(good_idx) < 2:
         print(f"Warning: {name or 'segment'} has too few clean frames to interpolate from.")
         report['interpolated'] = 0
-        return positions, rotations, report
+        # Nothing was interpolated, so those frames keep their original poses. They are
+        # still transition frames, so they are still not trustworthy ground truth.
+        return positions, rotations, valid, report
 
     # Only here, once a repair is known to be needed, is a Rotation object built — the
     # common clean case above stays pure numpy.
@@ -319,7 +363,7 @@ def repair_reconstruction_glitches(
         repaired_positions[bad, axis] = np.interp(
             query, timestamps[good_idx], np.asarray(positions)[good_idx, axis])
 
-    return repaired_positions, repaired_rotations, report
+    return repaired_positions, repaired_rotations, valid, report
 
 
 def _reconstruct_from_markers(
@@ -377,10 +421,29 @@ class WorldTrace:
     Or, it can generate a synthetic trace by finite differencing the world frames over time.
     """
 
-    def __init__(self, timestamps: np.ndarray, positions: Union[List[np.ndarray], np.ndarray], rotations: Union[List[np.ndarray], np.ndarray]):
+    def __init__(self, timestamps: np.ndarray, positions: Union[List[np.ndarray], np.ndarray],
+                 rotations: Union[List[np.ndarray], np.ndarray],
+                 valid: Union[List[bool], np.ndarray, None] = None):
+        """`valid` marks, per frame, whether this pose is trustworthy GROUND TRUTH.
+
+        Defaults to all-True, so every existing caller keeps its current meaning: a trace
+        built by hand or from a synthetic generator is valid throughout. `from_trc` sets it
+        from the marker-reconstruction repair (see repair_reconstruction_glitches), which is
+        the only place in this repo that knows a pose was interpolated or left corrupt.
+
+        The mask never affects the arrays. Poses stay on a uniform time grid because
+        resampling, filtering and every finite-difference angular velocity here assume one;
+        `valid` is how a frame is excluded from ERROR STATISTICS without being excluded from
+        the signal a filter integrates through.
+        """
         self.timestamps = timestamps
         self.positions = np.asarray(positions)
         self.rotations = np.asarray(rotations)
+        self.valid = (np.ones(len(timestamps), dtype=bool) if valid is None
+                      else np.asarray(valid, dtype=bool))
+        if len(self.valid) != len(timestamps):
+            raise ValueError(f"valid has length {len(self.valid)} but the trace has "
+                             f"{len(timestamps)} frames.")
 
     def __len__(self):
         """
@@ -396,8 +459,10 @@ class WorldTrace:
             raise ValueError(f"WorldTraces must have the same length to subtract them. Got self {len(self)} and other {len(other)}.")
         assert np.array_equal(self.timestamps[0],
                               other.timestamps[0]), "WorldTraces must have the same start time to subtract them."
+        # A difference is only trustworthy where BOTH operands are.
         return WorldTrace(self.timestamps, self.positions - other.positions,
-                          np.matmul(self.rotations, other.rotations.transpose(0, 2, 1)))
+                          np.matmul(self.rotations, other.rotations.transpose(0, 2, 1)),
+                          valid=self.valid & other.valid)
 
     def __getitem__(self, key) -> 'WorldTrace':
         """
@@ -407,10 +472,12 @@ class WorldTrace:
         """
         if isinstance(key, slice):
             # If key is a slice object, return a new WorldTrace instance with the sliced items
-            return WorldTrace(self.timestamps[key], self.positions[key], self.rotations[key])
+            return WorldTrace(self.timestamps[key], self.positions[key], self.rotations[key],
+                              valid=self.valid[key])
         else:
             # If key is an integer, return the corresponding item as a length 1 trace
-            return WorldTrace(np.array([self.timestamps[key]]), self.positions[key:key+1], self.rotations[key:key+1])
+            return WorldTrace(np.array([self.timestamps[key]]), self.positions[key:key+1],
+                              self.rotations[key:key+1], valid=self.valid[key:key+1])
 
     def __eq__(self, other):
         """
@@ -466,15 +533,16 @@ class WorldTrace:
             positions, rotations = _reconstruct_from_markers(
                 o_loc, d_loc, x_loc, y_loc, threshold=2.0
             )
-            positions, rotations, report = repair_reconstruction_glitches(
+            positions, rotations, valid, report = repair_reconstruction_glitches(
                 positions, rotations, timestamps, name=clean_name)
             if any(report.values()):
                 print(f"Warning: {trc_path.name}/{clean_name}: marker reconstruction repaired "
                       f"({report['flipped']} frame(s) un-flipped from swapped marker labels, "
                       f"{report['interpolated']} transition frame(s) interpolated, "
                       f"{report['unresolved']} discontinuity(ies) not attributable to a swap) "
-                      f"— see repair_reconstruction_glitches.")
-            world_traces[clean_name] = WorldTrace(timestamps, positions, rotations)
+                      f"— {int((~valid).sum())} frame(s) marked invalid; "
+                      f"see repair_reconstruction_glitches.")
+            world_traces[clean_name] = WorldTrace(timestamps, positions, rotations, valid=valid)
         return world_traces
 
     def transform(self, rotate: np.ndarray = np.eye(3), translate: np.ndarray = np.zeros(3)) -> 'WorldTrace':
@@ -483,7 +551,8 @@ class WorldTrace:
         """
         return WorldTrace(self.timestamps,
                           np.einsum('ij,nj->ni', rotate, self.positions) + translate,
-                          np.matmul(rotate, self.rotations))
+                          np.matmul(rotate, self.rotations),
+                          valid=self.valid)
 
     def allclose(self, other, atol=1e-6):
         """
@@ -507,7 +576,8 @@ class WorldTrace:
         return WorldTrace(
             self.timestamps.copy(),
             self.positions.copy(),
-            self.rotations.copy()
+            self.rotations.copy(),
+            valid=self.valid.copy()
         )
     
     def resample(self, new_frequency: float) -> 'WorldTrace':
@@ -574,8 +644,15 @@ class WorldTrace:
         # Convert interpolated Rotation objects back to an array of 3x3 matrices
         new_rotations = new_rotations_obj.as_matrix().copy()
 
-        # 4. Return the new WorldTrace
-        return WorldTrace(new_timestamps, new_positions, new_rotations)
+        # 4. Carry the validity mask across, conservatively.
+        # A resampled frame is interpolated from its two neighbours, so it inherits any
+        # invalidity from either. np.interp over the mask as floats gives a nonzero value
+        # wherever an invalid frame contributed at all; requiring 1.0 to stay valid is the
+        # conservative reading, and it also keeps invalid RUNS from shrinking at the edges.
+        valid_weight = np.interp(new_timestamps, original_timestamps, self.valid.astype(np.float64))
+        new_valid = valid_weight >= 1.0
+
+        return WorldTrace(new_timestamps, new_positions, new_rotations, valid=new_valid)
 
     def finite_difference_world_frame_accelerations(self, acc_from_gravity: np.ndarray = np.zeros(3)) -> np.ndarray:
         """
@@ -610,7 +687,8 @@ class WorldTrace:
         """
         Start timestamps at 0
         """
-        return WorldTrace(self.timestamps - self.timestamps[0], self.positions, self.rotations)
+        return WorldTrace(self.timestamps - self.timestamps[0], self.positions, self.rotations,
+                          valid=self.valid)
         
     @staticmethod
     def generate_random_world_trace(duration: float = 10.0, fs: float = 100.0) -> 'WorldTrace':
@@ -663,7 +741,12 @@ class WorldTrace:
         angle_axis = Rotation.from_matrix(self.rotations).as_rotvec()
         angle_axis = filtfilt(b, a, angle_axis, axis=0)
         rotations = Rotation.from_rotvec(angle_axis).as_matrix()
-        return WorldTrace(self.timestamps, positions, rotations)
+        # filtfilt is non-causal and spreads every sample over the filter's support, so an
+        # invalid frame contaminates its neighbours. The mask is carried unchanged rather
+        # than dilated: widening it would need the filter's effective support, which varies
+        # with order and cutoff, and the caller who low-passes a trace with invalid frames
+        # in it has a bigger problem than the mask's exact width.
+        return WorldTrace(self.timestamps, positions, rotations, valid=self.valid)
 
     def get_rotation_errors_deg(self, other_trace: 'WorldTrace') -> np.ndarray:
         """

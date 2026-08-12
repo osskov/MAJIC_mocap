@@ -59,7 +59,7 @@ VARIANT = "normalized_benchmark"
 # The re-tuned noise model. These are absolute stds handed to RelativeFilter unchanged,
 # and the measurements they weight are UNIT LENGTH here, so they are not comparable to the
 # DEFAULT_*_STD constants without accounting for that (see the module docstring).
-TUNED_STDS = {'gyro_std': 0.0045, 'acc_std': 0.0036, 'mag_std': 0.0042}
+TUNED_STDS = {'gyro_std': 0.0045, 'acc_std': 0.0036, 'mag_std': 0.02}
 
 # The benchmark's four IMU arms plus the ground truth, each spelled '_normalized' rather
 # than left to its base default. Spelling it out matters for the EKF, whose base already

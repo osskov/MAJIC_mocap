@@ -11,23 +11,28 @@ generated artifact lands under `results/`, with a provenance manifest sidecar.
 import os
 from pathlib import Path
 os.environ["DISABLE_TQDM"] = "True"
+import hashlib
 import re
 import time
 import multiprocessing
+from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
+from scipy.signal import butter, filtfilt
 from scipy.spatial.transform import Rotation
 from rich.live import Live
 from rich.table import Table
 
 import paths
-from paths import DATA_DIR, RESULTS_DIR, raw_trial_dir, ensure_parent, write_manifest
+from paths import (DATA_DIR, RESULTS_DIR, raw_trial_dir, ensure_parent, write_manifest,
+                   read_manifest)
 from src.toolchest.IMUTrace import IMUTrace
 from src.toolchest.PlateTrial import PlateTrial
 from src.toolchest.WorldTrace import WorldTrace
+from src.toolchest import trial_io
 from src.RelativeFilterPlus import RelativeFilter
 
 # ==============================================================================
@@ -246,11 +251,259 @@ def resolve_method_spec(method: str) -> Dict[str, Any]:
     return spec
 
 # ==============================================================================
+# Trial cache
+# ==============================================================================
+# Loading a trial from source costs ~8 s: ~2 s parsing the Xsens .txts, ~3 s parsing
+# and reconstructing the .trc's marker plates, ~3 s on cross-correlation sync and
+# sensor-to-segment alignment. The parsing is not the interesting part — the derived
+# steps are, because they are DECISIONS (which lag, which marker was faulty, which
+# blocks were half-turn-flipped) that the pipeline currently makes silently on every
+# run and never records.
+#
+# Caching the finished PlateTrials fixes both: runs get faster, and the decisions
+# land in a manifest you can inspect, diff and — once the many-to-one IMoVE trials
+# arrive, where a 2.6 h IMU record has to be matched against ~27 mocap trials — correct
+# by hand instead of re-deriving from scratch every time.
+
+# Namespace for this repo's own source tree, from Al Borno et al. (2022). The IMoVE
+# trees will add their own; the namespace exists because both contain a 'Subject01'.
+TRIAL_DATASET = 'alborno'
+
+# Toolchest modules whose code determines the CONTENT of a cached trial. Their bytes
+# are hashed into the cache key, so editing any of them invalidates every artifact.
+#
+# Hashing whole files is deliberately blunt — a docstring edit invalidates the cache
+# just as a threshold change does. The precise alternative (enumerate the constants
+# that matter: _reconstruct_from_markers' fault threshold, MAX_RECONSTRUCTION_ANGULAR_
+# SPEED_DEG_S, GLITCH_DILATION_FRAMES, MAX_FLIP_SNAP_RESIDUAL_DEG, the sync and
+# resample logic) fails open: someone adds a constant, forgets to list it here, and
+# every downstream result is quietly computed from stale inputs. Blunt-and-safe wins
+# because a rebuild is 8 s per trial and a silently stale cache is a retracted figure.
+_CONTENT_MODULES = ('PlateTrial.py', 'WorldTrace.py', 'IMUTrace.py',
+                    'gyro_utils.py', 'finite_difference_utils.py')
+
+# Cutoff for the alignment-residual diagnostic below.
+_RESIDUAL_LOWPASS_HZ = 10.0
+
+
+@lru_cache(maxsize=1)
+def _toolchest_digest() -> str:
+    """SHA-256 over the toolchest modules that produce a cached trial's contents."""
+    digest = hashlib.sha256()
+    toolchest = Path(__file__).resolve().parent.parent / 'src' / 'toolchest'
+    for name in sorted(_CONTENT_MODULES):
+        digest.update(name.encode())
+        digest.update((toolchest / name).read_bytes())
+    return digest.hexdigest()[:16]
+
+
+# The files a trial load actually reads, as globs relative to the trial folder. These
+# mirror IMUTrace.from_folder (the 'imu data' subdirectory, or the folder itself when
+# that is absent) and PlateTrial.from_folder (the .trc).
+#
+# Deliberately narrower than "everything under the folder": the trial directories also
+# hold a 66 MB .mtb (the raw Xsens binary, never parsed) and a 'madgwick (al borno)/'
+# subdirectory of third-party outputs whose filenames COLLIDE with the real IMU ones.
+# Keying on those would invalidate every cache entry whenever an unrelated file moved.
+#
+# Narrowing is safe here in a way it was not for the constants above, because the fail
+# case is covered from the other side: if the loader ever starts reading a new file,
+# that is a change to IMUTrace.py or PlateTrial.py, and the toolchest digest invalidates
+# everything on its own.
+_SOURCE_GLOBS = ('*.trc', 'imu data/*.txt', '*.txt')
+
+
+def _source_inventory(folder: Path) -> List[Dict[str, Any]]:
+    """Names and byte counts of the files a trial load reads, sorted.
+
+    Sizes rather than content hashes: `data/` is declared read-only (see paths.py), so
+    the realistic failure is a file being replaced or a re-download landing a different
+    trial, both of which change the size. Hashing 76 MB of .trc on every cache check
+    would buy protection against an edit the repo's own rules forbid.
+    """
+    found = {p for glob in _SOURCE_GLOBS for p in folder.glob(glob)}
+    return [{'name': str(p.relative_to(folder)), 'bytes': p.stat().st_size}
+            for p in sorted(found) if p.is_file() and not p.name.startswith('.')]
+
+
+def trial_cache_key(subject: str, activity: str, align: bool) -> Dict[str, Any]:
+    """Everything that determines a cached trial's contents.
+
+    Compared field-by-field against the stored manifest on load; any difference is a
+    cache miss. Note `align` is in here because `PlateTrial.from_folder`'s
+    align_plate_trials flag changes every rotation in the file.
+    """
+    return {
+        'schema_version': trial_io.SCHEMA_VERSION,
+        'toolchest_digest': _toolchest_digest(),
+        'align_plate_trials': align,
+        'sources': _source_inventory(raw_trial_dir(subject, activity)),
+    }
+
+
+def _alignment_residuals(plate: PlateTrial) -> Dict[str, float]:
+    """How well a plate's measured gyro matches the one implied by its mocap rotations.
+
+    This is the number to triage on: after `_align_world_trace_to_imu_trace` the two
+    should agree, and a plate where they do not has a bad sync lag, a bad alignment, or
+    corrupt marker reconstruction underneath it.
+
+    Reported both raw and low-passed, because the raw figure is misleading on its own.
+    The mocap-derived gyro comes from finite-differencing rotations, which amplifies
+    marker noise at high frequency: on Subject01/walking the raw residual is 35-78 deg/s
+    against a signal of 55-161 deg/s, but 8-14 deg/s below 10 Hz. The raw number is
+    differentiation noise; the low-passed one is alignment quality.
+    """
+    measured = np.asarray(plate.imu_trace.gyro, dtype=np.float64)
+    implied = plate.world_trace.calculate_imu_trace(skip_lin_acc=True).gyro
+    residual = measured - implied
+
+    # Scored over valid frames only. An interpolated or corrupt pose has no measured
+    # gyro to disagree with, so including it reports reconstruction damage as though it
+    # were misalignment — which is the confusion this diagnostic exists to avoid.
+    # Filtering still runs on the FULL trace: filtfilt needs the uniform grid, and
+    # dropping frames first would splice unrelated motion together at the seam.
+    valid = plate.valid
+
+    def rms(v: np.ndarray) -> float:
+        scored = v[valid]
+        if not len(scored):
+            return float('nan')
+        return float(np.degrees(np.sqrt((np.linalg.norm(scored, axis=1) ** 2).mean())))
+
+    out = {'gyro_residual_raw_rms_deg_s': rms(residual),
+           'n_invalid_frames': int((~valid).sum())}
+
+    fs = float(plate.imu_trace.get_sample_frequency())
+    cutoff = min(_RESIDUAL_LOWPASS_HZ, 0.4 * fs / 2.0)
+    # filtfilt's default padlen is 3 * max(len(a), len(b)); a trace shorter than that
+    # raises rather than returning something approximate.
+    if fs > 0 and len(plate) > 30:
+        b, a = butter(4, cutoff / (fs / 2.0), btype='low')
+        out['gyro_residual_lowpass_rms_deg_s'] = rms(filtfilt(b, a, residual, axis=0))
+        out['residual_lowpass_hz'] = cutoff
+    return out
+
+
+def trial_diagnostics(plates: Dict[str, PlateTrial]) -> Dict[str, Any]:
+    """Per-trial and per-plate quality numbers, recorded in the cache manifest.
+
+    The point is triage at scale: with 22 trials you notice a bad one by eye, with the
+    660-odd IMoVE adds. Having these in the manifests means a bad sync is a query over
+    sidecars rather than a filter run that produces nonsense.
+    """
+    any_plate = next(iter(plates.values()))
+    per_plate = {}
+    for name in sorted(plates):
+        plate = plates[name]
+        per_plate[name] = {
+            'n_frames': len(plate),
+            'acc_norm_median': float(np.median(np.linalg.norm(plate.imu_trace.acc, axis=1))),
+            'mag_norm_median': float(np.median(np.linalg.norm(plate.imu_trace.mag, axis=1))),
+            **_alignment_residuals(plate),
+        }
+    return {
+        'n_plates': len(plates),
+        'n_frames': len(any_plate),
+        'duration_s': float(any_plate.imu_trace.timestamps[-1] - any_plate.imu_trace.timestamps[0]),
+        'sample_rate_hz': float(any_plate.imu_trace.get_sample_frequency()),
+        'world_frame_gravity': measure_world_frame_gravity(plates).tolist(),
+        # Frames invalid on ANY plate: a joint angle needs two plates, so one bad plate
+        # takes the whole frame out of every joint it participates in.
+        'n_invalid_frames_any_plate': int(sum(
+            ~np.logical_and.reduce([p.valid for p in plates.values()]))),
+        'plates': per_plate,
+    }
+
+
+def save_cached_trial(plates: Dict[str, PlateTrial], subject: str, activity: str,
+                      align: bool = True, dataset: str = TRIAL_DATASET) -> Path:
+    """Writes a trial's PlateTrials plus the manifest that validates them on load."""
+    path = ensure_parent(paths.cached_trial_path(dataset, f"Subject{subject}", activity))
+    trial_io.plates_to_frame(plates).to_parquet(path, engine='pyarrow', index=False)
+    write_manifest(
+        path,
+        cache_key=trial_cache_key(subject, activity, align),
+        dataset=dataset, subject=f"Subject{subject}", activity=activity,
+        source=str(raw_trial_dir(subject, activity).relative_to(paths.REPO_ROOT)),
+        diagnostics=trial_diagnostics(plates),
+    )
+    return path
+
+
+def cached_trial_status(subject: str, activity: str, align: bool = True,
+                        dataset: str = TRIAL_DATASET) -> Tuple[str, Optional[str]]:
+    """(status, reason) for one trial's cache entry, without loading the parquet.
+
+    status is one of:
+      'fresh'   — usable as-is
+      'missing' — nothing cached yet
+      'stale'   — cached, but built from different inputs or code; reason names the field
+      'absent'  — the SOURCE trial does not exist, so there is nothing to cache
+
+    'absent' is separate from 'missing' because SUBJECTS x ACTIVITIES is a full cross
+    product and the dataset is not: Subjects 05, 08 and 10 have no complexTasks trial.
+    Reporting those as failures buries the real ones in expected noise.
+
+    Split out from `load_cached_trial` so `cache_trials.py --check` can audit the tree
+    cheaply, and so a stale entry reports WHICH input moved rather than just rebuilding.
+    """
+    folder = raw_trial_dir(subject, activity)
+    if not folder.is_dir() or not _source_inventory(folder):
+        return 'absent', f'no source trial at {folder.relative_to(paths.REPO_ROOT)}'
+
+    path = paths.cached_trial_path(dataset, f"Subject{subject}", activity)
+    if not path.exists():
+        return 'missing', None
+
+    manifest = read_manifest(path)
+    if manifest is None:
+        return 'stale', 'no manifest sidecar'
+
+    stored = manifest.get('cache_key')
+    if stored is None:
+        return 'stale', 'manifest predates cache_key'
+
+    expected = trial_cache_key(subject, activity, align)
+    for field, want in expected.items():
+        if stored.get(field) != want:
+            if field == 'sources':
+                return 'stale', 'source files changed'
+            return 'stale', f'{field}: cached {stored.get(field)!r} != current {want!r}'
+    return 'fresh', None
+
+
+def load_cached_trial(subject: str, activity: str, align: bool = True,
+                      dataset: str = TRIAL_DATASET) -> Optional[Dict[str, PlateTrial]]:
+    """The cached trial if it is still valid, else None.
+
+    Staleness is a miss, never a silent hit: the caller falls back to loading from
+    source, so a stale cache costs time and never correctness.
+    """
+    status, reason = cached_trial_status(subject, activity, align, dataset)
+    if status != 'fresh':
+        if status == 'stale' and os.environ.get("DISABLE_TQDM") != "True":
+            print(f"Trial cache stale for Subject{subject}/{activity} ({reason}); loading from source.")
+        return None
+    path = paths.cached_trial_path(dataset, f"Subject{subject}", activity)
+    return trial_io.plates_from_frame(pd.read_parquet(path, engine='pyarrow'))
+
+# ==============================================================================
 # Raw data loading
 # ==============================================================================
 
-def load_raw_data(subject: str, activity: str) -> Dict[str, PlateTrial]:
-    return PlateTrial.from_folder(raw_trial_dir(subject, activity))
+def load_raw_data(subject: str, activity: str, use_cache: bool = True,
+                  align: bool = True) -> Dict[str, PlateTrial]:
+    """A trial's PlateTrials, from the cache when it is valid and from source otherwise.
+
+    Transparent by design: a missing or stale cache changes how long this takes and
+    nothing else. Populate the cache with `python -m experiments.cache_trials`.
+    """
+    if use_cache:
+        plates = load_cached_trial(subject, activity, align=align)
+        if plates is not None:
+            return plates
+    return PlateTrial.from_folder(raw_trial_dir(subject, activity), align_plate_trials=align)
 
 # ==============================================================================
 # Gravity convention check

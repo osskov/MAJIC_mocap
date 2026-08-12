@@ -289,7 +289,7 @@ class TestWorldTrace(unittest.TestCase):
                            "fixture is not reproducing the 180 deg flip it is meant to")
         self.assertLess(flip_deg[:30].max(), 1e-6)
 
-        positions, rotations, report = repair_reconstruction_glitches(
+        positions, rotations, valid, report = repair_reconstruction_glitches(
             expected_positions.copy(), glitched, timestamps, name='femur_l')
 
         self.assertGreaterEqual(report['flipped'] + report['interpolated'], 4)
@@ -316,7 +316,7 @@ class TestWorldTrace(unittest.TestCase):
         corrupted = expected_rotations.copy()
         corrupted[flipped_block] = corrupted[flipped_block] @ np.diag([-1.0, 1.0, -1.0])
 
-        positions, rotations, report = repair_reconstruction_glitches(
+        positions, rotations, valid, report = repair_reconstruction_glitches(
             expected_positions.copy(), corrupted, timestamps, name='femur_l')
 
         self.assertGreater(report['flipped'], 200,
@@ -341,7 +341,7 @@ class TestWorldTrace(unittest.TestCase):
         # 70 deg is far past the speed limit but nowhere near a half turn.
         rotations[100:] = rotations[100:] @ Rotation.from_euler('y', 70.0, degrees=True).as_matrix()
 
-        _, _, report = repair_reconstruction_glitches(positions, rotations, timestamps)
+        _, _, valid, report = repair_reconstruction_glitches(positions, rotations, timestamps)
 
         self.assertEqual(report['flipped'], 0)
         self.assertEqual(report['unresolved'], 1)
@@ -355,7 +355,7 @@ class TestWorldTrace(unittest.TestCase):
             timestamps[:, None] * np.deg2rad(600.0) * np.array([0.0, 1.0, 0.0])).as_matrix()
         positions = np.random.rand(num_samples, 3)
 
-        out_positions, out_rotations, report = repair_reconstruction_glitches(
+        out_positions, out_rotations, valid, report = repair_reconstruction_glitches(
             positions, rotations, timestamps)
 
         self.assertEqual(report, {'flipped': 0, 'interpolated': 0, 'unresolved': 0})
@@ -439,6 +439,182 @@ class TestWorldTrace(unittest.TestCase):
         np.testing.assert_array_almost_equal(estimated_parent, offset_parent)
         np.testing.assert_array_almost_equal(estimated_child, offset_child)
         np.testing.assert_array_almost_equal(error, np.zeros((num_samples, 3)))
+
+
+class TestValidityMask(unittest.TestCase):
+    """The mask says which frames are trustworthy GROUND TRUTH.
+
+    Its whole job is to keep repaired frames on the uniform time grid (so filters and
+    finite differences still work) while keeping them out of error statistics.
+    """
+
+    @staticmethod
+    def _clean(num_samples=200, rate=100.0):
+        timestamps = np.arange(num_samples) / rate
+        rotations = Rotation.from_rotvec(
+            np.linspace(0.0, 0.4, num_samples)[:, None] * np.array([0.0, 0.0, 1.0])).as_matrix()
+        positions = np.tile(np.array([0.0, 1.0, 0.0]), (num_samples, 1))
+        return positions, rotations, timestamps
+
+    def test_defaults_to_all_valid(self):
+        """Every trace built by hand or by a generator is valid throughout."""
+        positions, rotations, timestamps = self._clean()
+        self.assertTrue(WorldTrace(timestamps, positions, rotations).valid.all())
+
+    def test_length_mismatch_raises(self):
+        positions, rotations, timestamps = self._clean(num_samples=50)
+        with self.assertRaises(ValueError):
+            WorldTrace(timestamps, positions, rotations, valid=np.ones(49, dtype=bool))
+
+    def test_clean_data_is_fully_valid(self):
+        positions, rotations, timestamps = self._clean()
+        _, _, valid, report = repair_reconstruction_glitches(positions, rotations, timestamps)
+        self.assertEqual(report, {'flipped': 0, 'interpolated': 0, 'unresolved': 0})
+        self.assertTrue(valid.all())
+
+    def test_interpolated_frames_are_invalid(self):
+        """A SLERP'd pose is plausible, not measured; it must not score a filter."""
+        positions, rotations, timestamps = self._clean()
+        # A 3-frame burst: large enough to trip the speed limit, small enough to be a
+        # transition rather than a sustained swap.
+        rotations[100:103] = rotations[100:103] @ Rotation.from_euler(
+            'y', 40.0, degrees=True).as_matrix()
+
+        _, _, valid, report = repair_reconstruction_glitches(positions, rotations, timestamps)
+
+        self.assertGreater(report['interpolated'], 0)
+        self.assertEqual(int((~valid).sum()), report['interpolated'])
+        self.assertFalse(valid[100:103].any(), "the glitched frames must be marked invalid")
+        self.assertTrue(valid[:95].all(), "clean frames elsewhere must stay valid")
+
+    def test_unresolved_gap_is_invalid(self):
+        """The frames deliberately LEFT corrupt are exactly what the mask is for."""
+        positions, rotations, timestamps = self._clean()
+        # 70 deg: past the speed limit, nowhere near a half turn, so unexplainable.
+        rotations[100:] = rotations[100:] @ Rotation.from_euler('y', 70.0, degrees=True).as_matrix()
+
+        _, _, valid, report = repair_reconstruction_glitches(positions, rotations, timestamps)
+
+        self.assertEqual(report['unresolved'], 1)
+        self.assertFalse(valid.all(), "an unresolved gap cannot leave every frame valid")
+        self.assertFalse(valid[100], "the frame after the unexplained jump is corrupt")
+
+    def test_unflipped_frames_stay_valid(self):
+        """A swap is a labelling error the repair genuinely undoes — the pose is measured."""
+        num_samples = 400
+        timestamps = np.arange(num_samples) / 100.0
+        rotations = Rotation.from_rotvec(
+            np.linspace(0.0, 2.0, num_samples)[:, None] * np.array([0.2, 1.0, -0.4])).as_matrix()
+        positions = np.tile(np.array([0.0, 1.1, 0.2]), (num_samples, 1))
+        rotations[100:350] = rotations[100:350] @ np.diag([-1.0, 1.0, -1.0])
+
+        _, _, valid, report = repair_reconstruction_glitches(positions, rotations, timestamps)
+
+        self.assertGreater(report['flipped'], 200)
+        # Only the block's two edges are transition frames; its 250-frame interior is
+        # recovered exactly and must not be thrown away.
+        self.assertTrue(valid[150:300].all(),
+                        "un-flipped interior frames are correct and must stay valid")
+
+    def test_mask_survives_slicing_and_rezeroing(self):
+        positions, rotations, timestamps = self._clean()
+        valid = np.ones(200, dtype=bool)
+        valid[50:60] = False
+        trace = WorldTrace(timestamps, positions, rotations, valid=valid)
+
+        np.testing.assert_array_equal(trace[40:70].valid, valid[40:70])
+        np.testing.assert_array_equal(trace.copy().valid, valid)
+        np.testing.assert_array_equal(trace.re_zero_timestamps().valid, valid)
+        np.testing.assert_array_equal(trace.transform(rotate=np.eye(3)).valid, valid)
+        self.assertEqual(len(trace[100].valid), 1)
+
+    def test_subtraction_intersects_masks(self):
+        """A difference is trustworthy only where both operands are."""
+        positions, rotations, timestamps = self._clean(num_samples=100)
+        a_valid, b_valid = np.ones(100, dtype=bool), np.ones(100, dtype=bool)
+        a_valid[10:20] = False
+        b_valid[15:25] = False
+        a = WorldTrace(timestamps, positions, rotations, valid=a_valid)
+        b = WorldTrace(timestamps, positions, rotations, valid=b_valid)
+        np.testing.assert_array_equal((a - b).valid, a_valid & b_valid)
+
+    def test_resampling_is_conservative(self):
+        """A resampled frame drawing on an invalid neighbour is itself invalid."""
+        positions, rotations, timestamps = self._clean(num_samples=200)
+        valid = np.ones(200, dtype=bool)
+        valid[100:110] = False
+        trace = WorldTrace(timestamps, positions, rotations, valid=valid)
+
+        resampled = trace.resample(50.0)
+        self.assertEqual(len(resampled.valid), len(resampled))
+        self.assertFalse(resampled.valid.all(), "the invalid run must survive downsampling")
+        # Conservative: the invalid window may widen at the edges but must never shrink
+        # to nothing or drift away from where the original damage was.
+        invalid_times = resampled.timestamps[~resampled.valid]
+        self.assertGreaterEqual(invalid_times.min(), timestamps[99])
+        self.assertLessEqual(invalid_times.max(), timestamps[110])
+
+
+class TestValidityMaskOnRealTrials(unittest.TestCase):
+    """Against the plate-trials this dataset is already known to have damaged.
+
+    These are the eleven of 152 that repair_reconstruction_glitches reports on. They are
+    the reason the mask exists, so they are what it is tested against.
+    """
+
+    #                                    subject     activity        plate         invalid
+    KNOWN_DAMAGE = [
+        ('08', 'walking',      'calcn_l_imu', 30),   # 17 interpolated + 2 unresolved gaps
+        ('06', 'walking',      'pelvis_imu',  36),   # 6 unresolved gaps
+        ('06', 'complexTasks', 'femur_l_imu', 57),   # 153 un-flipped (valid) + 57 interpolated
+        ('02', 'complexTasks', 'pelvis_imu',   9),
+        ('04', 'walking',      'torso_imu',   14),
+    ]
+
+    def _trace(self, subject, activity, plate):
+        import contextlib, io
+        import paths
+        trc = paths.raw_trial_dir(subject, activity) / f'{activity}.trc'
+        if not trc.is_file():
+            self.skipTest(f"source data not present at {trc}")
+        with contextlib.redirect_stdout(io.StringIO()):   # the repair warnings are expected
+            return WorldTrace.from_trc(trc)[plate]
+
+    def test_known_damaged_plates_are_masked(self):
+        for subject, activity, plate, expected in self.KNOWN_DAMAGE:
+            with self.subTest(subject=subject, activity=activity, plate=plate):
+                trace = self._trace(subject, activity, plate)
+                self.assertEqual(int((~trace.valid).sum()), expected)
+
+    def test_damage_is_localized_not_diffuse(self):
+        """Every known fault is a short burst. A mask spanning a large fraction of the
+        trial would mean the detector had fired on real motion, not on a glitch."""
+        for subject, activity, plate, _ in self.KNOWN_DAMAGE:
+            with self.subTest(subject=subject, activity=activity, plate=plate):
+                trace = self._trace(subject, activity, plate)
+                self.assertLess((~trace.valid).mean(), 0.001)
+
+    def test_subject08_calcn_l_brackets_the_known_boundary(self):
+        """Subject08/walking/calcn_l is the 176 deg jump WorldTrace's own comments name.
+
+        Independent cross-check: a separate marker-geometry analysis of this dataset put
+        the corrupt window at roughly frames 59830-59836. The mask is derived from angular
+        SPEED, not marker distances, so agreement here is two detectors meeting.
+        """
+        trace = self._trace('08', 'walking', 'calcn_l_imu')
+        invalid = np.flatnonzero(~trace.valid)
+        in_window = invalid[(invalid >= 59820) & (invalid <= 59870)]
+        self.assertGreater(len(in_window), 0,
+                           "the known 176 deg boundary must be masked")
+
+    def test_undamaged_plates_are_fully_valid(self):
+        """The other 141 plate-trials must not be masked at all — a detector that fires
+        on clean data would quietly shrink every error statistic in the repo."""
+        for subject, activity, plate in [('01', 'walking', 'femur_r_imu'),
+                                         ('03', 'walking', 'tibia_l_imu'),
+                                         ('01', 'complexTasks', 'torso_imu')]:
+            with self.subTest(subject=subject, activity=activity, plate=plate):
+                self.assertTrue(self._trace(subject, activity, plate).valid.all())
 
 
 if __name__ == '__main__':
