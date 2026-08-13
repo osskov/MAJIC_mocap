@@ -56,51 +56,6 @@ class IMUTrace:
         self.acc = np.asarray(acc)
         self.mag = np.asarray(mag)
 
-    @classmethod
-    def from_txt(cls, file_path: Union[str, Path]) -> 'IMUTrace':
-        """Parses a single Xsens-formatted IMU .txt file."""
-        file_path = Path(file_path)
-        freq = 100.0
-        
-        with open(file_path, "r", encoding="utf-8") as f:
-            for _ in range(10):
-                line = f.readline()
-                if line.startswith("// Update Rate"):
-                    try:
-                        freq = float(line.split(":")[1].split("Hz")[0].strip())
-                    except (IndexError, ValueError):
-                        pass
-                    break
-
-        df = pd.read_csv(
-            file_path,
-            delimiter='\t',
-            skiprows=5,
-            engine='c',
-            usecols=['Acc_X', 'Acc_Y', 'Acc_Z', 'Gyr_X', 'Gyr_Y', 'Gyr_Z', 'Mag_X', 'Mag_Y', 'Mag_Z']
-        )
-        
-        timestamps = np.arange(len(df), dtype=np.float64) / freq
-        acc = df[['Acc_X', 'Acc_Y', 'Acc_Z']].to_numpy(dtype=np.float64)
-        gyro = df[['Gyr_X', 'Gyr_Y', 'Gyr_Z']].to_numpy(dtype=np.float64)
-        mag = df[['Mag_X', 'Mag_Y', 'Mag_Z']].to_numpy(dtype=np.float64)
-
-        return cls(timestamps=timestamps, gyro=gyro, acc=acc, mag=mag)
-
-    @classmethod
-    def from_folder(cls, folder_path: Union[str, Path]) -> Dict[str, 'IMUTrace']:
-        """Loads all IMU .txt files in a folder directly by their segment names."""
-        folder = Path(folder_path)
-        imu_dir = folder / 'imu data' if (folder / 'imu data').is_dir() else folder
-
-        imu_files = list(imu_dir.glob("*.txt"))
-        imu_traces = {f.name.replace('.txt', ''): cls.from_txt(f) for f in imu_files}
-
-        if not imu_traces:
-            raise FileNotFoundError(f"No IMU .txt files found in: {imu_dir}")
-
-        return imu_traces
-
     def __len__(self):
         """
         Returns the number of samples in the IMUTrace.
@@ -490,50 +445,55 @@ class IMUTrace:
         """
         return IMUTrace(self.timestamps - self.timestamps[0], self.gyro, self.acc, self.mag)
 
-    def resample(self, new_frequency: float):
+    def resample(self, new_frequency: float, time_shift: float = 0.0):
         """
-        Resamples the IMU trace to a new, constant frequency.
+        Resamples the IMU trace to a new, constant frequency, band-limited.
 
-        This method uses linear interpolation (`scipy.interpolate.interp1d`)
-        to resample the gyro, accelerometer, and magnetometer data to a
-        new set of timestamps defined by the `new_frequency`.
+        Delegates to `toolchest.resampling`, shared with WorldTrace so both sides of an
+        IMU/mocap pair are treated identically. Downsampling anti-aliases first, so content
+        above the new Nyquist is removed rather than folded back into the signal band.
 
-        The new time vector starts at the original `self.timestamps[0]` and
-        ends at or slightly after `self.timestamps[-1]`.
+        `time_shift` moves the output grid in seconds, which is how a FRACTIONAL alignment
+        lag is applied -- see WorldTrace.resample.
+
+        This REPLACED linear interpolation, which is not band-limited and was measurably
+        corrupting results. Its response is sinc^2 -- upsampling 40 -> 100 Hz it costs
+        -1.2 dB at 8 Hz, -4.2 dB at 15 Hz and -7.8 dB at 20 Hz -- and it fabricates
+        spectral images at (old_rate +/- f), so the "upsampled" trace carried 20-50 Hz
+        content the sensor never measured. Because only the IMU was resampled and the
+        mocap was not, the two sides of any IMU-vs-mocap comparison sat in different
+        bands. Measured effect on the IMoVE cluster-to-IMU offset fit: sessions needing
+        no resampling (100 Hz IMU against 100 Hz mocap) returned offsets 5-12 mm smaller
+        than 40 Hz sessions on every segment, in the same direction 5/5.
+
+        The new time vector starts at the original `self.timestamps[0]`.
 
         Args:
             new_frequency (float): The target sample frequency in Hz.
+            time_shift (float): Seconds to offset the output grid by.
 
         Returns:
             IMUTrace: A new, resampled IMUTrace object.
         """
-        new_dt = 1 / new_frequency
-        old_dt = np.mean(np.diff(self.timestamps))
-        
-        # If frequency is already correct, just return a copy
-        if np.isclose(new_dt, old_dt):
+        from .resampling import resample_values
+
+        old_frequency = 1.0 / np.mean(np.diff(self.timestamps))
+
+        if np.isclose(new_frequency, old_frequency) and time_shift == 0.0:
             return self.copy()
 
-        # Create new timestamp vector
-        # Add a small buffer to ensure the last sample is included
-        stop_time = self.timestamps[-1] + min(old_dt, new_dt)
-        new_timestamps = np.arange(start=self.timestamps[0], stop=stop_time, step=new_dt)
-        
-        # Create linear interpolators for each data type
-        # 'extrapolate' is used to handle requests slightly outside the original time range
-        gyro_interpolator = interp1d(self.timestamps, self.gyro, axis=0, kind='linear',
-                                     fill_value='extrapolate')
-        acc_interpolator = interp1d(self.timestamps, self.acc, axis=0, kind='linear',
-                                    fill_value='extrapolate')
-        mag_interpolator = interp1d(self.timestamps, self.mag, axis=0, kind='linear',
-                                    fill_value='extrapolate')
+        duration = self.timestamps[-1] - self.timestamps[0]
+        n_new = int(np.floor(duration * new_frequency)) + 1
+        new_timestamps = (self.timestamps[0] + time_shift
+                          + np.arange(n_new) / new_frequency)
 
-        # Get new resampled data as monolithic (N_new, 3) arrays
-        new_gyro = gyro_interpolator(new_timestamps)
-        new_acc = acc_interpolator(new_timestamps)
-        new_mag = mag_interpolator(new_timestamps)
-
-        return IMUTrace(new_timestamps, new_gyro, new_acc, new_mag)
+        resampled = {
+            name: resample_values(getattr(self, name), self.timestamps, new_timestamps,
+                                  source_rate=old_frequency, target_rate=new_frequency)
+            for name in ('gyro', 'acc', 'mag')
+        }
+        return IMUTrace(new_timestamps, resampled['gyro'], resampled['acc'],
+                        resampled['mag'])
 
     
     def find_spheroidal_joint_offset(self,

@@ -222,9 +222,14 @@ class TestSensorStats(unittest.TestCase):
         self.plates = {'calcn_r_imu': PlateTrial('calcn_r_imu', trace, world),
                        'pelvis_imu': PlateTrial('pelvis_imu', trace.copy(), world.copy())}
 
-    def _raw_with_known_stds(self, stds_and_lengths):
-        """A raw foot trace whose gyro std inside each interval is exactly `std`, built from
-        a two-level square wave (std of +-a alternating is exactly a)."""
+    def _plates_with_known_stds(self, stds_and_lengths, extra_sensors=()):
+        """Plates whose foot gyro std inside each interval is exactly `std`, built from a
+        two-level square wave (the std of +-a alternating is exactly a).
+
+        The noise floor is read off the PLATES now, not a separately-loaded raw trace:
+        alignment no longer discards the inertial record, so the anchored-foot pauses are
+        present in the plate itself.
+        """
         total = sum(length for _, length in stds_and_lengths)
         gyro = np.zeros((total, 3))
         cursor = 0
@@ -233,17 +238,21 @@ class TestSensorStats(unittest.TestCase):
             block[0::2], block[1::2] = std, -std
             gyro[cursor:cursor + length, :] = block[:, None]
             cursor += length
-        n = total
-        return {'calcn_r_imu': IMUTrace(np.arange(n) * DT, gyro,
-                                       np.tile(EXPECTED_GRAVITY, (n, 1)),
-                                       np.tile([1.0, 0.0, 0.0], (n, 1)))}
+        timestamps = np.arange(total) * DT
+        trace = IMUTrace(timestamps, gyro, np.tile(EXPECTED_GRAVITY, (total, 1)),
+                         np.tile([1.0, 0.0, 0.0], (total, 1)))
+        world = WorldTrace(timestamps, np.zeros((total, 3)), np.tile(np.eye(3), (total, 1, 1)))
+        plates = {'calcn_r_imu': PlateTrial('calcn_r_imu', trace, world)}
+        for name in extra_sensors:
+            plates[name] = PlateTrial(name, trace.copy(), world.copy())
+        return plates
 
     def test_noise_is_length_weighted_across_intervals(self):
         """A long quiet interval must count for more than a short one. An unweighted mean of
         the two per-interval stds would give 0.055 here instead of 0.019 — same order of
         magnitude, silently wrong, and biased toward whatever the shortest interval saw."""
-        raw = self._raw_with_known_stds([(0.01, 900), (0.1, 100)])
-        stats = sensor_stats(self.plates, raw, [(0, 900), (900, 1000)])
+        plates = self._plates_with_known_stds([(0.01, 900), (0.1, 100)])
+        stats = sensor_stats(plates, [(0, 900), (900, 1000)])
         row = stats[stats['sensor'] == 'calcn_r_imu'].iloc[0]
         expected = (0.01 * 900 + 0.1 * 100) / 1000
         self.assertAlmostEqual(row['gyro_noise_x'], expected, places=6)
@@ -252,15 +261,14 @@ class TestSensorStats(unittest.TestCase):
     def test_non_foot_sensors_get_no_noise_estimate(self):
         """Only the feet are ground-anchored. Filling these columns for the pelvis would look
         like more data and be a measurement of postural sway."""
-        raw = self._raw_with_known_stds([(0.01, 1000)])
-        raw['pelvis_imu'] = raw['calcn_r_imu'].copy()
-        stats = sensor_stats(self.plates, raw, [(0, 1000)])
+        plates = self._plates_with_known_stds([(0.01, 1000)], extra_sensors=('pelvis_imu',))
+        stats = sensor_stats(plates, [(0, 1000)])
         pelvis = stats[stats['sensor'] == 'pelvis_imu'].iloc[0]
         self.assertTrue(np.isnan(pelvis['gyro_noise_x']))
         self.assertEqual(pelvis['n_stationary_samples'], 0)
 
     def test_no_stationary_intervals_leaves_noise_unset(self):
-        stats = sensor_stats(self.plates, self._raw_with_known_stds([(0.01, 1000)]), [])
+        stats = sensor_stats(self._plates_with_known_stds([(0.01, 1000)]), [])
         self.assertTrue(stats['gyro_noise_x'].isna().all())
         self.assertTrue((stats['n_stationary_samples'] == 0).all())
         # The distortion columns do not depend on stationarity and must still be filled.
@@ -425,7 +433,7 @@ class TestJointMagConsistency(unittest.TestCase):
         known linear acceleration must score exactly that. This is the pair of columns behind the
         report's acc_std comparison, so a sign or frame error here would quietly rescale it."""
         gravity_only = make_plate(name='torso_imu')
-        row = sensor_stats({'torso_imu': gravity_only}, None, []).iloc[0]
+        row = sensor_stats({'torso_imu': gravity_only}, []).iloc[0]
         self.assertAlmostEqual(row['linacc_rms'], 0.0, places=6)
         self.assertAlmostEqual(row['acc_norm_std'], 0.0, places=6)
         self.assertAlmostEqual(row['acc_norm_median'], np.linalg.norm(EXPECTED_GRAVITY), places=6)
@@ -434,7 +442,7 @@ class TestJointMagConsistency(unittest.TestCase):
         # vector's norm at every sample, whatever the plate's orientation is doing.
         world_acc = np.array([0.0, 0.0, 3.0])
         moving = make_plate(name='torso_imu', world_acc=world_acc)
-        row = sensor_stats({'torso_imu': moving}, None, []).iloc[0]
+        row = sensor_stats({'torso_imu': moving}, []).iloc[0]
         self.assertAlmostEqual(row['linacc_rms'], np.linalg.norm(world_acc), places=6)
         self.assertAlmostEqual(row['linacc_median'], np.linalg.norm(world_acc), places=6)
 
@@ -443,7 +451,7 @@ class TestJointMagConsistency(unittest.TestCase):
         perpendicular to gravity barely moves it while linacc sees the whole thing. If these two
         ever agreed, one of them would be computed wrong."""
         perpendicular = make_plate(name='torso_imu', world_acc=np.array([3.0, 0.0, 0.0]))
-        row = sensor_stats({'torso_imu': perpendicular}, None, []).iloc[0]
+        row = sensor_stats({'torso_imu': perpendicular}, []).iloc[0]
         self.assertAlmostEqual(row['linacc_rms'], 3.0, places=6)
         # |[3, 9.81, 0]| = 10.26 at every sample — constant, so its std is 0 despite 3 m/s^2 of motion
         self.assertAlmostEqual(row['acc_norm_std'], 0.0, places=6)

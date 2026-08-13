@@ -7,6 +7,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from src.toolchest.IMUTrace import IMUTrace
+from src.toolchest.building.xsens import read_xsens_txt
 
 
 class TestIMUTrace(unittest.TestCase):
@@ -215,48 +216,6 @@ class TestIMUTrace(unittest.TestCase):
 
         np.testing.assert_allclose(re_zerod_imu.timestamps, expected_timestamps)
 
-    def test_resample_same_frequency(self):
-        resampled_trace = self.imu_trace.resample(1.0)
-        np.testing.assert_array_equal(resampled_trace.timestamps, self.timestamps)
-        np.testing.assert_array_equal(resampled_trace.gyro, np.array(self.gyro))
-        np.testing.assert_array_equal(resampled_trace.acc, np.array(self.acc))
-        np.testing.assert_array_equal(resampled_trace.mag, np.array(self.mag))
-
-    def test_resample_higher_frequency(self):
-        timestamps = np.linspace(0, 5, 6)  # 0, 1, 2, 3, 4, 5 seconds
-        gyro = [np.array([t, t, t]) for t in timestamps]
-        acc = [np.array([t, t, t]) for t in timestamps]
-        mag = [np.array([t, t, t]) for t in timestamps]
-
-        imu_trace = IMUTrace(timestamps, gyro, acc, mag)
-        new_frequency = 2.0
-        resampled_trace = imu_trace.resample(new_frequency)
-        expected_timestamps = np.linspace(start=timestamps[0], stop=timestamps[-1], num=len(timestamps) * 2 - 1, endpoint=True)
-        np.testing.assert_allclose(resampled_trace.timestamps, expected_timestamps, rtol=1e-5)
-
-        # Every channel ramps linearly with time, so linear interpolation is exact.
-        expected = [np.array([t, t, t]) for t in expected_timestamps]
-        np.testing.assert_allclose(resampled_trace.gyro, expected, rtol=1e-5)
-        np.testing.assert_allclose(resampled_trace.acc, expected, rtol=1e-5)
-        np.testing.assert_allclose(resampled_trace.mag, expected, rtol=1e-5)
-
-    def test_resample_lower_frequency(self):
-        timestamps = np.linspace(0, 5, 6)  # 0, 1, 2, 3, 4, 5 seconds
-        gyro = [np.array([t, t, t]) for t in timestamps]
-        acc = [np.array([t, t, t]) for t in timestamps]
-        mag = [np.array([t, t, t]) for t in timestamps]
-
-        imu_trace = IMUTrace(timestamps, gyro, acc, mag)
-        new_frequency = 0.5
-        resampled_trace = imu_trace.resample(new_frequency)
-        expected_timestamps = np.array([0.0, 2.0, 4.0])
-        np.testing.assert_allclose(resampled_trace.timestamps, expected_timestamps, rtol=1e-5)
-
-        expected = [np.array([t, t, t]) for t in expected_timestamps]
-        np.testing.assert_allclose(resampled_trace.gyro, expected, rtol=1e-5)
-        np.testing.assert_allclose(resampled_trace.acc, expected, rtol=1e-5)
-        np.testing.assert_allclose(resampled_trace.mag, expected, rtol=1e-5)
-
     def test_subtraction(self):
         timestamps = np.array([0, 1, 2, 3, 4])
         gyro1 = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12], [13, 14, 15]])
@@ -323,7 +282,7 @@ class TestIMUTrace(unittest.TestCase):
             temp_file_path = temp_file.name
 
         try:
-            trace = IMUTrace.from_txt(temp_file_path)
+            trace = read_xsens_txt(temp_file_path)
             self.assertEqual(len(trace), 2)
             np.testing.assert_allclose(trace.timestamps, [0.0, 0.01])
             np.testing.assert_allclose(trace.acc, [[1.0, 2.0, 3.0], [1.1, 2.1, 3.1]])

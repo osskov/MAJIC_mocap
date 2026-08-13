@@ -15,6 +15,7 @@ from src.toolchest.IMUTrace import IMUTrace
 from src.toolchest.PlateTrial import PlateTrial
 from src.toolchest.WorldTrace import WorldTrace
 from src.toolchest import trial_io
+from src.toolchest.building import alborno, sources
 
 
 def make_plates(names=('femur_r_imu', 'tibia_r_imu'), num_samples=200, seed=0, valid=None):
@@ -168,27 +169,49 @@ class TestCacheKey(unittest.TestCase):
 
 
 class TestCacheStatus(unittest.TestCase):
+    """Status reporting, against a throwaway dataset registered for the test.
+
+    A registered TrialSource is now required — the cache layer asks it where the trial's
+    files are and which of them the key should hash, instead of templating a path. So a
+    test dataset has to be a real entry in the registry rather than just a directory name.
+    """
+
+    DATASET = '_test_dataset'
+
     def setUp(self):
         if not paths.raw_trial_dir('01', 'walking').is_dir():
             self.skipTest("source data not present")
-        self.tmp = paths.TRIALS_DIR / '_test_dataset'
+        real = sources.get_source('alborno')
+        self.source = sources.TrialSource(
+            name=self.DATASET,
+            enumerate_trials=lambda: [('01', 'walking')],
+            source_dir=real.source_dir,          # points at the real Al Borno trial
+            source_globs=real.source_globs,
+            load=real.load,
+        )
+        self._patch = mock.patch.dict(sources.SOURCES, {self.DATASET: self.source})
+        self._patch.start()
+        self.tmp = paths.TRIALS_DIR / self.DATASET
 
     def tearDown(self):
         import shutil
+        self._patch.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _status(self):
-        return eu.cached_trial_status('01', 'walking', dataset='_test_dataset')
+        return eu.cached_trial_status('01', 'walking', dataset=self.DATASET)
+
+    def _path(self):
+        return paths.cached_trial_path(self.DATASET, '01', 'walking')
 
     def test_missing_then_fresh(self):
         self.assertEqual(self._status()[0], 'missing')
-        eu.save_cached_trial(make_plates(), '01', 'walking', dataset='_test_dataset')
+        eu.save_cached_trial(make_plates(), '01', 'walking', dataset=self.DATASET)
         self.assertEqual(self._status()[0], 'fresh')
 
     def test_key_mismatch_reports_stale_and_names_the_field(self):
-        eu.save_cached_trial(make_plates(), '01', 'walking', dataset='_test_dataset')
-        path = paths.cached_trial_path('_test_dataset', 'Subject01', 'walking')
-        manifest_path = paths.manifest_path(path)
+        eu.save_cached_trial(make_plates(), '01', 'walking', dataset=self.DATASET)
+        manifest_path = paths.manifest_path(self._path())
         manifest = json.loads(manifest_path.read_text())
         manifest['cache_key']['toolchest_digest'] = 'deadbeefdeadbeef'
         manifest_path.write_text(json.dumps(manifest))
@@ -197,24 +220,24 @@ class TestCacheStatus(unittest.TestCase):
         self.assertEqual(status, 'stale')
         self.assertIn('toolchest_digest', reason)
 
-    def test_stale_entry_is_not_loaded(self):
-        eu.save_cached_trial(make_plates(), '01', 'walking', dataset='_test_dataset')
-        manifest_path = paths.manifest_path(
-            paths.cached_trial_path('_test_dataset', 'Subject01', 'walking'))
+    def test_a_stale_entry_raises_rather_than_loading(self):
+        """The whole point of the strict loader: staleness is loud, not a silent reparse."""
+        eu.save_cached_trial(make_plates(), '01', 'walking', dataset=self.DATASET)
+        manifest_path = paths.manifest_path(self._path())
         manifest = json.loads(manifest_path.read_text())
         manifest['cache_key']['schema_version'] = -1
         manifest_path.write_text(json.dumps(manifest))
-        self.assertIsNone(eu.load_cached_trial('01', 'walking', dataset='_test_dataset'))
+        with self.assertRaises(eu.StaleTrialCache):
+            eu.load_trial('01', 'walking', dataset=self.DATASET)
 
     def test_missing_manifest_is_stale_not_fresh(self):
         """A parquet with no sidecar has unknown provenance; refuse to trust it."""
-        eu.save_cached_trial(make_plates(), '01', 'walking', dataset='_test_dataset')
-        paths.manifest_path(
-            paths.cached_trial_path('_test_dataset', 'Subject01', 'walking')).unlink()
+        eu.save_cached_trial(make_plates(), '01', 'walking', dataset=self.DATASET)
+        paths.manifest_path(self._path()).unlink()
         self.assertEqual(self._status(), ('stale', 'no manifest sidecar'))
 
     def test_save_records_diagnostics(self):
-        path = eu.save_cached_trial(make_plates(), '01', 'walking', dataset='_test_dataset')
+        path = eu.save_cached_trial(make_plates(), '01', 'walking', dataset=self.DATASET)
         diagnostics = paths.read_manifest(path)['diagnostics']
         self.assertEqual(diagnostics['n_plates'], 2)
         self.assertAlmostEqual(diagnostics['sample_rate_hz'], 100.0, places=6)
@@ -222,38 +245,58 @@ class TestCacheStatus(unittest.TestCase):
             self.assertIn('gyro_residual_lowpass_rms_deg_s', stats)
 
 
-class TestLoadRawDataUsesCache(unittest.TestCase):
-    def test_cache_hit_returns_cached_plates_without_touching_source(self):
-        plates = make_plates()
-        with mock.patch.object(eu, 'load_cached_trial', return_value=plates) as cached, \
-             mock.patch.object(eu.PlateTrial, 'from_folder') as from_folder:
-            result = eu.load_raw_data('01', 'walking')
-        self.assertIs(result, plates)
-        cached.assert_called_once()
-        from_folder.assert_not_called()
+class TestStrictLoading(unittest.TestCase):
+    """load_trial reads the artifact and nothing else.
 
-    def test_cache_miss_falls_back_to_source(self):
-        with mock.patch.object(eu, 'load_cached_trial', return_value=None), \
-             mock.patch.object(eu.PlateTrial, 'from_folder', return_value={'x': None}) as from_folder:
+    These tests used to assert the opposite — that a cache miss silently fell back to
+    parsing from source. That made a stale artifact cost time and nothing else, which also
+    made it invisible: a sweep could mix cached and freshly-parsed trials with no record of
+    which produced which number.
+    """
+
+    def test_a_missing_trial_raises_and_names_the_build_command(self):
+        with mock.patch.object(eu, 'cached_trial_status', return_value=('missing', None)):
+            with self.assertRaises(eu.StaleTrialCache) as ctx:
+                eu.load_trial('01', 'walking')
+        self.assertIn('build_trials', str(ctx.exception))
+        self.assertIn('--dataset alborno', str(ctx.exception))
+
+    def test_a_stale_trial_raises_with_the_reason(self):
+        with mock.patch.object(eu, 'cached_trial_status',
+                               return_value=('stale', 'toolchest_digest: ...')):
+            with self.assertRaises(eu.StaleTrialCache) as ctx:
+                eu.load_trial('01', 'walking')
+        self.assertIn('toolchest_digest', str(ctx.exception))
+
+    def test_it_never_touches_the_source_reader(self):
+        """No fallback path exists, so a fresh read must not reach the dataset reader."""
+        if not paths.raw_trial_dir('01', 'walking').is_dir():
+            self.skipTest("source data not present")
+        if eu.cached_trial_status('01', 'walking')[0] != 'fresh':
+            self.skipTest("trial cache not built; run python -m experiments.build_trials")
+        with mock.patch.object(sources.alborno, 'load_trial') as reader:
+            plates = eu.load_trial('01', 'walking')
+        reader.assert_not_called()
+        self.assertGreater(len(plates), 0)
+
+    def test_load_raw_data_still_works_as_a_deprecated_alias(self):
+        with mock.patch.object(eu, 'load_trial', return_value={'x': None}) as inner:
             eu.load_raw_data('01', 'walking')
-        from_folder.assert_called_once()
-
-    def test_use_cache_false_skips_the_cache_entirely(self):
-        with mock.patch.object(eu, 'load_cached_trial') as cached, \
-             mock.patch.object(eu.PlateTrial, 'from_folder', return_value={}):
-            eu.load_raw_data('01', 'walking', use_cache=False)
-        cached.assert_not_called()
+        inner.assert_called_once()
 
 
 class TestRealTrialRoundTrip(unittest.TestCase):
     """End-to-end against real source data, if it is present."""
 
-    def test_cached_trial_matches_a_live_load(self):
-        if not paths.raw_trial_dir('01', 'walking').is_dir():
+    def _live(self, subject, trial):
+        """Straight from the dataset reader — what build_trials does."""
+        if not paths.raw_trial_dir(subject, trial).is_dir():
             self.skipTest("source data not present")
-        live = eu.load_raw_data('01', 'walking', use_cache=False)
-        frame = trial_io.plates_to_frame(live)
-        back = trial_io.plates_from_frame(frame)
+        return sources.get_source('alborno').load(subject, trial, True)
+
+    def test_cached_trial_matches_a_live_load(self):
+        live = self._live('01', 'walking')
+        back = trial_io.plates_from_frame(trial_io.plates_to_frame(live))
 
         self.assertEqual(set(back), set(live))
         for name, original in live.items():
@@ -263,28 +306,24 @@ class TestRealTrialRoundTrip(unittest.TestCase):
             np.testing.assert_array_equal(back[name].valid, original.valid)
 
     def test_a_known_damaged_trial_round_trips_its_mask(self):
-        """Subject08/walking/calcn_l is masked; the cache must not launder that away."""
-        if not paths.raw_trial_dir('08', 'walking').is_dir():
-            self.skipTest("source data not present")
-        live = eu.load_raw_data('08', 'walking', use_cache=False)
+        """Subject08/walking/calcn_l is masked; the artifact must not launder that away."""
+        live = self._live('08', 'walking')
         self.assertFalse(live['calcn_l_imu'].valid.all(),
                          "fixture assumption broken: this plate should carry known damage")
 
         back = trial_io.plates_from_frame(trial_io.plates_to_frame(live))
         np.testing.assert_array_equal(back['calcn_l_imu'].valid, live['calcn_l_imu'].valid)
-        # ...and the plates that are clean must not pick up a mask in transit.
-        self.assertTrue(back['femur_r_imu'].valid.all())
+        # Every plate now carries a mask, because alignment keeps the inertial record from
+        # before and after the mocap window and marks it unscoreable — so "clean" no longer
+        # means all-True. What must hold is that the mask survives the round trip unchanged.
+        np.testing.assert_array_equal(back['femur_r_imu'].valid, live['femur_r_imu'].valid)
+        self.assertFalse(back['femur_r_imu'].valid.all(),
+                         "fixture assumption: this trial has inertial data outside the "
+                         "mocap window, which is retained and marked unscoreable")
 
     def test_masked_frames_survive_sync_and_alignment(self):
-        """from_traces trims and _align_world_trace_to_imu_trace rebuilds the WorldTrace;
+        """assemble_plate_trials pads and align_world_to_imu rebuilds the WorldTrace;
         either dropping the mask would be silent."""
-        if not paths.raw_trial_dir('08', 'walking').is_dir():
-            self.skipTest("source data not present")
-        plates = eu.load_raw_data('08', 'walking', use_cache=False)
-        plate = plates['calcn_l_imu']
+        plate = self._live('08', 'walking')['calcn_l_imu']
         self.assertEqual(len(plate.valid), len(plate))
         self.assertFalse(plate.valid.all())
-
-
-if __name__ == '__main__':
-    unittest.main()

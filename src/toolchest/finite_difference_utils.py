@@ -1,6 +1,24 @@
 import inspect
 import numpy as np
 
+# Smoothing window for the polyfit derivative, in SECONDS. Chosen to reproduce the previous
+# fixed 10-sample default exactly at 100 Hz, which is what every existing result was
+# computed with; the difference is that it now means the same thing at 40 Hz.
+DEFAULT_WINDOW_SECONDS = 0.10
+
+
+def window_samples(timesteps: np.ndarray, window_seconds: float, order: int) -> int:
+    """How many samples a `window_seconds` window spans, floored so the fit stays smoothing.
+
+    A polynomial of `order` has order+1 coefficients, so a window of exactly that many
+    samples interpolates rather than smooths and one below it is underdetermined. The floor
+    of order+2 keeps at least one degree of freedom of averaging, which matters at low rates:
+    100 ms at 40 Hz is only 4 samples, and an order-3 fit would otherwise pass straight
+    through them and return the raw finite difference.
+    """
+    spacing = float(np.mean(np.diff(np.asarray(timesteps, dtype=np.float64))))
+    return max(order + 2, int(round(window_seconds / spacing)))
+
 
 def finite_difference(signal: np.ndarray, timesteps: np.ndarray, method: str = 'central', **kwargs) -> np.ndarray:
     """
@@ -190,19 +208,26 @@ def _overlap_average(est: np.ndarray, N: int, w: int) -> np.ndarray:
     return gradient
 
 
-def polynomial_fit_derivative(signal: np.ndarray, timesteps: np.ndarray, order: int = 3, window_size: int = 10,
-                              derivative_order: int = 1) -> np.ndarray:
+def polynomial_fit_derivative(signal: np.ndarray, timesteps: np.ndarray, order: int = 3,
+                              window_size: int = None, derivative_order: int = 1,
+                              window_seconds: float = DEFAULT_WINDOW_SECONDS) -> np.ndarray:
     """
     This function computes the sliding window polynomial fit derivative of a signal.
 
-    A length-`window_size` window slides over the signal; each position is fitted with a
-    polynomial of `order`, differentiated analytically, evaluated at every sample in the
-    window, and the overlapping estimates are averaged. That is a smoothed
-    Savitzky-Golay derivative.
+    A window slides over the signal; each position is fitted with a polynomial of `order`,
+    differentiated analytically, evaluated at every sample in the window, and the
+    overlapping estimates are averaged. That is a smoothed Savitzky-Golay derivative.
+
+    THE WINDOW IS SPECIFIED IN SECONDS, not samples. It used to be a fixed 10 samples,
+    which silently meant 100 ms at 100 Hz but 250 ms at 40 Hz -- so the same call smoothed
+    2.5x harder on the 40 Hz trials and the results were not comparable. Now that the
+    loader keeps each trial at its own native rate, that would have become a per-trial
+    difference masquerading as a per-subject one. `window_size` still overrides with an
+    explicit sample count where a test wants one.
 
     NOT CAUSAL. The window extends forwards, so sample t draws on samples up to
-    t + window_size - 1 -- 90 ms of lookahead at 100 Hz with the default window. Fine
-    for offline analysis; see experiments/ for the causal alternatives.
+    t + window_size - 1 -- 90 ms of lookahead at the default 100 ms window, whatever the
+    sample rate. Fine for offline analysis; see experiments/ for the causal alternatives.
 
     Implementation note: for a given set of window timestamps the map
     (window samples) -> (derivative at those samples) is a fixed `window_size` square
@@ -213,12 +238,16 @@ def polynomial_fit_derivative(signal: np.ndarray, timesteps: np.ndarray, order: 
 
     Accepts (N,) or (N, k); every column is differentiated independently.
     """
+    sig, squeeze = _as_columns(signal)
+    t = np.asarray(timesteps, dtype=np.float64)
+
+    if window_size is None:
+        window_size = window_samples(t, window_seconds, order)
+
     if len(signal) < window_size:
         raise ValueError("window_size (" + str(window_size) + ") must be less than the length of the signal (" + str(
             len(signal)) + ").")
 
-    sig, squeeze = _as_columns(signal)
-    t = np.asarray(timesteps, dtype=np.float64)
     N, k = sig.shape
     w = window_size
     M = N - w + 1

@@ -1,14 +1,11 @@
-from pathlib import Path
 import os
 import numpy as np
-import scipy.signal as signal
 from .IMUTrace import IMUTrace
-from .WorldTrace import WorldTrace, _generate_smooth_motion_profile
+from .WorldTrace import WorldTrace
 from typing import Tuple, List, Dict, Union
 import matplotlib.pyplot as plt
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
-from tqdm.auto import tqdm  # Import tqdm for progress bars
 
 class PlateTrial:
     """
@@ -72,6 +69,23 @@ class PlateTrial:
         return len(self.imu_trace)
 
     @property
+    def sample_rate(self) -> float:
+        """Samples per second. NOT the same for every trial, and not always 100.
+
+        The loader keeps each trial at the slowest rate any of its streams was recorded at,
+        rather than resampling everything onto one global grid. Al Borno's mocap is 100 Hz
+        throughout but Subject06 and Subject10 carry 40 Hz IMUs, so those three trials load
+        at 40 Hz; IMoVE is 40 Hz for the 17-sensor sessions and 100 Hz for the 7-sensor
+        long-walk ones. Upsampling to hide that would be inventing data -- see
+        toolchest.resampling for what it cost when the loader used to do exactly that.
+
+        So anything with a time constant -- a filter cutoff, a smoothing window, a process
+        noise -- has to be expressed per SECOND and converted through this, not baked in as
+        a sample count. `finite_difference_utils.window_samples` is the worked example.
+        """
+        return float(self.imu_trace.get_sample_frequency())
+
+    @property
     def valid(self) -> np.ndarray:
         """Per-frame boolean: is this sample usable as GROUND TRUTH?
 
@@ -121,39 +135,6 @@ class PlateTrial:
             self.world_trace.copy()
         )
 
-    def _align_world_trace_to_imu_trace(self) -> 'PlateTrial':
-        """
-        Aligns the WorldTrace's orientation to the IMUTrace's orientation.
-
-        This method calculates the static rotational offset between the "ground truth"
-        angular velocity (from WorldTrace) and the measured angular velocity
-        (from IMUTrace). It then applies this offset to the WorldTrace's
-        orientation data so that the coordinate frames are aligned.
-
-        This is a crucial step for sensor-to-segment calibration.
-
-        Returns:
-            PlateTrial: A new PlateTrial object with the aligned WorldTrace.
-        """
-        # 1. Calculate a synthetic IMU gyro trace from the world (mocap) rotations.
-        synthetic_imu_trace = self.world_trace.calculate_imu_trace(skip_lin_acc=True)
-        
-        # 2. Find the rotation (R_wt_it) that maps the world trace to the imu trace
-        #    by comparing their gyroscope data.
-        R_wt_it = synthetic_imu_trace.calculate_rotation_offset_from_gyros(self.imu_trace)
-        
-        # 3. Apply this static rotation to all orientations in the world trace.
-        #    new_R_world = old_R_world @ R_wt_it
-        world_rots_np = self.world_trace.rotations
-        new_world_rotations = np.matmul(world_rots_np, R_wt_it)
-
-        # 4. Create a new WorldTrace and PlateTrial with the aligned data.
-        #    The validity mask carries through unchanged: applying a constant rotation to
-        #    every frame cannot make a corrupt pose trustworthy or the reverse.
-        new_world_trace = WorldTrace(self.world_trace.timestamps, self.world_trace.positions,
-                                     new_world_rotations, valid=self.world_trace.valid)
-        return PlateTrial(self.name, self.imu_trace, new_world_trace)
-
     def project_imu_trace(self, local_offset: np.ndarray) -> IMUTrace:
         r"""
         Estimates the IMUTrace values at a different location on the same rigid body.
@@ -183,170 +164,6 @@ class PlateTrial:
         # This function relies on the IMUTrace class to handle the physics.
         return self.imu_trace.project_acc(local_offset)
     
-    @staticmethod
-    def from_traces(
-        imu_traces: Dict[str, 'IMUTrace'], 
-        world_traces: Dict[str, 'WorldTrace'], 
-        align_plate_trials: bool
-    ) -> List['PlateTrial']:
-        """
-        Factory method to create a list of PlateTrial objects from raw data.
-
-        This function performs the key "data wrangling" steps:
-        1.  Finds matching pairs of IMU and World traces.
-        2.  Resamples IMU data if its frequency doesn't match the World trace.
-        3.  Synchronizes the traces in time using cross-correlation of gyro norms.
-        4.  (Optionally) Aligns the coordinate frames.
-        5.  Trims all resulting trials to the same minimum length for consistency.
-
-        Args:
-            imu_traces (Dict[str, 'IMUTrace']): A dictionary mapping IMU names
-                to IMUTrace objects.
-            world_traces (Dict[str, 'WorldTrace']): A dictionary mapping segment
-                names to WorldTrace objects.
-            align_plate_trials (bool): If True, performs sensor-to-segment
-                alignment using `_align_world_trace_to_imu_trace`.
-
-        Returns:
-            List['PlateTrial']: A list of processed, synchronized, and aligned
-                PlateTrial objects.
-        """
-        plate_trials = {}
-        imu_slice, world_slice = slice(0, 0), slice(0, 0)
-        
-        if not imu_traces:
-            print("Warning: No IMU traces loaded.")
-            return []
-        
-        # --- ADDED TQDM ---
-        # Wrap the imu_traces dictionary items with tqdm for a progress bar
-        disable_tqdm = os.getenv("DISABLE_TQDM", "False") == "True"
-        if not disable_tqdm:
-            print("Processing and synchronizing traces...")
-        for imu_name, imu_trace in tqdm(imu_traces.items(), desc="Generating PlateTrials", disable=disable_tqdm):
-            try:
-                # Find the corresponding world_trace using the exact name
-                world_trace = world_traces[imu_name]
-            except KeyError:
-                if not disable_tqdm:
-                    print(f"IMU {imu_name} not found in world traces. Skipping.")
-                continue
-
-            # Resample if frequencies don't match (within a small tolerance)
-            if abs(imu_trace.get_sample_frequency() - world_trace.get_sample_frequency()) > 0.2:
-                # print(f"Sample frequency mismatch for {imu_name}: IMU {imu_trace.get_sample_frequency()} Hz, World {world_trace.get_sample_frequency()} Hz")
-                imu_trace = imu_trace.resample(float(world_trace.get_sample_frequency()))
-
-            # Sync traces by finding the optimal time lag
-            imu_slice, world_slice = PlateTrial._sync_traces(imu_trace, world_trace)
-            
-            # Create new traces based on the synchronized slices
-            synced_imu_trace = imu_trace[imu_slice].re_zero_timestamps()
-            synced_world_trace = world_trace[world_slice].re_zero_timestamps()
-            
-            # Create the new PlateTrial object
-            new_plate_trial = PlateTrial(imu_name, synced_imu_trace, synced_world_trace)
-            
-            # Optionally align the coordinate frames
-            if align_plate_trials:
-                new_plate_trial = new_plate_trial._align_world_trace_to_imu_trace()
-                
-            plate_trials[imu_name] = new_plate_trial
-
-        # Ensure all trials have the same length by trimming to the shortest one
-        plate_trial_lengths = [len(plate_trial) for plate_trial in plate_trials.values()]
-        if len(set(plate_trial_lengths)) > 1:
-            if not disable_tqdm:
-                print(f"Warning: Plate trials have different lengths: {plate_trial_lengths}. "
-                      "Trimming to minimum length.")
-            min_length = min(plate_trial_lengths)
-            plate_trials = {key: plate[:min_length] for key, plate in plate_trials.items()}
-
-        if not disable_tqdm:
-            print(f"Successfully generated {len(plate_trials)} PlateTrials.")
-        return plate_trials
-    
-    @staticmethod
-    def from_folder(folder_path: Union[str, Path], align_plate_trials: bool = True):
-        folder = Path(folder_path).resolve()
-        imu_traces = IMUTrace.from_folder(folder)
-
-        trc_files = list(folder.glob("*.trc"))
-        if not trc_files:
-            raise FileNotFoundError(f"No .trc file found in {folder}")
-        world_traces = WorldTrace.from_trc(trc_files[0])
-        return PlateTrial.from_traces(
-            imu_traces=imu_traces,world_traces=world_traces,align_plate_trials=align_plate_trials)
-    
-    @staticmethod
-    def _sync_traces(imu_trace: IMUTrace, world_trace: WorldTrace) -> Tuple[slice, slice]:
-        """
-        Synchronizes an IMU trace and a World trace using gyro data.
-
-        This method resamples if necessary, then uses `_sync_arrays` on the
-        norm of the gyroscope data (real and synthetic) to find the
-        time lag.
-
-        Args:
-            imu_trace (IMUTrace): The IMU data.
-            world_trace (WorldTrace): The Mocap data.
-
-        Returns:
-            Tuple[slice, slice]: A pair of slice objects (imu_slice, world_slice)
-                that, when applied to their respective traces, will align them
-                in time.
-        """
-        # Ensure sample frequencies are compatible before syncing
-        if not np.isclose(imu_trace.get_sample_frequency(), world_trace.get_sample_frequency(), rtol=0.2):
-            imu_trace = imu_trace.resample(float(world_trace.get_sample_frequency()))
-
-        # Calculate a synthetic gyro trace from the world trace
-        synthetic_imu_trace = world_trace.calculate_imu_trace(skip_lin_acc=True)
-        
-        # Sync based on the magnitude (norm) of the angular velocity vectors
-        imu_slice, world_slice = PlateTrial._sync_arrays(
-            np.linalg.norm(imu_trace.gyro, axis=1),
-            np.linalg.norm(synthetic_imu_trace.gyro, axis=1)
-        )
-        return imu_slice, world_slice
-
-    @staticmethod
-    def _sync_arrays(array1: np.ndarray, array2: np.ndarray) -> Tuple[slice, slice]:
-        """
-        Finds the optimal lag between two 1D arrays using cross-correlation.
-
-        Args:
-            array1 (np.ndarray): The first 1D array.
-            array2 (np.ndarray): The second 1D array.
-
-        Returns:
-            Tuple[slice, slice]: A pair of slice objects (slice1, slice2)
-                that trim the arrays to their overlapping, synchronized portions.
-        """
-        assert array1.ndim == array2.ndim == 1, "Input arrays must be 1D"
-        
-        # Pad the shorter array to match the longer one for correlation
-        max_len = max(len(array1), len(array2))
-        a1 = np.pad(array1, (0, max_len - len(array1)), mode='constant')
-        a2 = np.pad(array2, (0, max_len - len(array2)), mode='constant')
-
-        # Compute the full cross-correlation using FFT for speed
-        correlation = signal.correlate(a1, a2, mode='full', method='fft')
-        
-        # Find the index of the peak correlation.
-        # The lag is this index offset by (max_len - 1)
-        lag = np.argmax(correlation) - (max_len - 1)
-
-        # Calculate the start indices and new length for slicing
-        # If lag is positive, array1 starts later (trim its start)
-        # If lag is negative, array2 starts later (trim its start)
-        i1 = max(0, lag)
-        i2 = max(0, -lag)
-        new_len = min(len(array1) - i1, len(array2) - i2)
-
-        # Return the slice objects
-        return slice(i1, i1 + new_len), slice(i2, i2 + new_len)
-    
     def get_imu_trace_in_global_frame(self) -> IMUTrace:
         """
         Rotates the IMU sensor data into the global coordinate frame.
@@ -373,53 +190,6 @@ class PlateTrial:
             gyro=rotated_gyro,
             mag=rotated_mag
         )
-    
-    @staticmethod
-    def generate_random_plate_trial(
-        duration: float = 10.0,
-        fs: float = 100.0,
-        add_noise: bool = True,
-        gyro_noise_std: float = 0.005,
-        acc_noise_std: float = 0.05
-    ) -> 'PlateTrial':
-        """
-        Generates a single PlateTrial with random but smooth motion.
-
-        This function performs the following steps:
-        1. Creates a smooth, random 3D position and orientation trajectory (WorldTrace).
-        2. Calculates the ideal IMU data (gyroscope, accelerometer) that corresponds
-        to this trajectory.
-        3. Adds synthetic Gaussian noise to the IMU data to simulate a real sensor.
-        4. Combines the world and IMU traces into a single PlateTrial object.
-
-        Args:
-            duration (float, optional): The duration of the trial in seconds. Defaults to 10.0.
-            fs (float, optional): The sampling frequency in Hz. Defaults to 100.0.
-            add_noise (bool, optional): If True, adds noise to the synthetic IMU data.
-                Defaults to True.
-            gyro_noise_std (float, optional): Standard deviation of the gyroscope
-                noise in rad/s. Defaults to 0.005.
-            acc_noise_std (float, optional): Standard deviation of the accelerometer
-                noise in m/s^2. Defaults to 0.05.
-
-        Returns:
-            PlateTrial: A new PlateTrial object with synthetic data.
-        """
-        # 1. Generate the ground-truth WorldTrace
-        world_trace = WorldTrace.generate_random_world_trace(duration, fs)
-
-        # 2. Calculate the corresponding "perfect" IMU trace
-        # Define a standard gravity vector
-        gravity = np.array([0, 0, -9.81])
-        magnetic_field = np.array([0.2, 0, 0.4])  # Example magnetic field vector
-        imu_trace = world_trace.calculate_imu_trace(acc_from_gravity=gravity, magnetic_field=magnetic_field)
-
-        # 3. (Optional) Add realistic noise to the IMU data
-        if add_noise:
-            imu_trace = imu_trace.add_noise(gyro_noise_std, acc_noise_std)
-
-        # 4. Create and return the final PlateTrial object
-        return PlateTrial(name="synthetic_random_trial", imu_trace=imu_trace, world_trace=world_trace)
     
     def find_biaxial_joint_axes(
         self: 'PlateTrial',
@@ -611,254 +381,3 @@ class PlateTrial:
 
         return {'axis_parent_local': j1_res, 'axis_child_local': j2_res, 'converged': False}
         
-    def generate_1dof_plate(
-        self,
-        joint_center_parent: np.ndarray,
-        joint_center_child: np.ndarray,
-        parent_to_joint_rotation: Rotation = None,
-        child_to_joint_rotation: Rotation = None,
-        add_noise: bool = True,
-        gyro_noise_std: float = 0.005,
-        acc_noise_std: float = 0.05
-    ) -> 'PlateTrial':
-        """
-        Generates a child PlateTrial connected by a 1-DOF hinge joint.
-        The kinematic chain is:
-        R_child = R_parent @ R_p2j @ R_joint_motion(z) @ R_c2j.inv()
-        """
-        if parent_to_joint_rotation is None: parent_to_joint_rotation = Rotation.random()
-        if child_to_joint_rotation is None: child_to_joint_rotation = Rotation.random()
-
-        parent_world_trace = self.world_trace
-        num_samples = len(parent_world_trace)
-        duration = parent_world_trace.timestamps[-1] - parent_world_trace.timestamps[0]
-
-        angle = _generate_smooth_motion_profile(num_samples, duration, max_amp=np.pi)
-        R_joint_motion = Rotation.from_euler('z', angle)
-
-        R_parent_matrices = self.world_trace.rotations
-        R_p2j_mat = parent_to_joint_rotation.as_matrix()
-        R_c2j_inv_mat = child_to_joint_rotation.as_matrix().T
-        R_rel_total_matrices = R_p2j_mat @ R_joint_motion.as_matrix() @ R_c2j_inv_mat
-        R_child_matrices = R_parent_matrices @ R_rel_total_matrices
-
-        P_parent = self.world_trace.positions
-        parent_offset_global = (R_parent_matrices @ joint_center_parent).squeeze()
-        child_offset_global = (R_child_matrices @ joint_center_child).squeeze()
-        P_child = P_parent + parent_offset_global - child_offset_global
-
-        child_world_trace = WorldTrace(
-            timestamps=parent_world_trace.timestamps,
-            positions=[row for row in P_child],
-            rotations=[mat for mat in R_child_matrices]
-        )
-
-        gravity = np.array([0, 0, -9.81])
-        child_imu_trace = child_world_trace.calculate_imu_trace(acc_from_gravity=gravity)
-        if add_noise:
-            child_imu_trace = child_imu_trace.add_noise(gyro_noise_std, acc_noise_std)
-
-        return PlateTrial(f"{self.name}_child_dof1", child_imu_trace, child_world_trace)
-
-
-    def generate_2dof_plate(
-        self,
-        j1_parent: np.ndarray,
-        j2_child: np.ndarray,
-        carrying_angle: float,
-        parent_offset: np.ndarray,
-        child_offset: np.ndarray,
-        add_noise: bool = True,
-        gyro_noise_std: float = 0.005,
-        acc_noise_std: float = 0.05
-    ) -> 'PlateTrial':
-        """
-        Generates a child PlateTrial connected by a 2-DOF joint
-        with a fixed carrying angle.
-
-        The kinematic model is:
-        R_wc = R_wp @ R_pj1 @ R_j1j2 @ R_j2c
-
-        Where:
-        - R_wp: Parent's world rotation.
-        - R_pj1: Rotation aligning the parent-frame axis (j1_parent) to [0,0,1] (Z-axis).
-        - R_j1j2: The ZYX joint rotation [z_angle, carrying_angle, x_angle].
-        - R_j2c: Rotation aligning the child-frame axis (j2_child) to [1,0,0] (X-axis).
-        """
-        parent_world_trace = self.world_trace
-        num_samples = len(parent_world_trace)
-        duration = parent_world_trace.timestamps[-1] - parent_world_trace.timestamps[0]
-        timestamps = parent_world_trace.timestamps
-
-        # === 1. Calculate Constant Alignment Rotations ===
-        
-        # Normalize input axes
-        j1_p_norm = j1_parent / np.linalg.norm(j1_parent)
-        j2_c_norm = j2_child / np.linalg.norm(j2_child)
-
-        z_axis = np.array([0., 0., 1.])
-        x_axis = np.array([1., 0., 0.])
-
-        # R_pj1: "aligns [0,0,1] to j1_parent"
-        # This finds R such that R @ z_axis = j1_p_norm
-        # align_vectors(target, source)
-        R_pj1_rot = Rotation.align_vectors(j1_p_norm[np.newaxis, :], z_axis[np.newaxis, :])[0]
-        R_pj1_mat = R_pj1_rot.as_matrix()
-
-        # R_j2c: "aligns j2_child to [1,0,0]"
-        # This finds R such that R @ j2_c_norm = x_axis
-        R_j2c_rot = Rotation.align_vectors(x_axis[np.newaxis, :], j2_c_norm[np.newaxis, :])[0]
-        R_j2c_mat = R_j2c_rot.as_matrix()
-
-        # === 2. Generate Joint Motion Profile (R_j1j2) ===
-        
-        # Generate simple motion for the Z and X axes
-        z_angles = _generate_smooth_motion_profile(num_samples=num_samples,duration=duration, max_amp=np.pi/2) # Flexion/Extension
-        x_angles = _generate_smooth_motion_profile(num_samples=num_samples,duration=duration, max_amp=np.pi/6) # Abduction/Adduction
-        
-        # Convert to a (N, 3, 3) stack of rotation matrices
-        R_j1 = Rotation.from_euler('z', z_angles)
-        R_carrying = Rotation.from_euler('y', carrying_angle * np.ones(num_samples))
-        R_j2 = Rotation.from_euler('x', x_angles)
-
-        R_j1j2_mat = (R_j1 * R_carrying * R_j2).as_matrix()
-
-        # === 3. Calculate Child World Rotations ===
-        R_wp = self.world_trace.rotations
-        
-        # R_child = R_wp @ R_pj1 @ R_j1j2 @ R_j2c
-        # (N,3,3) = (N,3,3) @ (3,3) @ (N,3,3) @ (3,3)
-        R_wc = R_wp @ R_pj1_mat @ R_j1j2_mat @ R_j2c_mat
-
-        # === 4. Calculate Child World Positions ===
-        P_parent = self.world_trace.positions
-
-        # Apply parent rotation to parent offset vector (for all N samples)
-        # 'nij,j->ni' means: (N, 3, 3) @ (3,) -> (N, 3)
-        parent_offset_global = np.einsum('nij,j->ni', R_wp, parent_offset)
-        
-        # Apply child rotation to child offset vector (for all N samples)
-        child_offset_global = np.einsum('nij,j->ni', R_wc, child_offset)
-
-        # Child position = Parent pos + Parent offset - Child offset
-        P_child = P_parent + parent_offset_global - child_offset_global
-
-        # === 5. Create Traces and Return PlateTrial ===
-        child_world_trace = WorldTrace(
-            timestamps=parent_world_trace.timestamps,
-            positions=[row for row in P_child],
-            rotations=[mat for mat in R_wc]
-        )
-
-        gravity = np.array([0, 0, -9.81])
-        child_imu_trace = child_world_trace.calculate_imu_trace(acc_from_gravity=gravity)
-        
-        if add_noise:
-            child_imu_trace = child_imu_trace.add_noise(gyro_noise_std, acc_noise_std)
-
-        # # === Verification of Relative Angular Velocity ===
-        
-        # # Get actual relative angular velocity from IMU data (in world frame)
-        # w_c_world = np.array([r @ g for r, g in zip(child_world_trace.rotations, child_imu_trace.gyro)])
-        # w_p_world = np.array([r @ g for r, g in zip(self.world_trace.rotations, self.imu_trace.gyro)])
-        # w_rel_actual = w_c_world - w_p_world
-        # print(w_rel_actual[50])
-        # # Calculate ideal relative angular velocity from joint angle derivatives
-        
-        # # Use np.gradient for a stable derivative that matches array length
-        # dt = np.mean(np.diff(timestamps))
-        # z_dot = (np.roll(z_angles, -1) - z_angles) / dt
-        # x_dot = (np.roll(x_angles, -1) - x_angles) / dt
-
-        # # Fix the last sample (which was wrapped around)
-        # z_dot[-1] = z_dot[-2]
-        # x_dot[-1] = x_dot[-2]
-
-        # # y_dot is zero, so we omit it
-        
-        # # --- Component 1: z_dot around parent's j1 axis (in world frame) ---
-        # # This is the Z-axis in the J1 frame ([0,0,1]), rotated by R_wp @ R_pj1
-        # # The axis in world frame is R_wp @ j1_p_norm
-        # w_axis_j1_world = np.einsum('nij,j->ni', R_wp, j1_p_norm)
-        # w_rel_1_world = z_dot[:, np.newaxis] * w_axis_j1_world
-        # print(w_axis_j1_world[50])
-        # # --- Component 2: x_dot around the ZYX sequence's X-axis (in world frame) ---
-        # # This is the X-axis ([1,0,0]) *after* the Rz and Ry rotations.
-        # # Its orientation in the world is:
-        # # R_wp @ R_pj1 @ R_z(t) @ R_y(t) @ [1,0,0]
-        
-        # w_axis_j2_world = np.einsum('nij,j->ni', R_wc, j2_c_norm)
-        # w_rel_2_world = x_dot[:, np.newaxis] * w_axis_j2_world
-        # print(w_axis_j2_world[50])
-        # # Ideal total relative velocity is the sum of the two components
-        # w_rel_ideal = w_rel_1_world + w_rel_2_world
-        
-        # # Compare the actual (from IMU) vs ideal (from joint angles)
-        # # We skip the first few samples to avoid gradient artifacts at edges
-        # skip = 5 
-        # error = np.linalg.norm(w_rel_actual[skip:-skip] - w_rel_ideal[skip:-skip], axis=1)
-        
-        # print(f"2-DOF Joint Gen: Mean w_rel (actual vs. ideal) error: {np.mean(error):.6f} rad/s")
-
-        # j3_world = np.cross(w_axis_j1_world, w_axis_j2_world)
-        # dot_products = np.einsum('ni,ni->n', w_rel_actual, j3_world)
-        # print(f"2-DOF Joint Gen: Mean dot(w_rel_actual, j1 x j2): {np.mean(dot_products):.6f} (should be near 0)")
-        # dot_products_ideal = np.einsum('ni,ni->n', w_rel_ideal, j3_world)
-        # print(f"2-DOF Joint Gen: Mean dot(w_rel_ideal, j1 x j2): {np.mean(dot_products_ideal):.6f} (should be near 0)")
-
-        # # The magnitude of the cross product of joint axes in the real world should also be constant
-        # j3 = np.cross(w_axis_j1_world, w_axis_j2_world)
-        # j3_magnitudes = np.linalg.norm(j3, axis=1)
-        # print(f"2-DOF Joint Gen: Joint axes cross-product magnitude (should be constant): "
-        #       f"mean={np.mean(j3_magnitudes):.6f}, std={np.std(j3_magnitudes):.6f}")
-        # # --- End of new code block --
-        return PlateTrial(f"{self.name}_child_dof2", child_imu_trace, child_world_trace)
-
-    def generate_3dof_plate(
-        self,
-        joint_center_parent: np.ndarray,
-        joint_center_child: np.ndarray,
-        parent_to_joint_rotation: Rotation = None,
-        child_to_joint_rotation: Rotation = None,
-        add_noise: bool = True,
-        gyro_noise_std: float = 0.005,
-        acc_noise_std: float = 0.05
-    ) -> 'PlateTrial':
-        """
-        Generates a child PlateTrial connected by a 3-DOF spherical joint.
-        The kinematic chain is:
-        R_child = R_parent @ R_p2j @ R_joint_motion(zyx) @ R_c2j.inv()
-        """
-        if parent_to_joint_rotation is None: parent_to_joint_rotation = Rotation.random()
-        if child_to_joint_rotation is None: child_to_joint_rotation = Rotation.random()
-
-        parent_world_trace = self.world_trace
-        num_samples = len(parent_world_trace)
-        duration = parent_world_trace.timestamps[-1] - parent_world_trace.timestamps[0]
-
-        angles = [_generate_smooth_motion_profile(num_samples, duration, max_amp=np.pi/2) for _ in range(3)]
-        R_joint_motion = Rotation.from_euler('zyx', np.vstack(angles).T)
-
-        R_parent_matrices = self.world_trace.rotations
-        R_p2j_mat = parent_to_joint_rotation.as_matrix()
-        R_c2j_inv_mat = child_to_joint_rotation.as_matrix().T
-        R_rel_total_matrices = R_p2j_mat @ R_joint_motion.as_matrix() @ R_c2j_inv_mat
-        R_child_matrices = R_parent_matrices @ R_rel_total_matrices
-
-        P_parent = self.world_trace.positions
-        parent_offset_global = (R_parent_matrices @ joint_center_parent).squeeze()
-        child_offset_global = (R_child_matrices @ joint_center_child).squeeze()
-        P_child = P_parent + parent_offset_global - child_offset_global
-
-        child_world_trace = WorldTrace(
-            timestamps=parent_world_trace.timestamps,
-            positions=[row for row in P_child],
-            rotations=[mat for mat in R_child_matrices]
-        )
-
-        gravity = np.array([0, 0, -9.81])
-        child_imu_trace = child_world_trace.calculate_imu_trace(acc_from_gravity=gravity)
-        if add_noise:
-            child_imu_trace = child_imu_trace.add_noise(gyro_noise_std, acc_noise_std)
-
-        return PlateTrial(f"{self.name}_child_dof3", child_imu_trace, child_world_trace)

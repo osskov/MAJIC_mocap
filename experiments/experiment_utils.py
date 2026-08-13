@@ -29,9 +29,11 @@ from rich.table import Table
 import paths
 from paths import (DATA_DIR, RESULTS_DIR, raw_trial_dir, ensure_parent, write_manifest,
                    read_manifest)
+from src.toolchest.building.sources import SOURCES, TrialSource, get_source
 from src.toolchest.IMUTrace import IMUTrace
 from src.toolchest.PlateTrial import PlateTrial
 from src.toolchest.WorldTrace import WorldTrace
+from src.toolchest.gyro_utils import relative_rotvec
 from src.toolchest import trial_io
 from src.RelativeFilterPlus import RelativeFilter
 from src import relative_filter_fast
@@ -280,8 +282,15 @@ TRIAL_DATASET = 'alborno'
 # resample logic) fails open: someone adds a constant, forgets to list it here, and
 # every downstream result is quietly computed from stale inputs. Blunt-and-safe wins
 # because a rebuild is 8 s per trial and a silently stale cache is a retracted figure.
+#
+# Paths are relative to src/toolchest. The whole building/ package is in here because it
+# now owns every step between a file on disk and a PlateTrial — parsing, reconstruction,
+# sync, alignment. It determines a cached trial's contents as directly as the physics does,
+# and leaving any of it out would be exactly the fail-open hole this list exists to avoid.
 _CONTENT_MODULES = ('PlateTrial.py', 'WorldTrace.py', 'IMUTrace.py',
-                    'gyro_utils.py', 'finite_difference_utils.py')
+                    'gyro_utils.py', 'finite_difference_utils.py',
+                    'building/xsens.py', 'building/reconstruction.py',
+                    'building/assembly.py', 'building/alborno.py')
 
 # Cutoff for the alignment-residual diagnostic below.
 _RESIDUAL_LOWPASS_HZ = 10.0
@@ -311,41 +320,44 @@ def _toolchest_digest() -> str:
 # case is covered from the other side: if the loader ever starts reading a new file,
 # that is a change to IMUTrace.py or PlateTrial.py, and the toolchest digest invalidates
 # everything on its own.
-_SOURCE_GLOBS = ('*.trc', 'imu data/*.txt', '*.txt')
-
-
-def _source_inventory(folder: Path) -> List[Dict[str, Any]]:
+def _source_inventory(folder: Path, globs: Tuple[str, ...]) -> List[Dict[str, Any]]:
     """Names and byte counts of the files a trial load reads, sorted.
 
-    Sizes rather than content hashes: `data/` is declared read-only (see paths.py), so
-    the realistic failure is a file being replaced or a re-download landing a different
-    trial, both of which change the size. Hashing 76 MB of .trc on every cache check
-    would buy protection against an edit the repo's own rules forbid.
+    `globs` come from the dataset's TrialSource, because which files matter is a property
+    of the dataset, not of the cache. Al Borno's are `*.trc` and `imu data/*.txt`; IMoVE's
+    will be `mocap_data/*.csv` and `imu_data/*.txt`.
+
+    Sizes rather than content hashes: `data/` is declared read-only (see paths.py), so the
+    realistic failure is a file being replaced or a re-download landing a different trial,
+    both of which change the size. Hashing 76 MB of .trc on every cache check would buy
+    protection against an edit the repo's own rules forbid.
     """
-    found = {p for glob in _SOURCE_GLOBS for p in folder.glob(glob)}
+    found = {p for glob in globs for p in folder.glob(glob)}
     return [{'name': str(p.relative_to(folder)), 'bytes': p.stat().st_size}
             for p in sorted(found) if p.is_file() and not p.name.startswith('.')]
 
 
-def trial_cache_key(subject: str, activity: str, align: bool) -> Dict[str, Any]:
+def trial_cache_key(subject: str, trial: str, align: bool,
+                    dataset: str = TRIAL_DATASET) -> Dict[str, Any]:
     """Everything that determines a cached trial's contents.
 
-    Compared field-by-field against the stored manifest on load; any difference is a
-    cache miss. Note `align` is in here because `PlateTrial.from_folder`'s
-    align_plate_trials flag changes every rotation in the file.
+    Compared field-by-field against the stored manifest on load; any difference is a cache
+    miss. `align` is in here because the sensor-to-segment alignment rewrites every rotation
+    in the file, and `dataset` selects which source's layout and globs to key against.
     """
+    source = get_source(dataset)
     return {
         'schema_version': trial_io.SCHEMA_VERSION,
         'toolchest_digest': _toolchest_digest(),
         'align_plate_trials': align,
-        'sources': _source_inventory(raw_trial_dir(subject, activity)),
+        'sources': _source_inventory(source.source_dir(subject, trial), source.source_globs),
     }
 
 
 def _alignment_residuals(plate: PlateTrial) -> Dict[str, float]:
     """How well a plate's measured gyro matches the one implied by its mocap rotations.
 
-    This is the number to triage on: after `_align_world_trace_to_imu_trace` the two
+    This is the number to triage on: after `assembly.align_world_to_imu` the two
     should agree, and a plate where they do not has a bad sync lag, a bad alignment, or
     corrupt marker reconstruction underneath it.
 
@@ -417,22 +429,23 @@ def trial_diagnostics(plates: Dict[str, PlateTrial]) -> Dict[str, Any]:
     }
 
 
-def save_cached_trial(plates: Dict[str, PlateTrial], subject: str, activity: str,
+def save_cached_trial(plates: Dict[str, PlateTrial], subject: str, trial: str,
                       align: bool = True, dataset: str = TRIAL_DATASET) -> Path:
     """Writes a trial's PlateTrials plus the manifest that validates them on load."""
-    path = ensure_parent(paths.cached_trial_path(dataset, f"Subject{subject}", activity))
+    source = get_source(dataset)
+    path = ensure_parent(paths.cached_trial_path(dataset, subject, trial))
     trial_io.plates_to_frame(plates).to_parquet(path, engine='pyarrow', index=False)
     write_manifest(
         path,
-        cache_key=trial_cache_key(subject, activity, align),
-        dataset=dataset, subject=f"Subject{subject}", activity=activity,
-        source=str(raw_trial_dir(subject, activity).relative_to(paths.REPO_ROOT)),
+        cache_key=trial_cache_key(subject, trial, align, dataset),
+        dataset=dataset, subject=subject, trial=trial,
+        source=str(source.source_dir(subject, trial).relative_to(paths.REPO_ROOT)),
         diagnostics=trial_diagnostics(plates),
     )
     return path
 
 
-def cached_trial_status(subject: str, activity: str, align: bool = True,
+def cached_trial_status(subject: str, trial: str, align: bool = True,
                         dataset: str = TRIAL_DATASET) -> Tuple[str, Optional[str]]:
     """(status, reason) for one trial's cache entry, without loading the parquet.
 
@@ -442,18 +455,20 @@ def cached_trial_status(subject: str, activity: str, align: bool = True,
       'stale'   — cached, but built from different inputs or code; reason names the field
       'absent'  — the SOURCE trial does not exist, so there is nothing to cache
 
-    'absent' is separate from 'missing' because SUBJECTS x ACTIVITIES is a full cross
-    product and the dataset is not: Subjects 05, 08 and 10 have no complexTasks trial.
-    Reporting those as failures buries the real ones in expected noise.
+    'absent' should not arise now that TrialSource.enumerate_trials lists what is on disk
+    rather than crossing two constants — it existed because SUBJECTS x ACTIVITIES claimed
+    trials the dataset does not have. It is kept for the case a listed trial's files vanish
+    between enumeration and the build.
 
-    Split out from `load_cached_trial` so `cache_trials.py --check` can audit the tree
-    cheaply, and so a stale entry reports WHICH input moved rather than just rebuilding.
+    Split out from `load_trial` so `build_trials.py --check` can audit the tree cheaply, and
+    so a stale entry reports WHICH input moved rather than just rebuilding.
     """
-    folder = raw_trial_dir(subject, activity)
-    if not folder.is_dir() or not _source_inventory(folder):
+    source = get_source(dataset)
+    folder = source.source_dir(subject, trial)
+    if not folder.is_dir() or not _source_inventory(folder, source.source_globs):
         return 'absent', f'no source trial at {folder.relative_to(paths.REPO_ROOT)}'
 
-    path = paths.cached_trial_path(dataset, f"Subject{subject}", activity)
+    path = paths.cached_trial_path(dataset, subject, trial)
     if not path.exists():
         return 'missing', None
 
@@ -465,7 +480,7 @@ def cached_trial_status(subject: str, activity: str, align: bool = True,
     if stored is None:
         return 'stale', 'manifest predates cache_key'
 
-    expected = trial_cache_key(subject, activity, align)
+    expected = trial_cache_key(subject, trial, align, dataset)
     for field, want in expected.items():
         if stored.get(field) != want:
             if field == 'sources':
@@ -474,37 +489,43 @@ def cached_trial_status(subject: str, activity: str, align: bool = True,
     return 'fresh', None
 
 
-def load_cached_trial(subject: str, activity: str, align: bool = True,
-                      dataset: str = TRIAL_DATASET) -> Optional[Dict[str, PlateTrial]]:
-    """The cached trial if it is still valid, else None.
+class StaleTrialCache(RuntimeError):
+    """A trial's parquet is missing, or was built from different inputs or code.
 
-    Staleness is a miss, never a silent hit: the caller falls back to loading from
-    source, so a stale cache costs time and never correctness.
+    Raised rather than silently falling back to parsing from source. That fallback made a
+    stale cache cost time and nothing else, which sounds safe and is the problem: it also
+    made it invisible, and it meant a run could mix cached and freshly-parsed trials with no
+    record of which was which. The manifest's job is to say what code version produced the
+    data a result rests on; a fallback means the result may not rest on it at all.
     """
-    status, reason = cached_trial_status(subject, activity, align, dataset)
+
+
+def load_trial(subject: str, trial: str, align: bool = True,
+               dataset: str = TRIAL_DATASET) -> Dict[str, PlateTrial]:
+    """One trial's PlateTrials, read from its parquet.
+
+    The parquet is the interface, not an optimisation: this never parses from source. Build
+    it first with `python -m experiments.build_trials --dataset <name>`.
+
+    Raises StaleTrialCache if the artifact is missing or no longer matches its inputs.
+    """
+    status, reason = cached_trial_status(subject, trial, align, dataset)
     if status != 'fresh':
-        if status == 'stale' and os.environ.get("DISABLE_TQDM") != "True":
-            print(f"Trial cache stale for Subject{subject}/{activity} ({reason}); loading from source.")
-        return None
-    path = paths.cached_trial_path(dataset, f"Subject{subject}", activity)
+        detail = f" ({reason})" if reason else ""
+        raise StaleTrialCache(
+            f"{dataset}/{subject}/{trial}: trial cache is {status}{detail}. "
+            f"Run: python -m experiments.build_trials --dataset {dataset}")
+    path = paths.cached_trial_path(dataset, subject, trial)
     return trial_io.plates_from_frame(pd.read_parquet(path, engine='pyarrow'))
 
-# ==============================================================================
-# Raw data loading
-# ==============================================================================
 
-def load_raw_data(subject: str, activity: str, use_cache: bool = True,
-                  align: bool = True) -> Dict[str, PlateTrial]:
-    """A trial's PlateTrials, from the cache when it is valid and from source otherwise.
+def load_raw_data(subject: str, activity: str, align: bool = True) -> Dict[str, PlateTrial]:
+    """Deprecated name for `load_trial`, kept so existing experiments keep working.
 
-    Transparent by design: a missing or stale cache changes how long this takes and
-    nothing else. Populate the cache with `python -m experiments.cache_trials`.
+    Misleading now: it does not load raw data, it reads a built trial.
     """
-    if use_cache:
-        plates = load_cached_trial(subject, activity, align=align)
-        if plates is not None:
-            return plates
-    return PlateTrial.from_folder(raw_trial_dir(subject, activity), align_plate_trials=align)
+    return load_trial(subject, activity, align=align)
+
 
 # ==============================================================================
 # Gravity convention check
@@ -519,10 +540,20 @@ def measure_world_frame_gravity(plates: Dict[str, PlateTrial]) -> np.ndarray:
     which is exactly what EXPECTED_GRAVITY is supposed to be. Measured spread
     across this dataset is 0.035 m/s^2, so it is a sharp check, not a fuzzy one.
     """
-    world_accs = [
-        np.einsum('nij,nj->ni', plate.world_trace.rotations, plate.imu_trace.acc).mean(axis=0)
-        for plate in plates.values()
-    ]
+    # Valid frames only. The rotation is what puts the reading in the world frame, so a
+    # frame whose pose is padded or corrupt contributes a correctly-measured accelerometer
+    # vector rotated by the wrong matrix — which is worse than no sample at all. Since
+    # alignment stopped trimming, the padded stretches can outnumber the real ones.
+    world_accs = []
+    for plate in plates.values():
+        valid = np.asarray(plate.valid)
+        if not valid.any():
+            continue
+        rotated = np.einsum('nij,nj->ni', plate.world_trace.rotations[valid],
+                            plate.imu_trace.acc[valid])
+        world_accs.append(rotated.mean(axis=0))
+    if not world_accs:
+        raise ValueError("No plate has a valid frame; cannot measure world-frame gravity.")
     return np.mean(world_accs, axis=0)
 
 
@@ -555,11 +586,22 @@ def check_gravity_convention(plates: Dict[str, PlateTrial], tol: float = 0.5,
 # ==============================================================================
 
 def _compute_expected_mag_field(plate_trials: List[PlateTrial]) -> np.ndarray:
-    """Median world-frame magnetic field across all torso-mounted IMU readings."""
-    all_global_mags = [
-        (plate.world_trace.rotations @ plate.imu_trace.mag[..., None])[..., 0]
-        for plate in plate_trials if 'torso' in plate.name
-    ]
+    """Median world-frame magnetic field across all torso-mounted IMU readings.
+
+    Valid frames only, for the same reason as measure_world_frame_gravity: rotating a real
+    magnetometer reading by a padded or corrupt pose puts it somewhere it never was.
+    """
+    all_global_mags = []
+    for plate in plate_trials:
+        if 'torso' not in plate.name:
+            continue
+        valid = np.asarray(plate.valid)
+        if not valid.any():
+            continue
+        all_global_mags.append(
+            (plate.world_trace.rotations[valid] @ plate.imu_trace.mag[valid][..., None])[..., 0])
+    if not all_global_mags:
+        raise ValueError("No torso plate has a valid frame; cannot estimate the field.")
     return np.median(np.concatenate(all_global_mags, axis=0), axis=0)
 
 
@@ -929,6 +971,20 @@ def _run_relative_filter(parent_trial: PlateTrial,
 # Joint angles per method kind
 # ==============================================================================
 
+def _joint_valid(parent_plate: PlateTrial, child_plate: PlateTrial) -> np.ndarray:
+    """Per-frame validity of a JOINT: both segments have to be trustworthy.
+
+    A joint angle is a relative rotation between two plates, so it inherits the worse of
+    the two masks. One corrupt plate takes the frame out of every joint it participates in
+    — Subject06's femur_l invalidates both L_Hip and L_Knee at those frames, not one.
+
+    This is the column that carries plate-level validity into the error statistics, which
+    is what makes it safe to stop trimming traces at load: an unscoreable frame becomes one
+    that is present and excluded, rather than one that was silently deleted.
+    """
+    return np.asarray(parent_plate.valid) & np.asarray(child_plate.valid)
+
+
 def _joint_angles_from_marker(plates: Dict[str, PlateTrial]) -> pd.DataFrame:
     all_joint_data = []
     any_plate = next(iter(plates.values()))
@@ -950,6 +1006,7 @@ def _joint_angles_from_marker(plates: Dict[str, PlateTrial]) -> pd.DataFrame:
             'rx': rotvec[:, 0],
             'ry': rotvec[:, 1],
             'rz': rotvec[:, 2],
+            'valid': _joint_valid(parent_plate, child_plate),
         })
         all_joint_data.append(df)
 
@@ -1007,6 +1064,10 @@ def _joint_angles_from_filter(plates: Dict[str, PlateTrial], project: bool, mag_
             'rx': rotvec[:, 0],
             'ry': rotvec[:, 1],
             'rz': rotvec[:, 2],
+            # The filter's own output is defined everywhere it ran; `valid` describes the
+            # GROUND TRUTH it will be scored against, which is why it is the same column
+            # for every method on a given trial.
+            'valid': _joint_valid(parent_plate, child_plate),
         })
         all_joint_data.append(df)
 
@@ -1067,10 +1128,42 @@ def _joint_angles_from_ekf(plates: Dict[str, PlateTrial], acc_source: str = 'rea
     return pd.concat(all_joint_data, ignore_index=True) if all_joint_data else pd.DataFrame()
 
 
+def run_window(plates: Dict[str, PlateTrial]) -> slice:
+    """The span a filter should actually be run over: t = 0 to the last scoreable frame.
+
+    Since alignment stopped trimming, a trial carries the whole inertial record — 430 s of
+    it before t = 0 on Subject01's walking trial. None of that is scoreable, and a filter
+    run through it would pay 1.7x the runtime to produce output nobody can evaluate.
+
+    The start is t = 0, which is the first overlap sample and therefore the exact instant
+    the old code re-zeroed to; filters see an identical first sample, so the burn-in
+    transient that dominates pooled error is unchanged.
+
+    The end is the last frame valid on ANY plate, taken trial-wide rather than per plate so
+    that one corrupt segment cannot shorten the run for the others. For IMoVE's long-walk
+    trials this spans the first mocap take to the last, gaps included — which is right, since
+    the filter has to run continuously through them to carry its state across.
+    """
+    any_plate = next(iter(plates.values()))
+    timestamps = any_plate.imu_trace.timestamps
+    start = int(np.searchsorted(timestamps, 0.0))
+
+    scoreable = np.logical_or.reduce([np.asarray(p.valid) for p in plates.values()])
+    if not scoreable.any():
+        return slice(start, len(timestamps))
+    return slice(start, int(np.flatnonzero(scoreable)[-1]) + 1)
+
+
 def compute_joint_angles(plates: Dict[str, PlateTrial], method: str,
                           stds: Optional[Dict[str, float]] = None) -> pd.DataFrame:
     """Joint angles for one method. `stds` overrides the DEFAULT_*_STD tuning per
-    sensor (see resolve_stds); it is inert for 'marker', which runs no filter."""
+    sensor (see resolve_stds); it is inert for 'marker', which runs no filter.
+
+    Every method is evaluated over the same `run_window`, so their outputs share a timestamp
+    axis and `compute_error_stats` can merge them frame for frame.
+    """
+    window = run_window(plates)
+    plates = {name: plate[window] for name, plate in plates.items()}
     spec = resolve_method_spec(method)
     if spec['kind'] == 'marker':
         return _joint_angles_from_marker(plates)
@@ -1124,6 +1217,31 @@ def load_joint_angles(subject: str, activity: str, method: str,
     return pd.read_parquet(path, engine='pyarrow') if path.exists() else None
 
 
+LABEL_COLUMNS = ('joint_name', 'subject', 'trial_type', 'method')
+
+
+def as_categorical_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """Store the label columns as categoricals rather than Python string objects.
+
+    These four columns hold a handful of distinct values each, but as object dtype every
+    cell is a separate str: measured on the pooled table (40.8M rows across 11 subjects
+    x 2 activities x 5 methods) they were 9.2 of 10.5 GB, and categorical brings the whole
+    frame to 1.5 GB. That is the difference between the pooled summary fitting in memory
+    and not, and it compounds with the method count -- the noise sweep has 176 of them.
+
+    It also saves time downstream: merge and groupby both factorise these columns, and
+    categorical arrives pre-factorised.
+
+    Anything grouping or pivoting on these columns afterwards must pass observed=True, or
+    pandas expands to the full cartesian product of categories and invents all-NaN rows
+    for combinations that were never run.
+    """
+    for col in LABEL_COLUMNS:
+        if col in df.columns and not isinstance(df[col].dtype, pd.CategoricalDtype):
+            df[col] = df[col].astype('category')
+    return df
+
+
 def load_all_joint_angles(subjects: List[str], activities: List[str], methods: List[str],
                           variant: Optional[str] = None) -> pd.DataFrame:
     frames = []
@@ -1136,7 +1254,9 @@ def load_all_joint_angles(subjects: List[str], activities: List[str], methods: L
                         print(f"Warning: missing joint angles for Subject{subject}/{activity}/{method} — skipping")
                     continue
                 frames.append(df.assign(subject=f"Subject{subject}", trial_type=activity, method=method))
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not frames:
+        return pd.DataFrame()
+    return as_categorical_labels(pd.concat(frames, ignore_index=True))
 
 # ==============================================================================
 # Statistics
@@ -1159,13 +1279,31 @@ def compute_error_stats(df: pd.DataFrame) -> pd.DataFrame:
     if merged_df.empty:
         return pd.DataFrame()
 
+    # Drop frames whose GROUND TRUTH is not trustworthy — interpolated marker poses,
+    # unresolved reconstruction failures, and (once alignment stops trimming) the stretches
+    # of IMU record the mocap never covered. Scoring against an invented pose measures the
+    # invention, not the filter.
+    #
+    # Filtered on the marker side specifically: `valid` describes the reference, and the
+    # IMU-side copy is the same values for the same trial. Absent on artifacts written
+    # before the column existed, which are treated as fully valid — that was the effective
+    # behaviour when they were produced, so it reproduces them rather than silently
+    # reinterpreting them.
+    if 'valid_marker' in merged_df.columns:
+        merged_df = merged_df[merged_df['valid_marker'].to_numpy(dtype=bool)]
+    elif 'valid' in merged_df.columns:
+        merged_df = merged_df[merged_df['valid'].to_numpy(dtype=bool)]
+    if merged_df.empty:
+        return pd.DataFrame()
+
     rotvec_imu = merged_df[['rx_imu', 'ry_imu', 'rz_imu']].to_numpy()
     rotvec_marker = merged_df[['rx_marker', 'ry_marker', 'rz_marker']].to_numpy()
 
-    r_imu = Rotation.from_rotvec(rotvec_imu)
-    r_marker = Rotation.from_rotvec(rotvec_marker)
-    r_error = r_imu * r_marker.inv()
-    rotvec_error = r_error.as_rotvec()
+    # rotvec of (R_imu @ R_marker^-1). relative_rotvec is the scipy expression
+    #     (Rotation.from_rotvec(imu) * Rotation.from_rotvec(marker).inv()).as_rotvec()
+    # done in plain numpy: identical to ~1e-15 rad but ~9x faster, and this runs on every
+    # sample of every method, which made it 45% of this function.
+    rotvec_error = relative_rotvec(rotvec_imu, rotvec_marker)
 
     merged_df['X'] = rotvec_error[:, 0]
     merged_df['Y'] = rotvec_error[:, 1]
@@ -1181,16 +1319,25 @@ def compute_error_stats(df: pd.DataFrame) -> pd.DataFrame:
         merged_df[f'{col}_sq'] = merged_df[col] ** 2
         merged_df[f'{col}_abs'] = merged_df[col].abs()
 
-    # Fast built-in aggregations across wide format
-    grouped = merged_df.groupby(group_cols)
+    # Fast built-in aggregations across wide format.
+    #
+    # observed=True is required, not cosmetic: load_all_joint_angles hands the label
+    # columns over as categoricals (88% of this table's memory otherwise), and a
+    # categorical groupby without it expands to the full cartesian product of categories,
+    # inventing all-NaN rows for subject/method/joint combinations that were never run.
+    grouped = merged_df.groupby(group_cols, observed=True)
 
     means = grouped[target_cols].mean()
     stds = grouped[target_cols].std()
     mins = grouped[target_cols].min()
     maxs = grouped[target_cols].max()
-    medians = grouped[target_cols].median()
-    q25s = grouped[target_cols].quantile(0.25)
-    q75s = grouped[target_cols].quantile(0.75)
+    # One pass for all three order statistics rather than three: each quantile() call
+    # sorts every group independently, so asking together is ~2.5x cheaper. quantile(0.5)
+    # and median() agree exactly, including for even-sized groups.
+    quantiles = grouped[target_cols].quantile([0.25, 0.5, 0.75])
+    q25s = quantiles.xs(0.25, level=-1)
+    medians = quantiles.xs(0.50, level=-1)
+    q75s = quantiles.xs(0.75, level=-1)
     maes = grouped[[f'{c}_abs' for c in target_cols]].mean().rename(columns=lambda c: c.replace('_abs', ''))
     rmses = np.sqrt(grouped[[f'{c}_sq' for c in target_cols]].mean()).rename(columns=lambda c: c.replace('_sq', ''))
 
@@ -1212,6 +1359,14 @@ def compute_error_stats(df: pd.DataFrame) -> pd.DataFrame:
         summary_list.append(melted.set_index(group_cols + ['axis']))
 
     summary_df = pd.concat(summary_list, axis=1).reset_index()
+    # Hand the label columns back as plain strings whatever came in. The input may arrive
+    # with them as categoricals (load_all_joint_angles does that for the memory), and
+    # leaking that dtype into the statistics tables would change how every downstream
+    # consumer sorts, uniques and groups them for no benefit — the output is a few hundred
+    # rows, so there is nothing to save here.
+    for col in group_cols:
+        if isinstance(summary_df[col].dtype, pd.CategoricalDtype):
+            summary_df[col] = summary_df[col].astype(str)
     return summary_df
 
 
@@ -1416,7 +1571,7 @@ def compute_stats_worker(row_key: Tuple[str, str], stage_labels: List[str], shar
             shared_state[(row_key, stage)] = "Failed"
             return None
 
-        all_df = pd.concat(frames, ignore_index=True)
+        all_df = as_categorical_labels(pd.concat(frames, ignore_index=True))
         stats_df = compute_error_stats(all_df)
         if not stats_df.empty:
             stats_path = ensure_parent(paths.per_subject_statistics_path(stats_name, subject, activity))

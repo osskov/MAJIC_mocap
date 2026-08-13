@@ -50,7 +50,7 @@ The misalignment floor, and why no choice of frame removes it
 ------------------------------------------------------------
 The reference is built by rotating a world-frame acceleration into the body frame with the
 mocap orientation, while the estimate is measured in the sensor's true frame. Any residual
-sensor-to-segment misalignment left by PlateTrial._align_world_trace_to_imu_trace therefore
+sensor-to-segment misalignment left by assembly.align_world_to_imu therefore
 turns into an apparent projection error of roughly (angle) x |a|, and since |a| is dominated
 by gravity, 1 deg tilts it by ~0.17 m/s^2. That term adds in quadrature with everything else
 in the residual, so whether it matters is an empirical question and not one to assume —

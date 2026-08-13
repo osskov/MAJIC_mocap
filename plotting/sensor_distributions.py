@@ -511,7 +511,11 @@ def plot_foot_stationary(foot_df: pd.DataFrame, intervals: pd.DataFrame, subject
     detected stationary periods shaded. Time base is the RAW IMU clock, not the
     mocap-synced one — these periods usually sit outside the captured mocap window, which
     is exactly why the noise floor is measured on the untrimmed traces."""
-    stationary = intervals[(intervals['label'] == 'foot_stationary') & (intervals['time_base'] == 'raw')]
+    # No time_base filter: foot-stationary intervals used to be indexed against the raw IMU
+    # files while everything else was indexed against the trimmed PlateTrial. There is one
+    # timeline now, so the label alone identifies them, and filtering on 'raw' would find
+    # nothing in artifacts written since.
+    stationary = intervals[intervals['label'] == 'foot_stationary']
     if foot_df.empty or stationary.empty:
         print(f"No stationary foot periods for Subject{subject}/{activity}, skipping diagnostic.")
         return

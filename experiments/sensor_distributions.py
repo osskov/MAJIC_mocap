@@ -416,7 +416,7 @@ def label_activity_intervals(plates: Dict[str, PlateTrial], fs: float
     return {'sitting': sitting, 'standing': standing, 'ambulation': mask_to_intervals(~quiet_mask)}
 
 
-def find_foot_stationary_intervals(raw_imus: Dict[str, IMUTrace]) -> Tuple[List[Tuple[int, int]], List[str]]:
+def find_foot_stationary_intervals(imu_traces: Dict[str, IMUTrace]) -> Tuple[List[Tuple[int, int]], List[str]]:
     """Intervals where BOTH feet are completely stationary, for the intrinsic noise floor.
 
     Both feet, because one foot can sit still while the subject shifts weight on the other
@@ -425,22 +425,29 @@ def find_foot_stationary_intervals(raw_imus: Dict[str, IMUTrace]) -> Tuple[List[
     STATIONARY_MARGIN_S at both ends so that the rolling-std detector's own edges (where
     the window straddles motion) are not measured as noise.
 
-    Operates on RAW, untrimmed IMUTraces, not PlateTrials: PlateTrial.from_folder syncs to
-    the mocap .trc and trims to the overlap, and the long anchored-foot pauses this needs
-    usually sit before or after the captured mocap window. Returns ([], []) when the trial
-    has no long-enough pause, which is a normal outcome for walking trials.
+    Takes the PlateTrial IMU traces. This used to require the raw files instead, because the
+    anchored-foot pauses mostly sit before or after the mocap window and the old alignment
+    trimmed them off - it left 3 of 19 trials with any usable pause at all, and 20% of the
+    stationary time. Alignment no longer discards inertial data, so the plates carry the full
+    record and both figures are back to 13 of 19 and 100%.
+
+    Deliberately NOT restricted to `valid` frames: validity describes the mocap ground truth,
+    and this measurement does not use it. Every inertial sample in a plate is a real
+    measurement, which is exactly why the world trace is the one that gets padded.
+
+    Returns ([], []) when the trial has no long-enough pause, still a normal outcome.
     """
-    foot_sensors = [s for s in FOOT_SENSORS if s in raw_imus]
+    foot_sensors = [s for s in FOOT_SENSORS if s in imu_traces]
     if not foot_sensors:
         return [], []
 
-    fs = raw_imus[foot_sensors[0]].get_sample_frequency()
+    fs = imu_traces[foot_sensors[0]].get_sample_frequency()
     window = max(int(STATIONARY_WINDOW_S * fs), 2)
-    n = min(len(raw_imus[s]) for s in foot_sensors)
+    n = min(len(imu_traces[s]) for s in foot_sensors)
 
     is_stationary = np.ones(n, dtype=bool)
     for sensor in foot_sensors:
-        gyro_norm = np.linalg.norm(raw_imus[sensor].gyro[:n], axis=1)
+        gyro_norm = np.linalg.norm(imu_traces[sensor].gyro[:n], axis=1)
         rolling_std = pd.Series(gyro_norm).rolling(window=window, center=True).std().to_numpy()
         is_stationary &= (rolling_std < STATIONARY_GYRO_STD_THRESHOLD) & (~np.isnan(rolling_std))
 
@@ -453,25 +460,29 @@ def find_foot_stationary_intervals(raw_imus: Dict[str, IMUTrace]) -> Tuple[List[
 
 
 def intervals_table(activity_intervals: Dict[str, List[Tuple[int, int]]], timestamps: np.ndarray,
-                    stationary_intervals: List[Tuple[int, int]],
-                    raw_timestamps: Optional[np.ndarray]) -> pd.DataFrame:
+                    stationary_intervals: List[Tuple[int, int]]) -> pd.DataFrame:
     """All labeled intervals for one trial, in one table.
 
-    `time_base` distinguishes the two clocks in play: 'synced' indices/times refer to the
-    mocap-synchronized PlateTrial (segment_samples, joint_samples), 'raw' ones to the
-    untrimmed IMU files (foot_samples). Mixing them up would place a shaded region tens of
-    seconds off, so the column is mandatory rather than implied by the label.
+    There is now ONE clock. `time_base` used to separate 'synced' indices (the trimmed
+    PlateTrial) from 'raw' ones (the untrimmed IMU files), because a foot-stationary interval
+    and a sitting interval were indexed against different arrays and mixing them up put a
+    shaded region tens of seconds out. Non-destructive alignment removed that distinction:
+    the plates carry the full inertial record, so every interval here indexes the same
+    timestamps.
+
+    The column is kept, always 'synced', so that figures and artifacts written before the
+    change still read. It carries no information now and can go once those are regenerated.
     """
     rows = []
     for label, intervals in activity_intervals.items():
         for start, end in intervals:
             rows.append({'label': label, 'time_base': 'synced', 'start_index': start, 'end_index': end,
                          'start_time': timestamps[start], 'end_time': timestamps[min(end, len(timestamps) - 1)]})
-    if raw_timestamps is not None:
-        for start, end in stationary_intervals:
-            rows.append({'label': 'foot_stationary', 'time_base': 'raw', 'start_index': start, 'end_index': end,
-                         'start_time': raw_timestamps[start],
-                         'end_time': raw_timestamps[min(end, len(raw_timestamps) - 1)]})
+    for start, end in stationary_intervals:
+        rows.append({'label': 'foot_stationary', 'time_base': 'synced',
+                     'start_index': start, 'end_index': end,
+                     'start_time': timestamps[min(start, len(timestamps) - 1)],
+                     'end_time': timestamps[min(end, len(timestamps) - 1)]})
     df = pd.DataFrame(rows, columns=['label', 'time_base', 'start_index', 'end_index',
                                      'start_time', 'end_time'])
     df['duration_s'] = df['end_time'] - df['start_time']
@@ -481,12 +492,12 @@ def intervals_table(activity_intervals: Dict[str, List[Tuple[int, int]]], timest
 # Per-sensor and per-joint scalars
 # ==============================================================================
 
-def foot_samples(raw_imus: Dict[str, IMUTrace], foot_sensors: List[str]) -> pd.DataFrame:
-    """Raw-time-base signal norms for the foot sensors, so the stationary-detection
-    diagnostic figure can be drawn without reloading the raw IMU files."""
+def foot_samples(plates: Dict[str, PlateTrial], foot_sensors: List[str]) -> pd.DataFrame:
+    """Foot-sensor signal norms, so the stationary-detection diagnostic figure can be drawn
+    without reloading anything. On the trial's single timeline, like every other table."""
     rows = []
     for sensor in foot_sensors:
-        trace = raw_imus[sensor]
+        trace = plates[sensor].imu_trace
         rows.append(pd.DataFrame({
             'timestamp': trace.timestamps.astype(np.float64),
             'sensor': sensor,
@@ -497,7 +508,7 @@ def foot_samples(raw_imus: Dict[str, IMUTrace], foot_sensors: List[str]) -> pd.D
     return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
-def sensor_stats(plates: Dict[str, PlateTrial], raw_imus: Optional[Dict[str, IMUTrace]],
+def sensor_stats(plates: Dict[str, PlateTrial],
                  stationary_intervals: List[Tuple[int, int]]) -> pd.DataFrame:
     """Per-sensor scalars for one trial: field-magnitude variability, non-gravity acceleration,
     median world-frame field, and (feet only) the intrinsic per-axis noise floor.
@@ -528,10 +539,26 @@ def sensor_stats(plates: Dict[str, PlateTrial], raw_imus: Optional[Dict[str, IMU
     """
     rows = []
     for sensor, plate in plates.items():
+        # Two different spans, on purpose.
+        #
+        # Anything that needs a mocap ROTATION - linacc_rms, the world-frame field - is
+        # restricted to valid frames, because outside them the world trace holds a constant
+        # padded pose and rotating a real reading by it puts the vector somewhere it never
+        # was. Since alignment stopped trimming, those padded stretches can outnumber the
+        # measured ones: 43656 of Subject01's 103981 frames.
+        #
+        # The reference-free magnitudes are held to the same span rather than taking the
+        # whole record, so that a trial's numbers stay comparable with each other and with
+        # what this experiment reported before. They would be defensible over the full
+        # record too - |mag| and |acc| need no orientation - but that is a different
+        # measurement and should be a deliberate one.
+        valid = np.asarray(plate.valid)
+        if not valid.any():
+            continue
         world = plate.get_imu_trace_in_global_frame()
-        mag_norm = np.linalg.norm(plate.imu_trace.mag, axis=1)
-        acc_norm = np.linalg.norm(plate.imu_trace.acc, axis=1)
-        linacc = np.linalg.norm(world.acc - EXPECTED_GRAVITY, axis=1)
+        mag_norm = np.linalg.norm(plate.imu_trace.mag[valid], axis=1)
+        acc_norm = np.linalg.norm(plate.imu_trace.acc[valid], axis=1)
+        linacc = np.linalg.norm(world.acc[valid] - EXPECTED_GRAVITY, axis=1)
         row = {
             'sensor': sensor,
             'segment': SENSOR_SEGMENT.get(sensor, sensor),
@@ -541,9 +568,9 @@ def sensor_stats(plates: Dict[str, PlateTrial], raw_imus: Optional[Dict[str, IMU
             'acc_norm_median': float(np.median(acc_norm)),
             'linacc_rms': float(np.sqrt(np.mean(linacc ** 2))),
             'linacc_median': float(np.median(linacc)),
-            'world_mag_x': float(np.median(world.mag[:, 0])),
-            'world_mag_y': float(np.median(world.mag[:, 1])),
-            'world_mag_z': float(np.median(world.mag[:, 2])),
+            'world_mag_x': float(np.median(world.mag[valid, 0])),
+            'world_mag_y': float(np.median(world.mag[valid, 1])),
+            'world_mag_z': float(np.median(world.mag[valid, 2])),
             'n_stationary_samples': 0,
         }
         for modality in ('gyro', 'acc', 'mag'):
@@ -552,15 +579,19 @@ def sensor_stats(plates: Dict[str, PlateTrial], raw_imus: Optional[Dict[str, IMU
         rows.append(row)
 
     by_sensor = {row['sensor']: row for row in rows}
-    if raw_imus is not None and stationary_intervals:
+    if stationary_intervals:
         # Feet only, and deliberately so: the intervals were defined by both feet being
         # still, which says nothing about the torso or thighs. Filling these columns for
         # every sensor would look like more data and be a measurement of postural sway.
+        #
+        # Over the FULL record, not the valid frames: the pauses mostly sit outside the
+        # mocap window, and every inertial sample is real regardless of whether the cameras
+        # were running. Recovering these is what the non-destructive alignment was for.
         for sensor in FOOT_SENSORS:
-            if sensor not in by_sensor or sensor not in raw_imus:
+            if sensor not in by_sensor or sensor not in plates:
                 continue
             row = by_sensor[sensor]
-            trace = raw_imus[sensor]
+            trace = plates[sensor].imu_trace
             weighted = {modality: np.zeros(3) for modality in ('gyro', 'acc', 'mag')}
             total = 0
             for start, end in stationary_intervals:
@@ -831,32 +862,30 @@ def compute_trial(subject: str, activity: str, plates: Dict[str, PlateTrial],
 
     `tables` restricts the work to a subset (see --only-tables). Anything only one table needs is
     skipped when that table is not wanted, which is what makes a targeted rerun cheap: the two
-    per-sample tables carry the rigid-body projection and dominate the runtime, and the raw
-    untrimmed IMU load only exists for the foot/noise tables.
+    per-sample tables carry the rigid-body projection and dominate the runtime.
 
-    Raw (untrimmed) IMUs are loaded here in addition to the synced plates — see
-    find_foot_stationary_intervals for why the noise floor cannot use the synced traces.
+    Everything comes from the plates. This used to load the raw IMU files as well, because the
+    noise floor needs anchored-foot pauses and the old alignment trimmed them away with the rest
+    of the record outside the mocap window. It no longer does, so there is one source and one
+    timeline.
     """
     wanted = set(tables)
     fs = plates['pelvis_imu'].imu_trace.get_sample_frequency()
     timestamps = plates['pelvis_imu'].imu_trace.timestamps
 
-    raw_imus, raw_timestamps = None, None
     stationary, foot_sensor_names = [], []
-    imu_folder = paths.raw_trial_dir(subject, activity) / "imu data"
-    if wanted & {'foot_samples', 'intervals', 'sensor_stats'} and imu_folder.exists():
-        raw_imus = IMUTrace.from_folder(imu_folder)
-        stationary, foot_sensor_names = find_foot_stationary_intervals(raw_imus)
-        if foot_sensor_names:
-            raw_timestamps = raw_imus[foot_sensor_names[0]].timestamps
+    if wanted & {'foot_samples', 'intervals', 'sensor_stats'}:
+        stationary, foot_sensor_names = find_foot_stationary_intervals(
+            {name: plate.imu_trace for name, plate in plates.items()})
 
     computed = {
         'segment_samples': lambda: segment_samples(plates, expected_mag),
         'joint_samples': lambda: joint_samples(plates, fs),
-        'foot_samples': lambda: foot_samples(raw_imus, foot_sensor_names) if raw_imus else pd.DataFrame(),
+        'foot_samples': lambda: (foot_samples(plates, foot_sensor_names)
+                                 if foot_sensor_names else pd.DataFrame()),
         'intervals': lambda: intervals_table(label_activity_intervals(plates, fs), timestamps,
-                                            stationary, raw_timestamps),
-        'sensor_stats': lambda: sensor_stats(plates, raw_imus, stationary),
+                                            stationary),
+        'sensor_stats': lambda: sensor_stats(plates, stationary),
         'joint_stats': lambda: joint_mag_consistency(plates, expected_mag).merge(
             joint_acc_residual(plates), on='joint', how='outer'),
     }

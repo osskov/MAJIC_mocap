@@ -29,9 +29,9 @@ from typing import Any, Dict, List, Tuple
 
 import paths
 from experiments.experiment_utils import (
-    SUBJECTS, ACTIVITIES, TRIAL_DATASET,
-    cached_trial_status, load_raw_data, run_tracked_grid, save_cached_trial,
+    TRIAL_DATASET, cached_trial_status, run_tracked_grid, save_cached_trial,
 )
+from src.toolchest.building.sources import SOURCES, get_source
 
 # Alignment residual above which a plate is called out at the end of a run. Chosen off
 # the observed spread on this dataset — Subject01/walking's eight plates sit at 8-14
@@ -41,16 +41,17 @@ from experiments.experiment_utils import (
 RESIDUAL_WARN_DEG_S = 25.0
 
 
-def cache_trial_worker(row_key: Tuple[str, str], stage_labels: List[str], shared_state: Dict,
-                       force: bool = False) -> Dict[str, Any]:
-    """stage_labels = ['cache']. Builds one trial's cache entry if it needs building."""
+def build_trial_worker(row_key: Tuple[str, str], stage_labels: List[str], shared_state: Dict,
+                       dataset: str = TRIAL_DATASET, force: bool = False) -> Dict[str, Any]:
+    """stage_labels = ['build']. Builds one trial's parquet if it needs building."""
     subject, activity = row_key
+    source = get_source(dataset)
     stage = stage_labels[0]
     shared_state[(row_key, stage)] = "Running"
     started = time.time()
 
     try:
-        status, reason = cached_trial_status(subject, activity)
+        status, reason = cached_trial_status(subject, activity, dataset=dataset)
         if status == 'absent':
             # Not an error: SUBJECTS x ACTIVITIES is a full cross product and the
             # dataset is not (Subjects 05, 08 and 10 have walking only).
@@ -62,11 +63,11 @@ def cache_trial_worker(row_key: Tuple[str, str], stage_labels: List[str], shared
             return {'subject': subject, 'activity': activity, 'action': 'skipped',
                     'status': status, 'reason': reason}
 
-        # use_cache=False: this is the thing that BUILDS the cache, so reading it would
-        # either be a no-op or, under --force, quietly re-serialize a stale entry
-        # instead of rebuilding from source.
-        plates = load_raw_data(subject, activity, use_cache=False)
-        path = save_cached_trial(plates, subject, activity)
+        # Straight to the dataset's reader. This is the thing that BUILDS the parquet, so
+        # it is the one place that may touch source files at all — everything else in the
+        # codebase goes through experiment_utils.load_trial, which reads only the artifact.
+        plates = source.load(subject, activity, True)
+        path = save_cached_trial(plates, subject, activity, dataset=dataset)
 
         manifest = paths.read_manifest(path) or {}
         diagnostics = manifest.get('diagnostics', {})
@@ -81,18 +82,18 @@ def cache_trial_worker(row_key: Tuple[str, str], stage_labels: List[str], shared
         return {'subject': subject, 'activity': activity, 'action': 'failed', 'error': str(e)}
 
 
-def report_check(row_keys: List[Tuple[str, str]]) -> None:
-    """Prints cache status for every trial without loading or writing anything."""
+def report_check(row_keys: List[Tuple[str, str]], dataset: str) -> None:
+    """Prints build status for every trial without loading or writing anything."""
     counts: Dict[str, int] = {}
-    for subject, activity in row_keys:
-        status, reason = cached_trial_status(subject, activity)
+    for subject, trial in row_keys:
+        status, reason = cached_trial_status(subject, trial, dataset=dataset)
         counts[status] = counts.get(status, 0) + 1
         detail = f"  ({reason})" if reason else ""
-        print(f"  Subject{subject}/{activity:14s} {status}{detail}")
+        print(f"  {subject}/{trial:22s} {status}{detail}")
     print("\n" + ", ".join(f"{n} {status}" for status, n in sorted(counts.items())))
 
 
-def report_build(results: Dict[Any, Dict[str, Any]]) -> None:
+def report_build(results: Dict[Any, Dict[str, Any]], out: str) -> None:
     """Summarizes a build pass: what was written, and which plates look suspect."""
     built = [r for r in results.values() if r and r['action'] == 'built']
     skipped = [r for r in results.values() if r and r['action'] == 'skipped']
@@ -102,10 +103,10 @@ def report_build(results: Dict[Any, Dict[str, Any]]) -> None:
     total_bytes = sum(r['bytes'] for r in built)
     print(f"\n{len(built)} built, {len(skipped)} already fresh, {len(absent)} not in the dataset,"
           f" {len(failed)} failed"
-          f"  ({total_bytes / 1e6:.0f} MB written to {paths.TRIALS_DIR.relative_to(paths.REPO_ROOT)}/{TRIAL_DATASET})")
+          f"  ({total_bytes / 1e6:.0f} MB written to {out})")
 
     for r in failed:
-        print(f"  FAILED Subject{r['subject']}/{r['activity']}: {r['error']}")
+        print(f"  FAILED {r['subject']}/{r['activity']}: {r['error']}")
 
     suspect = [
         (r['subject'], r['activity'], name, stats['gyro_residual_lowpass_rms_deg_s'])
@@ -117,38 +118,58 @@ def report_build(results: Dict[Any, Dict[str, Any]]) -> None:
         print(f"\nPlates with a low-passed gyro alignment residual over {RESIDUAL_WARN_DEG_S} deg/s —"
               f" worth a look before trusting their joint angles:")
         for subject, activity, name, residual in sorted(suspect, key=lambda t: -t[3]):
-            print(f"  Subject{subject}/{activity}/{name}: {residual:.1f} deg/s")
+            print(f"  {subject}/{activity}/{name}: {residual:.1f} deg/s")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build the PlateTrial parquet cache.")
-    parser.add_argument("--subjects", nargs='+', default=SUBJECTS, help="Subject IDs to cache.")
-    parser.add_argument("--activities", nargs='+', default=ACTIVITIES, help="Activities to cache.")
+    parser = argparse.ArgumentParser(description="Build the PlateTrial parquets.")
+    parser.add_argument("--dataset", default=TRIAL_DATASET, choices=sorted(SOURCES),
+                        help="Which registered dataset to build.")
+    parser.add_argument("--subjects", nargs='+', default=None,
+                        help="Restrict to these subject IDs (default: all the source lists).")
+    parser.add_argument("--trials", nargs='+', default=None,
+                        help="Restrict to these trial names (default: all the source lists).")
     parser.add_argument("--force", action="store_true", help="Rebuild even entries that are already fresh.")
-    parser.add_argument("--check", action="store_true", help="Report cache status and exit without writing.")
+    parser.add_argument("--check", action="store_true", help="Report status and exit without writing.")
     parser.add_argument("--workers", type=int, default=os.cpu_count())
     args = parser.parse_args()
 
-    for a in args.activities:
-        if a not in ACTIVITIES:
-            print(f"Error: Unknown activity '{a}'. Allowed: {ACTIVITIES}")
+    source = get_source(args.dataset)
+
+    # The source lists what is on disk, so a typo in --subjects is caught against reality
+    # rather than against a constant, and a subject with only one of two trials needs no
+    # special case.
+    row_keys = source.enumerate_trials()
+    if args.subjects:
+        unknown = set(args.subjects) - {s for s, _ in row_keys}
+        if unknown:
+            print(f"Error: no such subject(s) in {args.dataset}: {sorted(unknown)}")
             return
+        row_keys = [(s, t) for s, t in row_keys if s in args.subjects]
+    if args.trials:
+        unknown = set(args.trials) - {t for _, t in row_keys}
+        if unknown:
+            print(f"Error: no such trial(s) in {args.dataset}: {sorted(unknown)}")
+            return
+        row_keys = [(s, t) for s, t in row_keys if t in args.trials]
 
-    row_keys = [(subject, activity) for subject in args.subjects for activity in args.activities]
-
-    if args.check:
-        print(f"Trial cache status for {len(row_keys)} trials "
-              f"({paths.TRIALS_DIR.relative_to(paths.REPO_ROOT)}/{TRIAL_DATASET}):\n")
-        report_check(row_keys)
+    if not row_keys:
+        print(f"No trials selected in {args.dataset}.")
         return
 
-    print(f"Caching {len(row_keys)} trials using {args.workers} workers...")
+    out = f"{paths.TRIALS_DIR.relative_to(paths.REPO_ROOT)}/{args.dataset}"
+    if args.check:
+        print(f"Build status for {len(row_keys)} trials in {args.dataset} ({out}):\n")
+        report_check(row_keys, args.dataset)
+        return
+
+    print(f"Building {len(row_keys)} trials from {args.dataset} using {args.workers} workers...")
     _, results = run_tracked_grid(
-        row_keys, ['Subject', 'Activity'], ['cache'],
-        partial(cache_trial_worker, force=args.force),
-        args.workers, title="MAJIC MOCAP TRIAL CACHE",
+        row_keys, ['Subject', 'Trial'], ['build'],
+        partial(build_trial_worker, dataset=args.dataset, force=args.force),
+        args.workers, title=f"BUILD TRIALS — {args.dataset}",
     )
-    report_build(results)
+    report_build(results, out)
 
 
 if __name__ == '__main__':

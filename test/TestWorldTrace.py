@@ -6,30 +6,13 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from src.toolchest.IMUTrace import IMUTrace
-from src.toolchest.WorldTrace import (WorldTrace, _reconstruct_from_markers,
-                                      estimate_plate_template, fit_plate_to_template,
-                                      repair_reconstruction_glitches)
+from src.toolchest.WorldTrace import WorldTrace
+from src.toolchest.building import alborno
+from src.toolchest.building.reconstruction import (_reconstruct_from_markers,
+                                                    repair_reconstruction_glitches)
+from test.fixtures import markers_from_poses as _markers_from_poses
 
 # Marker layout of a plate, in the plate's own frame. This has to agree with the
-# convention _reconstruct_from_markers reconstructs against: +x runs d->x and y->o,
-# +y runs x->o and d->y, and the four markers are symmetric about the plate origin.
-PLATE_HALF_WIDTH = 0.04
-PLATE_HALF_HEIGHT = 0.03
-MARKER_O_LOCAL = np.array([PLATE_HALF_WIDTH, PLATE_HALF_HEIGHT, 0.0])
-MARKER_D_LOCAL = np.array([-PLATE_HALF_WIDTH, -PLATE_HALF_HEIGHT, 0.0])
-MARKER_X_LOCAL = np.array([PLATE_HALF_WIDTH, -PLATE_HALF_HEIGHT, 0.0])
-MARKER_Y_LOCAL = np.array([-PLATE_HALF_WIDTH, PLATE_HALF_HEIGHT, 0.0])
-
-
-def _markers_from_poses(positions, rotations):
-    """Places the four plate markers in the world, given the plate's pose over time."""
-    positions = np.asarray(positions, dtype=np.float64)
-    rotations = np.asarray(rotations, dtype=np.float64)
-    return tuple(
-        np.einsum('nij,j->ni', rotations, local) + positions
-        for local in (MARKER_O_LOCAL, MARKER_D_LOCAL, MARKER_X_LOCAL, MARKER_Y_LOCAL)
-    )
-
 
 class TestWorldTrace(unittest.TestCase):
     def setUp(self):
@@ -186,23 +169,6 @@ class TestWorldTrace(unittest.TestCase):
         errors = world_trace.get_rotation_errors_deg(world_trace_2)
 
         np.testing.assert_allclose(errors, rotation_amount * 180 / np.pi, atol=0.01)
-
-    def test_resample_preserves_pose_at_shared_timestamps(self):
-        timestamps = np.linspace(0, 1, 101)  # 100 Hz
-        positions = np.column_stack([timestamps, 2 * timestamps, np.zeros_like(timestamps)])
-        rotations = Rotation.from_rotvec(timestamps[:, None] * np.array([0., 0., 1.])).as_matrix()
-        world_trace = WorldTrace(timestamps, positions, rotations)
-
-        resampled = world_trace.resample(50.0)
-
-        self.assertAlmostEqual(resampled.get_sample_frequency(), 50.0, places=6)
-        # Linear position and constant-rate rotation are both exactly representable,
-        # so slerp/interp should reproduce them at the new timestamps.
-        expected_positions = np.column_stack([resampled.timestamps, 2 * resampled.timestamps,
-                                              np.zeros_like(resampled.timestamps)])
-        expected_rotations = Rotation.from_rotvec(resampled.timestamps[:, None] * np.array([0., 0., 1.])).as_matrix()
-        np.testing.assert_array_almost_equal(resampled.positions, expected_positions)
-        np.testing.assert_array_almost_equal(resampled.rotations, expected_rotations)
 
     def test_reconstruct_from_markers_stationary(self):
         num_samples = 5
@@ -406,7 +372,7 @@ class TestWorldTrace(unittest.TestCase):
             temp_path = temp_file.name
 
         try:
-            world_traces = WorldTrace.from_trc(temp_path)
+            world_traces = alborno.load_world_traces(temp_path)
         finally:
             os.remove(temp_path)
 
@@ -414,7 +380,25 @@ class TestWorldTrace(unittest.TestCase):
         trace = world_traces['torso']
         np.testing.assert_allclose(trace.timestamps, timestamps)
         np.testing.assert_allclose(trace.positions, expected_positions, atol=1e-6)
-        np.testing.assert_allclose(trace.rotations, expected_rotations, atol=1e-6)
+
+        # Rotations are compared UP TO A CONSTANT plate-frame rotation, which is a real
+        # change from the legacy path and worth being explicit about.
+        #
+        # `_reconstruct_from_markers` builds its axes from named marker differences, so its
+        # frame follows a defined convention and equalled `expected_rotations` outright. The
+        # merged path fits a template recovered by MDS, whose axes are the plate's principal
+        # ones — deterministic, but with no anatomical meaning.
+        #
+        # Nothing downstream depends on the convention, because
+        # assembly.align_world_to_imu solves the plate-to-sensor rotation from
+        # gyros and absorbs any constant offset. Measured over 2.67 M joint-frames, switching
+        # conventions moved 2 of them by more than 0.5 deg. But a caller that used
+        # world_trace.rotations WITHOUT alignment would see the difference, so the test
+        # asserts the invariant that actually holds rather than the one that used to.
+        offset = expected_rotations[0].T @ trace.rotations[0]
+        np.testing.assert_allclose(trace.rotations,
+                                   np.einsum('nij,jk->nik', expected_rotations, offset),
+                                   atol=1e-6)
 
     def test_get_joint_center(self):
         # A hinge-free ball joint: both segments rotate independently, but the same
@@ -440,141 +424,6 @@ class TestWorldTrace(unittest.TestCase):
         np.testing.assert_array_almost_equal(estimated_parent, offset_parent)
         np.testing.assert_array_almost_equal(estimated_child, offset_child)
         np.testing.assert_array_almost_equal(error, np.zeros((num_samples, 3)))
-
-
-class TestTemplatePlateFit(unittest.TestCase):
-    """WorldTrace.from_markers / fit_plate_to_template — the shape-agnostic reconstruction.
-
-    Written against IMoVE's real plate, which is an irregular planar quadrilateral, not a
-    rectangle: its six inter-marker distances are 120.4 / 104.4 / 103.4 / 84.6 / 62.9 /
-    59.6 mm. That is exactly the case _reconstruct_from_markers cannot handle.
-    """
-
-    # Recovered by MDS on the median inter-marker distances, in metres.
-    TEMPLATE = np.array([[-60.1, 23.6, 0.0], [43.8, 34.6, 0.0],
-                         [50.2, -24.6, 0.0], [-33.9, -33.6, 0.0]]) / 1000.0
-
-    def setUp(self):
-        rng = np.random.default_rng(0)
-        self.n = 400
-        self.timestamps = np.arange(self.n) / 100.0
-        self.template = self.TEMPLATE - self.TEMPLATE.mean(axis=0)
-        self.rotations = Rotation.from_rotvec(
-            np.cumsum(rng.normal(0, 0.02, (self.n, 3)), axis=0)).as_matrix()
-        self.positions = np.cumsum(rng.normal(0, 0.002, (self.n, 3)), axis=0)
-        self.markers = (np.einsum('nij,kj->nki', self.rotations, self.template)
-                        + self.positions[:, None, :])
-
-    def _errors(self, positions, rotations, valid):
-        relative = np.einsum('nji,njk->nik', self.rotations, rotations)
-        angle = np.degrees(np.linalg.norm(Rotation.from_matrix(relative).as_rotvec(), axis=1))
-        offset = np.linalg.norm(positions - self.positions, axis=1)
-        return angle[valid].max(), offset[valid].max()
-
-    def test_exact_on_clean_markers(self):
-        pos, rot, valid, report = fit_plate_to_template(
-            self.markers, self.timestamps, template=self.template)
-        self.assertTrue(valid.all())
-        angle, offset = self._errors(pos, rot, valid)
-        self.assertLess(angle, 1e-6)
-        self.assertLess(offset, 1e-9)
-        self.assertEqual(report['fault_counts_per_marker'], [0, 0, 0, 0])
-
-    def test_template_can_be_estimated_from_the_data(self):
-        """No template supplied: the plate's own median geometry has to supply one."""
-        estimated = estimate_plate_template(self.markers)
-        actual = np.sort([np.linalg.norm(estimated[i] - estimated[j])
-                          for i in range(4) for j in range(i + 1, 4)])
-        expected = np.sort([np.linalg.norm(self.template[i] - self.template[j])
-                            for i in range(4) for j in range(i + 1, 4)])
-        np.testing.assert_allclose(actual, expected, atol=1e-9)
-
-    def test_reconstruction_is_rigid(self):
-        """Every reconstructed frame must be a rotation, never a reflection.
-
-        A mirrored fit silently flips the segment and every joint angle taken from it.
-        """
-        _, rot, _, _ = fit_plate_to_template(self.markers, self.timestamps,
-                                             template=self.template)
-        np.testing.assert_allclose(np.linalg.det(rot), 1.0, atol=1e-9)
-        np.testing.assert_allclose(np.einsum('nij,nkj->nik', rot, rot),
-                                   np.broadcast_to(np.eye(3), rot.shape), atol=1e-9)
-
-    def test_leave_one_out_isolates_a_displaced_marker(self):
-        """One marker off, the other three consistent — the common fault by far.
-
-        This is the case _compute_case handles with four hand-written branches; here it
-        falls out of dropping each marker in turn, with no assumption about plate shape.
-        """
-        markers = self.markers.copy()
-        markers[100:130, 2] += np.array([0.04, 0.0, 0.0])
-
-        pos, rot, valid, report = fit_plate_to_template(markers, self.timestamps,
-                                                        template=self.template)
-        self.assertTrue(valid.all(), "a single displaced marker must not lose the frame")
-        self.assertEqual(report['fault_counts_per_marker'], [0, 0, 30, 0])
-        angle, offset = self._errors(pos, rot, valid)
-        self.assertLess(angle, 1e-6, "the surviving three markers give the pose exactly")
-
-    def test_gaps_are_tolerated_while_three_markers_remain(self):
-        markers = self.markers.copy()
-        markers[200:260, 1] = np.nan      # NaN gap
-        markers[300:320, 3] = 0.0         # exactly-zero gap, how some exporters mark one
-        pos, rot, valid, _ = fit_plate_to_template(markers, self.timestamps,
-                                                   template=self.template)
-        self.assertTrue(valid.all())
-        angle, _ = self._errors(pos, rot, valid)
-        self.assertLess(angle, 1e-6)
-
-    def test_two_missing_markers_is_invalid_not_guessed(self):
-        """Two markers leave the pose underdetermined. It must be refused, not invented."""
-        markers = self.markers.copy()
-        markers[150:170, 0] = np.nan
-        markers[150:170, 1] = np.nan
-        _, _, valid, report = fit_plate_to_template(markers, self.timestamps,
-                                                    template=self.template)
-        self.assertFalse(valid[150:170].any())
-        self.assertTrue(valid[:150].all())
-        self.assertEqual(report['n_invalid'], 20)
-
-    def test_invalid_frames_are_still_on_the_grid(self):
-        """Invalid frames keep interpolated poses, because the uniform time grid is what
-        every finite-difference angular velocity in this repo assumes."""
-        markers = self.markers.copy()
-        markers[150:170, :2] = np.nan
-        pos, rot, valid, _ = fit_plate_to_template(markers, self.timestamps,
-                                                   template=self.template)
-        self.assertEqual(len(pos), self.n)
-        self.assertTrue(np.isfinite(pos).all(), "no gaps left in the array")
-        self.assertTrue(np.isfinite(rot).all())
-
-    def test_a_permanently_absent_marker_degrades_to_three(self):
-        markers = self.markers.copy()
-        markers[:, 1] = np.nan
-        pos, rot, valid, _ = fit_plate_to_template(markers, self.timestamps,
-                                                   template=self.template)
-        self.assertTrue(valid.all())
-        angle, offset = self._errors(pos, rot, valid)
-        self.assertLess(angle, 1e-6)
-        self.assertLess(offset, 1e-9, "the origin must not move when a marker is dropped")
-
-    def test_too_few_markers_fails_legibly(self):
-        """s2's treadmill trials lose whole marker groups. A reader has to be able to tell
-        'untracked in this trial' from 'failed to reconstruct'."""
-        markers = self.markers.copy()
-        markers[:, :2] = np.nan
-        with self.assertRaises(ValueError) as ctx:
-            fit_plate_to_template(markers, self.timestamps, name='THIGH_L')
-        self.assertIn('THIGH_L', str(ctx.exception))
-
-    def test_from_markers_returns_a_worldtrace_carrying_the_mask(self):
-        markers = self.markers.copy()
-        markers[150:170, :2] = np.nan
-        trace = WorldTrace.from_markers(markers, self.timestamps, template=self.template)
-        self.assertIsInstance(trace, WorldTrace)
-        self.assertEqual(len(trace), self.n)
-        self.assertFalse(trace.valid[150:170].any())
-        self.assertTrue(trace.valid[:150].all())
 
 
 class TestValidityMask(unittest.TestCase):
@@ -674,23 +523,6 @@ class TestValidityMask(unittest.TestCase):
         b = WorldTrace(timestamps, positions, rotations, valid=b_valid)
         np.testing.assert_array_equal((a - b).valid, a_valid & b_valid)
 
-    def test_resampling_is_conservative(self):
-        """A resampled frame drawing on an invalid neighbour is itself invalid."""
-        positions, rotations, timestamps = self._clean(num_samples=200)
-        valid = np.ones(200, dtype=bool)
-        valid[100:110] = False
-        trace = WorldTrace(timestamps, positions, rotations, valid=valid)
-
-        resampled = trace.resample(50.0)
-        self.assertEqual(len(resampled.valid), len(resampled))
-        self.assertFalse(resampled.valid.all(), "the invalid run must survive downsampling")
-        # Conservative: the invalid window may widen at the edges but must never shrink
-        # to nothing or drift away from where the original damage was.
-        invalid_times = resampled.timestamps[~resampled.valid]
-        self.assertGreaterEqual(invalid_times.min(), timestamps[99])
-        self.assertLessEqual(invalid_times.max(), timestamps[110])
-
-
 class TestValidityMaskOnRealTrials(unittest.TestCase):
     """Against the plate-trials this dataset is already known to have damaged.
 
@@ -698,13 +530,25 @@ class TestValidityMaskOnRealTrials(unittest.TestCase):
     the reason the mask exists, so they are what it is tested against.
     """
 
-    #                                    subject     activity        plate         invalid
+    # Counts are for the MERGED reconstruction (readers.alborno default). The legacy figures
+    # are alongside, because the differences say what the merge actually changed:
+    #
+    #   torso 14 -> 2   leave-one-out RECOVERED 12 frames the legacy path could only
+    #                   interpolate. A single displaced marker no longer costs the frame.
+    #   calcn_l 30 -> 31, pelvis 36 -> 38
+    #                   the millimetre residual flags a little more than the angular-speed
+    #                   detector did — shape faults that never produced a pose jump.
+    #   femur_l 57 -> 51
+    #                   same effect in the other direction: frames the speed detector called
+    #                   transitions turn out to fit the template, so they are kept.
+    #
+    #                                    subject     activity        plate     invalid  legacy
     KNOWN_DAMAGE = [
-        ('08', 'walking',      'calcn_l_imu', 30),   # 17 interpolated + 2 unresolved gaps
-        ('06', 'walking',      'pelvis_imu',  36),   # 6 unresolved gaps
-        ('06', 'complexTasks', 'femur_l_imu', 57),   # 153 un-flipped (valid) + 57 interpolated
-        ('02', 'complexTasks', 'pelvis_imu',   9),
-        ('04', 'walking',      'torso_imu',   14),
+        ('08', 'walking',      'calcn_l_imu', 31),   # 30
+        ('06', 'walking',      'pelvis_imu',  38),   # 36
+        ('06', 'complexTasks', 'femur_l_imu', 51),   # 57
+        ('02', 'complexTasks', 'pelvis_imu',   9),   # 9, unchanged
+        ('04', 'walking',      'torso_imu',    2),   # 14
     ]
 
     def _trace(self, subject, activity, plate):
@@ -714,7 +558,7 @@ class TestValidityMaskOnRealTrials(unittest.TestCase):
         if not trc.is_file():
             self.skipTest(f"source data not present at {trc}")
         with contextlib.redirect_stdout(io.StringIO()):   # the repair warnings are expected
-            return WorldTrace.from_trc(trc)[plate]
+            return alborno.load_world_traces(trc)[plate]
 
     def test_known_damaged_plates_are_masked(self):
         for subject, activity, plate, expected in self.KNOWN_DAMAGE:
