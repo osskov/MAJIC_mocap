@@ -270,6 +270,9 @@ class TestAgainstCachedTrials(unittest.TestCase):
         cls.sampled = _load(SAMPLE_TRIALS)
         if cls.sampled is None:
             require_cache(False, "no IMoVE trials cached")
+        # The 100 Hz sessions on their own. The constant is derived from these, so the closed
+        # loop below can only be checked against them.
+        cls.long_walk = _load(LONG_WALK_TRIALS)
 
     @unittest.expectedFailure
     def test_the_two_sample_rates_agree(self):
@@ -329,12 +332,23 @@ class TestAgainstCachedTrials(unittest.TestCase):
         This is what the resampler bug slipped past: the constant was derived through one
         pipeline and went on being applied after the pipeline changed under it. Here that
         shows up directly, because a constant wrong by delta leaves exactly delta behind.
+
+        CHECKED ON THE 100 Hz SESSIONS, because that is where the constant comes from. Against
+        the 40 Hz trials it fails by ~12 mm, and that is not drift: those sessions carry a rate
+        bias no analysis cutoff removes, which is precisely why refit_cluster_offset excludes
+        them. test_the_two_sample_rates_agree records that, as an expected failure.
+
+        Partly circular, then -- it re-measures the trials the constant was fitted on. It still
+        earns its place as a STALENESS guard, which is the failure mode that has actually bitten
+        here, twice.
         """
         if not RIGID_SENSOR_OFFSET_MM:
             self.skipTest("RIGID_SENSOR_OFFSET_MM not populated yet; "
                           "run experiments/refit_cluster_offset.py")
+        if self.long_walk is None:
+            self.skipTest("no 100 Hz long-walk trials cached")
 
-        pooled = pool_cluster_offsets(self.sampled)
+        pooled = pool_cluster_offsets(self.long_walk)
         for sensor, entry in sorted(pooled.items()):
             # Only the bolted sensors. A taped sensor's offset was FITTED on this very trial,
             # so its residual is zero by construction and asserting on it would test nothing.

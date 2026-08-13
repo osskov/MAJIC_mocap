@@ -81,41 +81,50 @@ FOOT_TOLERANCE_M = 0.025
 # each limb, and the pelvis. These share one mounting bracket per segment, so the offset is
 # hardware -- one number for every subject and every trial -- and belongs here as a constant.
 #
-# Measured across ~230 trials each; see experiments/refit_cluster_offset.py. Their between-fit
-# spread is 3.9-4.8 mm per axis, which is what a fixed mounting should look like.
+# Derived by experiments/refit_cluster_offset.py, whose docstring records why it uses the five
+# 100 Hz sessions with omega from the gyroscope rather than all 243 trials with omega from the
+# mocap. In short: the 40 Hz sessions carry a rate bias that no analysis cutoff removes, and
+# differentiating a marker reconstruction twice puts noise in the design matrix, where it biases
+# p rather than merely scattering it.
+#
+# n = 5 per sensor, and that is not a typo: the per-axis spread is 0.4-5.6 mm here against
+# 3.9-20.6 mm from 236 trials on the old path. Five good measurements beat 236 biased ones.
 RIGID_SENSOR_OFFSET_MM: Dict[str, Tuple[float, float, float]] = {
-    'THIGH_L_M': (-8.1, -15.6, 26.7),
-    'THIGH_R_M': (-11.5, -7.8, 25.0),
-    'SHANK_L_M': (6.2, -12.4, 0.5),
-    'SHANK_R_M': (7.0, -6.9, 3.8),
-    'PELVIS_M': (10.1, -4.6, -17.6),
+    'THIGH_L_M': (1.8, -11.3, 3.6),
+    'THIGH_R_M': (-0.7, -7.7, 6.1),
+    'SHANK_L_M': (8.5, -11.1, -17.3),
+    'SHANK_R_M': (9.1, -8.6, -16.7),
+    'PELVIS_M': (4.4, -10.7, -13.1),
 }
 
-# TWO THINGS ABOUT THE ABOVE ARE UNRESOLVED, and neither is visible in the numbers themselves.
+# THE STRUCTURE IS PARTLY THERE AND PARTLY NOT.
 #
-# The magnitudes disagree by 3x across segments -- shank 10.5-13.9, pelvis 20.8, thigh
-# 28.6-32.0 mm -- and |p| is rotation-invariant, so this is NOT explained by the IMUs sitting
-# differently in their brackets. Identical hardware on identical plates should not do that.
-# Left agrees with right to 3.3-3.4 mm within each segment type, so the fits themselves are
-# sound; it is the between-segment difference that has no mechanism.
+# y is shared across all five: -7.7, -8.6, -10.7, -11.1, -11.3 mm. Left agrees with right
+# componentwise to 0.6-3.6 mm on both segment types, which is a real check rather than a fitted
+# one -- the two sides are separate hardware, fitted separately, in their own frames.
 #
-# And the two sample rates disagree: the thighs read 3x larger at 40 Hz than at 100 Hz while
-# the shanks read SMALLER, so it is not one global rate bias. The 100 Hz long-walk sessions
-# involve no resampling at all, which makes them the more trustworthy side -- and there the
-# thigh and shank values are much closer to each other, which would be consistent with the
-# shared offset the segments ought to have. So both problems may be the same defect.
+# But the magnitudes still do not agree: thigh 9.9-12.0, pelvis 17.5, shank 20.9-22.2 mm. Same
+# plate and same bracket should give one number, and |p| is rotation-invariant so this cannot be
+# the IMUs sitting differently in their brackets. The gyro narrowed the spread from 3x to 2.2x
+# without closing it, and nothing explains the remainder. Treat the per-segment values as
+# measured and the shared-offset hypothesis as unsupported.
 #
-# These values are therefore the best current estimate, dominated by the 40 Hz sessions
-# because they are 238 of 243 trials. TestClusterOffset.test_the_two_sample_rates_agree is
-# marked as an expected failure and documents this.
-
 # Everything else is TAPED ON, near the same spot each time but not at it: the High and Low
 # sensors flanking each Mid, and the feet, which have no cluster at all. Their offset is a
 # property of the trial, not of the hardware, so it is FITTED PER TRIAL in `load_trial` and
 # these values serve only as a fallback when that fit diverges.
 #
 # The data says the same thing the taping does: their between-fit spread is 8.5-21.1 mm per
-# axis against the bolted sensors' 3.9-4.8, and the feet's is worse still.
+# axis against the bolted sensors' 0.4-5.6, and the feet's is worse still. Per-trial fitting is
+# the right granularity for them, verified rather than assumed: real trial-to-trial movement is
+# 5.3-8.7 mm per axis against a split-half noise floor of 4.3-5.3, so pooling within a session
+# would smear a real effect. See scratch/check_placement_granularity.py.
+#
+# THESE ARE STILL 40 Hz-DERIVED, unlike the bolted constants, and cannot be otherwise: the
+# 100 Hz long-walk sessions carry only 7 sensors -- the five Mid/pelvis units plus the feet --
+# so no High or Low sensor appears in the 100 Hz data at all. They inherit whatever rate bias
+# refit_cluster_offset's docstring describes. It matters less than it would for the bolted
+# constants, because these are only a fallback for a diverged per-trial fit.
 NOMINAL_SENSOR_OFFSET_MM: Dict[str, Tuple[float, float, float]] = {
     'THIGH_L_H': (73.3, -11.1, 15.0),
     'THIGH_L_L': (-89.2, -14.9, 24.8),
@@ -407,8 +416,8 @@ def load_trial(session_dir: Union[str, Path], trial: str,
 
 
 def _fit_iteratively(plate: PlateTrial, iterations: int = 4,
-                     converged_mm: float = 0.2,
-                     lowpass_hz: float = 8.0) -> Optional[np.ndarray]:
+                     converged_mm: float = 0.2, lowpass_hz: float = 8.0,
+                     omega_from: str = 'gyro') -> Optional[np.ndarray]:
     """Total sensor offset, by fitting, shifting, and re-fitting what remains.
 
     One pass is not enough because the fit READS LOW. `A` is built from twice-differentiated
@@ -430,7 +439,8 @@ def _fit_iteratively(plate: PlateTrial, iterations: int = 4,
     previous_step = None
     for _ in range(iterations):
         try:
-            step = current.fit_sensor_offset(lowpass_hz=lowpass_hz)
+            step = current.fit_sensor_offset(lowpass_hz=lowpass_hz,
+                                             omega_from=omega_from)
         except (ValueError, np.linalg.LinAlgError):
             return None if not total.any() else total
 

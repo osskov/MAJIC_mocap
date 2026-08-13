@@ -176,7 +176,8 @@ class PlateTrial:
         )
 
     def fit_sensor_offset(self, lowpass_hz: float = 8.0,
-                          excitation_percentile: float = 50.0) -> np.ndarray:
+                          excitation_percentile: float = 50.0,
+                          omega_from: str = 'gyro') -> np.ndarray:
         """Where the IMU sits relative to the mocap origin, in metres, in the SENSOR frame.
 
         Two rigidly connected points on one body differ only by the lever-arm term, so
@@ -226,8 +227,47 @@ class PlateTrial:
                                                self.imu_trace.gyro[valid])
         residual = (self.imu_trace.acc @ rotation.T) - synthetic.acc
 
-        omega = synthetic.gyro
-        alpha = synthetic._finite_difference_gyros('polyfit')
+        # WHERE OMEGA COMES FROM decides how noisy A is, and A is the design matrix, so its
+        # noise biases p toward zero rather than merely scattering it.
+        #
+        #   'gyro'   uses the gyroscope's own reading, which IS omega, measured. One
+        #            differentiation instead of two, and no marker-reconstruction noise at all.
+        #   'mocap'  differentiates the reconstructed pose once for omega and twice for alpha.
+        #            Kept for comparison; this was the default until it was measured against
+        #            the alternative and lost.
+        #
+        # 'gyro' is the default on two measurements over IMoVE's 100 Hz sessions. Sensitivity
+        # of the answer to the analysis cutoff, which a rigid lever arm should not have at all,
+        # falls from 77% to 26% -- and on THIGH_R_M from 206% to 26%. And left/right agreement,
+        # which is a genuine test because the two sides are independent hardware fitted
+        # independently, improves from 2.3 to 1.1 mm on the shanks and from 2.9 to 0.3 mm on
+        # the thighs.
+        #
+        # The frames are already equivalent: after assembly.align_world_to_imu the world trace's
+        # rotations map sensor -> world, so calculate_imu_trace's gyro and the measured gyro are
+        # both in the sensor frame and `rotation` below is the identity. What differs is not the
+        # frame but the SIGNAL -- the two disagree by 10-25% RMS, and that discrepancy is
+        # marker-reconstruction noise, sync error and soft tissue.
+        #
+        # The honest cost: `residual` still takes the origin's acceleration from mocap, which
+        # the gyro cannot supply, so A and b now come from different sources. The old path was
+        # internally consistent but noisy; this one is cross-sourced but far more accurate in
+        # A, which is the design matrix and therefore the term whose noise biases p.
+        #
+        # Mocap is still needed for `residual`, which wants the origin's linear acceleration --
+        # something the gyro cannot supply. So this moves only the design matrix off the mocap,
+        # not the whole fit.
+        if omega_from == 'gyro':
+            source = IMUTrace(self.imu_trace.timestamps,
+                              self.imu_trace.gyro @ rotation.T,
+                              self.imu_trace.acc, self.imu_trace.mag)
+        elif omega_from == 'mocap':
+            source = synthetic
+        else:
+            raise ValueError(f"omega_from must be 'mocap' or 'gyro', got {omega_from!r}.")
+
+        omega = source.gyro
+        alpha = source._finite_difference_gyros('polyfit')
         lever = (_skew(alpha) + np.einsum('ni,nj->nij', omega, omega)
                  - (omega ** 2).sum(axis=1)[:, None, None] * np.eye(3))
         # Body-frame gravity direction per sample, the other half of the design matrix.
