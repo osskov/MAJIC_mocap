@@ -1,6 +1,8 @@
 import json
 import os
 import unittest
+
+from test.fixtures import require_data
 from unittest import mock
 
 import numpy as np
@@ -139,19 +141,28 @@ class TestCacheKey(unittest.TestCase):
     def setUp(self):
         self.folder = paths.raw_trial_dir('01', 'walking')
         if not self.folder.is_dir():
-            self.skipTest(f"source data not present at {self.folder}")
+            require_data(False, f"no source data at {self.folder}")
 
     def test_key_is_stable_across_calls(self):
-        self.assertEqual(eu.trial_cache_key('01', 'walking', align=True),
-                         eu.trial_cache_key('01', 'walking', align=True))
+        self.assertEqual(eu.trial_cache_key('01', 'walking'),
+                         eu.trial_cache_key('01', 'walking'))
 
-    def test_align_flag_changes_the_key(self):
-        """align_plate_trials rewrites every rotation, so it cannot share an entry."""
-        self.assertNotEqual(eu.trial_cache_key('01', 'walking', align=True),
-                            eu.trial_cache_key('01', 'walking', align=False))
+    def test_content_size_is_part_of_the_key(self):
+        """A truncated parquet has to be a MISS, not a wrong answer.
+
+        cached_trial_status never opens the artifact -- it compares manifest fields. Without
+        the row and plate counts in the key, a write interrupted between the parquet and the
+        manifest leaves a short file validating against the old manifest, fresh forever.
+        """
+        full = eu.trial_cache_key('01', 'walking', content={'n_rows': 1000, 'n_plates': 8})
+        short = eu.trial_cache_key('01', 'walking', content={'n_rows': 500, 'n_plates': 8})
+        missing = eu.trial_cache_key('01', 'walking', content={'n_rows': 1000, 'n_plates': 7})
+
+        self.assertNotEqual(full, short)
+        self.assertNotEqual(full, missing)
 
     def test_inventory_covers_what_the_loader_reads_and_no_more(self):
-        names = {s['name'] for s in eu.trial_cache_key('01', 'walking', align=True)['sources']}
+        names = {s['name'] for s in eu.trial_cache_key('01', 'walking')['sources']}
         self.assertIn('walking.trc', names)
         self.assertIn('imu data/femur_r_imu.txt', names)
         # The .mtb is never parsed and the madgwick outputs have colliding filenames;
@@ -161,11 +172,85 @@ class TestCacheKey(unittest.TestCase):
 
     def test_toolchest_edit_invalidates(self):
         """A change to the code that BUILDS a trial must not reuse an old artifact."""
-        with mock.patch.object(eu, '_CONTENT_MODULES', ('PlateTrial.py',)):
+        with mock.patch.object(eu, '_CORE_MODULES', ('PlateTrial.py',)):
             eu._toolchest_digest.cache_clear()
-            narrowed = eu._toolchest_digest()
+            narrowed = eu._toolchest_digest('alborno')
         eu._toolchest_digest.cache_clear()
-        self.assertNotEqual(narrowed, eu._toolchest_digest())
+        self.assertNotEqual(narrowed, eu._toolchest_digest('alborno'))
+
+    def test_a_comment_edit_does_not_invalidate(self):
+        """The digest hashes the AST, not the bytes.
+
+        Raw-byte hashing made every prose edit a full rebuild of both datasets, and this
+        codebase is deliberately comment-dense -- most invalidations were re-explaining
+        something rather than changing behaviour.
+        """
+        module = paths.REPO_ROOT / 'src' / 'toolchest' / 'building' / 'assembly.py'
+        original = module.read_bytes()
+        eu._toolchest_digest.cache_clear()
+        before = eu._toolchest_digest('alborno')
+        try:
+            module.write_bytes(original + b"\n# explanatory comment added later\n")
+            eu._toolchest_digest.cache_clear()
+            self.assertEqual(eu._toolchest_digest('alborno'), before)
+        finally:
+            module.write_bytes(original)
+            eu._toolchest_digest.cache_clear()
+
+    def test_a_semantic_edit_still_invalidates(self):
+        """The property that must survive the above. Comment-insensitivity is only safe if
+        behaviour-sensitivity is intact."""
+        module = paths.REPO_ROOT / 'src' / 'toolchest' / 'building' / 'assembly.py'
+        original = module.read_bytes()
+        eu._toolchest_digest.cache_clear()
+        before = eu._toolchest_digest('alborno')
+        try:
+            module.write_bytes(original.replace(b'SYNC_SPREAD_LIMIT_S = 1.0',
+                                                b'SYNC_SPREAD_LIMIT_S = 2.0'))
+            eu._toolchest_digest.cache_clear()
+            self.assertNotEqual(eu._toolchest_digest('alborno'), before)
+        finally:
+            module.write_bytes(original)
+            eu._toolchest_digest.cache_clear()
+
+    def test_one_dataset_s_reader_does_not_invalidate_the_other(self):
+        """alborno.py was invalidating all 262 IMoVE artifacts. Fail-closed, but needlessly:
+        the IMoVE loader never reads it."""
+        module = paths.REPO_ROOT / 'src' / 'toolchest' / 'building' / 'alborno.py'
+        original = module.read_bytes()
+        eu._toolchest_digest.cache_clear()
+        before_alborno = eu._toolchest_digest('alborno')
+        before_imove = eu._toolchest_digest('imove')
+        try:
+            module.write_bytes(original.replace(b'MARKER_FAULT_THRESHOLD = 2.0',
+                                                b'MARKER_FAULT_THRESHOLD = 3.0'))
+            eu._toolchest_digest.cache_clear()
+            self.assertNotEqual(eu._toolchest_digest('alborno'), before_alborno)
+            self.assertEqual(eu._toolchest_digest('imove'), before_imove)
+        finally:
+            module.write_bytes(original)
+            eu._toolchest_digest.cache_clear()
+
+    def test_the_digest_does_not_move_with_the_interpreter(self):
+        """ast.dump emits internal field names that change between CPython releases, so 3.12
+        and 3.13 produced different digests for identical source -- two interpreters on one
+        machine each invalidated the other's 281 artifacts. ast.unparse emits canonical
+        source instead. Pinned by round-tripping the module through it: a digest built on
+        anything version-dependent would not survive this.
+        """
+        import ast
+        module = paths.REPO_ROOT / 'src' / 'toolchest' / 'building' / 'assembly.py'
+        once = eu._semantic_source(module)
+        # Re-parsing unparsed source must give the same text back, which is the property
+        # that makes it stable rather than merely different from dump.
+        twice = ast.unparse(ast.parse(once)).encode()
+        self.assertEqual(once.decode().strip(), twice.decode().strip())
+
+    def test_every_reader_module_is_hashed_by_someone(self):
+        """A reader missing from _READER_MODULES is a silent stale cache for its dataset."""
+        for name in sources.SOURCES:
+            self.assertIn(name, eu._READER_MODULES,
+                          f"{name} has no entry, so its reader is unhashed")
 
 
 class TestCacheStatus(unittest.TestCase):
@@ -180,7 +265,7 @@ class TestCacheStatus(unittest.TestCase):
 
     def setUp(self):
         if not paths.raw_trial_dir('01', 'walking').is_dir():
-            self.skipTest("source data not present")
+            require_data(False, "no source data")
         real = sources.get_source('alborno')
         self.source = sources.TrialSource(
             name=self.DATASET,
@@ -203,6 +288,63 @@ class TestCacheStatus(unittest.TestCase):
 
     def _path(self):
         return paths.cached_trial_path(self.DATASET, '01', 'walking')
+
+    def test_a_truncated_parquet_is_stale_not_fresh(self):
+        """The guard where the work happens, not one level above it.
+
+        cached_trial_status compares manifest fields and never opened the artifact, so a
+        write interrupted between the parquet and the manifest left a short file validating
+        against the OLD manifest -- and because --force means the cache key is unchanged, it
+        validated forever. Truncating in place with the manifest untouched reproduces exactly
+        that state.
+        """
+        eu.save_cached_trial(make_plates(), '01', 'walking', dataset=self.DATASET)
+        self.assertEqual(self._status(), ('fresh', None))
+
+        path = self._path()
+        with open(path, 'r+b') as handle:
+            handle.truncate(path.stat().st_size // 2)
+
+        status, reason = self._status()
+        self.assertEqual(status, 'stale')
+        self.assertIn('n_rows', reason)
+
+    def test_a_manifest_without_the_content_check_is_stale(self):
+        """Artifacts written before the check existed cannot be trusted, because the very
+        thing they lack is the evidence that they are whole."""
+        eu.save_cached_trial(make_plates(), '01', 'walking', dataset=self.DATASET)
+        manifest_path = paths.manifest_path(self._path())
+        manifest = json.loads(manifest_path.read_text())
+        manifest['cache_key'].pop('n_rows')
+        manifest_path.write_text(json.dumps(manifest))
+
+        self.assertEqual(self._status(), ('stale', 'manifest predates the content check'))
+
+    def test_row_count_of_an_unreadable_file_is_none_rather_than_raising(self):
+        """A corrupt parquet has to report a miss, not blow up inside a status check that
+        the build loop runs over every trial."""
+        path = self._path()
+        paths.ensure_parent(path).write_bytes(b'this is not a parquet')
+        self.assertIsNone(eu._parquet_row_count(path))
+
+    def test_the_staging_file_does_not_survive_a_successful_write(self):
+        eu.save_cached_trial(make_plates(), '01', 'walking', dataset=self.DATASET)
+        staging = self._path().with_suffix(self._path().suffix + '.tmp')
+        self.assertFalse(staging.exists(), f"{staging.name} was left behind")
+
+    def test_a_failed_write_leaves_the_previous_artifact_readable(self):
+        """The point of writing to a temporary name and renaming. Before, a failure partway
+        through to_parquet left a half-file where the good one had been."""
+        eu.save_cached_trial(make_plates(), '01', 'walking', dataset=self.DATASET)
+        good_bytes = self._path().read_bytes()
+
+        with mock.patch.object(eu.trial_io, 'plates_to_frame',
+                               side_effect=RuntimeError('disk full')):
+            with self.assertRaises(RuntimeError):
+                eu.save_cached_trial(make_plates(), '01', 'walking', dataset=self.DATASET)
+
+        self.assertEqual(self._path().read_bytes(), good_bytes)
+        self.assertEqual(self._status(), ('fresh', None))
 
     def test_missing_then_fresh(self):
         self.assertEqual(self._status()[0], 'missing')
@@ -235,6 +377,55 @@ class TestCacheStatus(unittest.TestCase):
         eu.save_cached_trial(make_plates(), '01', 'walking', dataset=self.DATASET)
         paths.manifest_path(self._path()).unlink()
         self.assertEqual(self._status(), ('stale', 'no manifest sidecar'))
+
+    @staticmethod
+    def _consistent_plates(twist_deg=0.0):
+        """Plates whose IMU genuinely derives from their world trace.
+
+        make_plates() pairs unrelated traces -- its raw residual is already 222 deg/s -- so a
+        deliberate misalignment cannot be seen against it. The residual only means anything
+        when the aligned case is near zero.
+        """
+        timestamps = np.arange(400) / 100.0
+        angles = np.column_stack([0.9 * np.sin(2 * np.pi * 0.7 * timestamps),
+                                  0.6 * np.sin(2 * np.pi * 1.1 * timestamps),
+                                  0.4 * np.sin(2 * np.pi * 1.9 * timestamps)])
+        rotations = Rotation.from_euler('zyx', angles).as_matrix()
+        world = WorldTrace(timestamps, np.zeros((len(timestamps), 3)), rotations)
+        synthetic = world.calculate_imu_trace(skip_lin_acc=True)
+        imu = IMUTrace(timestamps, synthetic.gyro, synthetic.acc, synthetic.mag)
+
+        twist = Rotation.from_euler('y', twist_deg, degrees=True).as_matrix()
+        twisted = WorldTrace(timestamps, world.positions,
+                             np.matmul(rotations, twist), valid=world.valid)
+        return {'femur_r_imu': PlateTrial('femur_r_imu', imu, twisted)}
+
+    def test_the_alignment_residual_responds_to_misalignment(self):
+        """The diagnostic is checked for PRESENCE everywhere and for MEANING nowhere.
+
+        It is the triage number for 281 artifacts and the thing RESIDUAL_WARN_DEG_S gates on,
+        so a change that left it always near zero would silence the warning across the whole
+        tree without failing anything.
+        """
+        good = eu.trial_diagnostics(self._consistent_plates(0.0))['plates']
+        bad = eu.trial_diagnostics(self._consistent_plates(20.0))['plates']
+
+        for name in good:
+            self.assertLess(good[name]['gyro_residual_raw_rms_deg_s'], 1.0,
+                            "an aligned plate must sit near zero or the number says nothing")
+            self.assertGreater(bad[name]['gyro_residual_raw_rms_deg_s'],
+                               10 * good[name]['gyro_residual_raw_rms_deg_s'],
+                               f"{name}: 20 deg of misalignment did not move the residual")
+
+    def test_suspect_lists_the_plates_over_the_threshold(self):
+        """The field load_trial warns on. Derived at write time, so if it stopped being
+        derived the warning would simply never fire."""
+        clean = eu.trial_diagnostics(self._consistent_plates(0.0))
+        self.assertIn('suspect', clean)
+        self.assertEqual(clean['suspect'], [])
+
+        self.assertEqual(eu.trial_diagnostics(self._consistent_plates(60.0))['suspect'],
+                         ['femur_r_imu'])
 
     def test_save_records_diagnostics(self):
         path = eu.save_cached_trial(make_plates(), '01', 'walking', dataset=self.DATASET)
@@ -271,9 +462,9 @@ class TestStrictLoading(unittest.TestCase):
     def test_it_never_touches_the_source_reader(self):
         """No fallback path exists, so a fresh read must not reach the dataset reader."""
         if not paths.raw_trial_dir('01', 'walking').is_dir():
-            self.skipTest("source data not present")
+            require_data(False, "no source data")
         if eu.cached_trial_status('01', 'walking')[0] != 'fresh':
-            self.skipTest("trial cache not built; run python -m experiments.build_trials")
+            require_data(False, "trial cache not built")
         with mock.patch.object(sources.alborno, 'load_trial') as reader:
             plates = eu.load_trial('01', 'walking')
         reader.assert_not_called()
@@ -291,8 +482,8 @@ class TestRealTrialRoundTrip(unittest.TestCase):
     def _live(self, subject, trial):
         """Straight from the dataset reader — what build_trials does."""
         if not paths.raw_trial_dir(subject, trial).is_dir():
-            self.skipTest("source data not present")
-        return sources.get_source('alborno').load(subject, trial, True)
+            require_data(False, "no source data")
+        return sources.get_source('alborno').load(subject, trial)
 
     def test_cached_trial_matches_a_live_load(self):
         live = self._live('01', 'walking')

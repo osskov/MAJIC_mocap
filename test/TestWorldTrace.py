@@ -10,7 +10,7 @@ from src.toolchest.WorldTrace import WorldTrace
 from src.toolchest.building import alborno
 from src.toolchest.building.reconstruction import (_reconstruct_from_markers,
                                                     repair_reconstruction_glitches)
-from test.fixtures import markers_from_poses as _markers_from_poses
+from test.fixtures import markers_from_poses as _markers_from_poses, require_data
 
 # Marker layout of a plate, in the plate's own frame. This has to agree with the
 
@@ -426,6 +426,100 @@ class TestWorldTrace(unittest.TestCase):
         np.testing.assert_array_almost_equal(error, np.zeros((num_samples, 3)))
 
 
+class TestUnitDetection(unittest.TestCase):
+    """from_trc infers millimetres from coordinate MAGNITUDE, not from the Units header.
+
+    Tested in one direction only until now. The reverse matters more, because its failure is
+    silent: a capture whose coordinates never exceed 1000 mm stays in millimetres, which
+    leaves every rotation -- and therefore every joint angle -- perfect while positions are
+    1000x wrong. Only the lever-arm work would ever notice.
+    """
+
+    @staticmethod
+    def _write_trc(positions, rotations, timestamps, scale):
+        markers = _markers_from_poses(positions, rotations)
+        names = ['torso_o', 'torso_d', 'torso_x', 'torso_y']
+        header, axes = ['Frame#', 'Time'], ['', '']
+        for i, name in enumerate(names):
+            header += [name, '', '']
+            axes += [f'X{i + 1}', f'Y{i + 1}', f'Z{i + 1}']
+        lines = [
+            'PathFileType\t4\t(X/Y/Z)\tsynthetic.trc',
+            'DataRate\tCameraRate\tNumFrames\tNumMarkers\tUnits\tOrigDataRate\t'
+            'OrigDataStartFrame\tOrigNumFrames',
+            f'100.00\t100.00\t{len(timestamps)}\t{len(names)}\tmm\t100.00\t1\t'
+            f'{len(timestamps)}',
+            '\t'.join(header), '\t'.join(axes), '',
+        ]
+        for step in range(len(timestamps)):
+            row = [str(step + 1), f'{timestamps[step]:.6f}']
+            for marker in markers:
+                row += [f'{v * scale:.6f}' for v in marker[step]]
+            lines.append('\t'.join(row))
+        handle = tempfile.NamedTemporaryFile(mode='w+', suffix='.trc', delete=False,
+                                             encoding='utf-8')
+        handle.write('\n'.join(lines) + '\n')
+        handle.close()
+        return handle.name
+
+    def setUp(self):
+        self.n = 6
+        self.timestamps = np.arange(self.n) / 100.0
+        self.rotations = Rotation.from_euler(
+            'XYZ', np.random.rand(self.n, 3) * 0.05).as_matrix()
+        self.positions = np.random.rand(self.n, 3)
+        self.positions[:, 1] += 1.5           # a realistic standing height, in metres
+
+    def test_metres_pass_through_unchanged(self):
+        """Coordinates already in metres are far below the threshold, so the branch must not
+        fire and divide a correct number by 1000."""
+        path = self._write_trc(self.positions, self.rotations, self.timestamps, scale=1.0)
+        try:
+            traces = alborno.load_world_traces(path)
+        finally:
+            os.unlink(path)
+
+        np.testing.assert_allclose(traces['torso'].positions, self.positions, atol=1e-6)
+
+    def test_millimetres_are_converted(self):
+        path = self._write_trc(self.positions, self.rotations, self.timestamps, scale=1000.0)
+        try:
+            traces = alborno.load_world_traces(path)
+        finally:
+            os.unlink(path)
+
+        np.testing.assert_allclose(traces['torso'].positions, self.positions, atol=1e-6)
+
+    def test_a_low_capture_in_millimetres_is_not_detected(self):
+        """The silent failure, pinned so it is a known limitation rather than a surprise.
+
+        A capture that never leaves a 1 m box reads as metres whatever its real units. The
+        rotations come out perfect either way -- they are scale-invariant -- so joint angles
+        would look flawless while positions were 1000x out.
+        """
+        low = np.random.rand(self.n, 3) * 0.4          # never exceeds 400 mm
+
+        loaded = {}
+        for label, scale in (('metres', 1.0), ('millimetres', 1000.0)):
+            path = self._write_trc(low, self.rotations, self.timestamps, scale=scale)
+            try:
+                loaded[label] = alborno.load_world_traces(path)['torso']
+            finally:
+                os.unlink(path)
+
+        # Compared against EACH OTHER rather than against the input, which isolates the unit
+        # question: the reconstruction's marker-relabeling pass can settle on either of two
+        # valid labellings for a rectangular plate, and that ambiguity is unrelated to units.
+        np.testing.assert_allclose(loaded['millimetres'].positions,
+                                   loaded['metres'].positions * 1000.0, atol=1e-3)
+        # Rotations come out IDENTICAL to within the fixture's own precision -- the TRC is
+        # written with '%.6f', which keeps fewer significant digits at the 1000x scale, so
+        # 1e-4 is the floor here rather than 1e-9. That is exactly why nothing downstream
+        # notices: a 1000x position error leaves every joint angle perfect.
+        np.testing.assert_allclose(loaded['millimetres'].rotations,
+                                   loaded['metres'].rotations, atol=1e-4)
+
+
 class TestValidityMask(unittest.TestCase):
     """The mask says which frames are trustworthy GROUND TRUTH.
 
@@ -556,7 +650,7 @@ class TestValidityMaskOnRealTrials(unittest.TestCase):
         import paths
         trc = paths.raw_trial_dir(subject, activity) / f'{activity}.trc'
         if not trc.is_file():
-            self.skipTest(f"source data not present at {trc}")
+            require_data(False, f"no source data at {trc}")
         with contextlib.redirect_stdout(io.StringIO()):   # the repair warnings are expected
             return alborno.load_world_traces(trc)[plate]
 

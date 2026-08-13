@@ -1,6 +1,8 @@
 import os
 import unittest
 
+from test.fixtures import require_data
+
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -110,6 +112,87 @@ class TestPlateTrialBasics(unittest.TestCase):
         np.testing.assert_allclose(aligned.world_trace.rotations, expected, atol=1e-6)
 
 
+class TestAlignmentOverRaggedValidity(unittest.TestCase):
+    """align_world_to_imu fits over VALID frames only, and that is the whole argument.
+
+    The existing test uses a clean plate where every frame is valid, so it only ever exercises
+    the `valid.all()` fast path. The docstring's reasoning is entirely about the other one: on
+    Subject01 the padded stretches hold a constant pose, so their synthetic gyro is zero while
+    the sensor is still moving, and fitting over them pits 430 s of "the segment did not
+    rotate" against 603 s of real overlap.
+    """
+
+    def setUp(self):
+        rate, self.n = 100.0, 1200
+        timestamps = np.arange(self.n) / rate
+        angles = np.column_stack([
+            0.9 * np.sin(2 * np.pi * 0.8 * timestamps),
+            0.6 * np.sin(2 * np.pi * 1.3 * timestamps),
+            0.4 * np.sin(2 * np.pi * 2.1 * timestamps)])
+        rotations = Rotation.from_euler('zyx', angles).as_matrix()
+
+        # A real sensor-to-segment rotation to recover.
+        self.R_plate_sensor = Rotation.from_rotvec([0.3, -0.2, 0.5]).as_matrix()
+        world = WorldTrace(timestamps, np.zeros((self.n, 3)), rotations)
+        synthetic = world.calculate_imu_trace(skip_lin_acc=True)
+        self.imu = IMUTrace(timestamps,
+                            synthetic.gyro @ self.R_plate_sensor,
+                            synthetic.acc @ self.R_plate_sensor,
+                            synthetic.mag)
+
+        # The first two thirds are CORRUPT: poses that still move, but wrongly. That is the
+        # case masking actually protects against. Held padding turns out to be inert for this
+        # estimator -- a Procrustes fit accumulates H = sum a_i b_i^T, and a held pose has
+        # zero synthetic gyro, so those rows contribute nothing whether masked or not.
+        # Interpolated frames from a failed reconstruction do rotate, and they bias it.
+        corrupt = Rotation.from_euler('zyx', angles[:, [2, 0, 1]] * 1.7).as_matrix()
+        ragged_rotations = rotations.copy()
+        ragged_rotations[:800] = corrupt[:800]
+        valid = np.zeros(self.n, dtype=bool)
+        valid[800:] = True
+        self.ragged = WorldTrace(timestamps, np.zeros((self.n, 3)), ragged_rotations,
+                                 valid=valid)
+        self.truth = WorldTrace(timestamps[800:], np.zeros((self.n - 800, 3)),
+                                rotations[800:])
+
+    def test_the_padding_does_not_drag_the_recovered_rotation(self):
+        aligned = assembly.align_world_to_imu(PlateTrial('plate', self.imu, self.ragged))
+
+        # Over the valid stretch the aligned world must reproduce the sensor frame.
+        expected = np.matmul(self.ragged.rotations[800:], self.R_plate_sensor)
+        np.testing.assert_allclose(aligned.world_trace.rotations[800:], expected, atol=1e-6)
+
+    def test_it_matches_fitting_the_valid_stretch_alone(self):
+        """The strongest form: masking must give the same answer as never having had the
+        padding at all."""
+        ragged = assembly.align_world_to_imu(PlateTrial('plate', self.imu, self.ragged))
+        clean = assembly.align_world_to_imu(
+            PlateTrial('plate', self.imu[800:], self.truth))
+
+        np.testing.assert_allclose(ragged.world_trace.rotations[800:],
+                                   clean.world_trace.rotations, atol=1e-6)
+
+    def test_including_the_invalid_frames_would_have_given_a_different_answer(self):
+        """Guards against the tests above passing for the wrong reason. Worth stating what
+        this does NOT show: held padding is inert here, because zero synthetic gyro rows add
+        nothing to the Procrustes cross-covariance. Masking earns its keep on frames that
+        move WRONGLY -- interpolated poses from a failed reconstruction -- not on still ones.
+        """
+        all_valid = WorldTrace(self.ragged.timestamps, self.ragged.positions,
+                               self.ragged.rotations)
+        unmasked = assembly.align_world_to_imu(PlateTrial('plate', self.imu, all_valid))
+        masked = assembly.align_world_to_imu(PlateTrial('plate', self.imu, self.ragged))
+
+        self.assertFalse(np.allclose(unmasked.world_trace.rotations,
+                                     masked.world_trace.rotations, atol=1e-3))
+
+    def test_a_plate_with_no_valid_frames_raises(self):
+        dead = WorldTrace(self.ragged.timestamps, self.ragged.positions,
+                          self.ragged.rotations, valid=np.zeros(self.n, dtype=bool))
+        with self.assertRaises(ValueError):
+            assembly.align_world_to_imu(PlateTrial('plate', self.imu, dead))
+
+
 class TestPlateTrialSyntheticGenerators(unittest.TestCase):
     def test_generate_random_plate_trial(self):
         plate = fixtures.generate_random_plate_trial(duration=2.0, fs=100.0, add_noise=False)
@@ -173,7 +256,7 @@ class TestPlateTrialFromFolder(unittest.TestCase):
     def setUpClass(cls):
         cls.trial_dir = paths.raw_trial_dir('02', 'complexTasks')
         if not cls.trial_dir.is_dir():
-            raise unittest.SkipTest(f"No source data found at {cls.trial_dir}")
+            require_data(False, f"no source data at {cls.trial_dir}")
         cls.plates = alborno.load_trial(cls.trial_dir)
 
     def test_loads_every_sensor_as_a_plate_trial(self):

@@ -327,5 +327,81 @@ class TestMergedReconstruction(unittest.TestCase):
             Rotation.from_matrix(delta).as_rotvec(), axis=1)).max(), 1e-6)
 
 
+class TestMergedUnresolvedBranch(unittest.TestCase):
+    """The safety valve on the path production actually uses.
+
+    `repair_reconstruction_glitches` (legacy, no caller) has four tests for the unresolved
+    case; `reconstruct_plate` (merged, the only method any caller passes) only ever asserted
+    `unresolved == 0` on clean data. The branch is not hypothetical -- it fires on Subject01
+    every single build:
+
+        calcn_l_imu: 2 discontinuity(ies) are neither a marker relabeling this plate can
+        hide nor safely interpolable, and have been LEFT IN PLACE.
+    """
+
+    RECTANGLE = np.array([[PLATE_HALF_WIDTH, PLATE_HALF_HEIGHT, 0.0],
+                          [-PLATE_HALF_WIDTH, -PLATE_HALF_HEIGHT, 0.0],
+                          [PLATE_HALF_WIDTH, -PLATE_HALF_HEIGHT, 0.0],
+                          [-PLATE_HALF_WIDTH, PLATE_HALF_HEIGHT, 0.0]])
+
+    def _markers(self, rotations, positions):
+        return np.stack([np.einsum('nij,j->ni', rotations, local) + positions
+                         for local in self.RECTANGLE], axis=1)
+
+    def setUp(self):
+        self.n = 300
+        self.timestamps = np.arange(self.n) / 100.0
+        self.rotations = Rotation.from_rotvec(
+            np.linspace(0.0, 0.4, self.n)[:, None] * np.array([0.0, 0.0, 1.0])).as_matrix()
+        self.positions = np.tile(np.array([0.0, 1.0, 0.0]), (self.n, 1))
+
+    def test_an_unexplained_jump_is_reported_and_left_in_place(self):
+        """Not a half turn, so no relabeling explains it; a sustained step, so interpolation
+        would invent the rest of the trial. The only honest answer is to say so."""
+        rotations = self.rotations.copy()
+        rotations[150:] = rotations[150:] @ Rotation.from_euler(
+            'y', 70.0, degrees=True).as_matrix()
+
+        _, _, valid, report = reconstruct_plate(
+            self._markers(rotations, self.positions), self.timestamps, name='segment')
+
+        self.assertGreaterEqual(report['unresolved'], 1)
+        self.assertEqual(report['flipped'], 0)
+
+    def test_the_unresolved_region_is_marked_invalid(self):
+        """The report is for a human; `valid` is what keeps the frames out of the error
+        statistics. A branch that reported without masking would be worse than useless."""
+        rotations = self.rotations.copy()
+        rotations[150:] = rotations[150:] @ Rotation.from_euler(
+            'y', 70.0, degrees=True).as_matrix()
+
+        _, _, valid, report = reconstruct_plate(
+            self._markers(rotations, self.positions), self.timestamps, name='segment')
+
+        self.assertFalse(valid.all(), "an unresolved discontinuity cannot leave all valid")
+
+    def test_a_half_turn_is_repaired_rather_than_reported(self):
+        """The discriminating case: a rectangle's diagonals are equal, so a relabeling is
+        invisible to the shape fit and shows up only as an impossible rotation. It must be
+        FIXED, not left in place -- otherwise the merge gains nothing over the template fit.
+        """
+        rotations = self.rotations.copy()
+        rotations[150:] = rotations[150:] @ Rotation.from_euler(
+            'z', 180.0, degrees=True).as_matrix()
+
+        _, _, valid, report = reconstruct_plate(
+            self._markers(rotations, self.positions), self.timestamps, name='segment')
+
+        self.assertEqual(report['unresolved'], 0)
+        self.assertGreater(report['flipped'], 0)
+
+    def test_clean_data_reports_nothing(self):
+        _, _, valid, report = reconstruct_plate(
+            self._markers(self.rotations, self.positions), self.timestamps, name='segment')
+
+        self.assertEqual(report['unresolved'], 0)
+        self.assertTrue(valid.all())
+
+
 if __name__ == '__main__':
     unittest.main()

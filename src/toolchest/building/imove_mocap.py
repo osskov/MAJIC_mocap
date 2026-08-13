@@ -33,7 +33,8 @@ import pandas as pd
 
 from ..PlateTrial import PlateTrial
 from ..WorldTrace import WorldTrace
-from .assembly import _lag_seconds, _world_on_timestamps, assemble_plate_trials
+from .assembly import (_lag_seconds, _world_on_timestamps, assemble_plate_trials,
+                       shift_world_origin)
 from .reconstruction import fit_plate_to_template
 from .xsens import read_xsens_txt
 
@@ -75,8 +76,50 @@ FOOT_TOKENS = ('CAL', 'MT', 'DP')
 CLUSTER_TOLERANCE_M = 0.010
 FOOT_TOLERANCE_M = 0.025
 
+# Where each IMU sits relative to its marker cluster's origin, in MILLIMETRES, in that
+# sensor's own frame. Filled by `pool_cluster_offsets` over the whole dataset; see
+# experiments/refit_cluster_offset.py to re-derive.
+#
+# This is hardware, not anatomy: the cluster is bolted to the IMU and DEVICE_TO_SENSOR
+# assigns one physical unit to a given segment for every subject, so there is one constant
+# per sensor rather than one per subject. Fitting it per trial instead would be worse, not
+# more precise -- single-trial fits are unstable and occasionally diverge outright.
+#
+# It is NOT zero, which is what the plate figure suggests and what a fitter would otherwise
+# assume. At running-level excitation the neglected lever term A p reaches 1-3 m/s^2, and
+# because this anchors the absolute positions of the H and L sensors (sensor-to-sensor
+# constraints only ever give differences) an error here displaces all three equally.
+#
+# UNLIKE DEVICE_TO_SENSOR, THIS DEPENDS ON THE PIPELINE THAT MEASURED IT. Fixing the
+# resampler moved it by 70-90%. TestClusterOffset re-fits it from cached trials and fails
+# when the two drift apart, which is the guard that would have caught that.
+CLUSTER_TO_IMU_OFFSET_MM: Dict[str, Tuple[float, float, float]] = {}
+
 _HEADER_ROWS = 7          # rows before the first data row
 _NAME_ROW = 3             # 'modified_rizzoli:LTH1' etc.
+
+
+def pool_cluster_offsets(samples: Dict[str, np.ndarray]) -> Dict[str, Dict[str, object]]:
+    """{sensor: (N, 3) offsets in metres} -> {sensor: median, spread, n} in millimetres.
+
+    Median and MAD rather than mean and sd throughout. Single-trial fits occasionally
+    diverge -- one IMoVE lateral-step trial returned a magnitude standard deviation of
+    205 mm -- and one such fit drags a mean by tens of millimetres while leaving a median
+    untouched. The spread reported is MAD * 1.4826, so it is comparable to a standard
+    deviation for the well-behaved majority without being set by the outliers.
+    """
+    pooled = {}
+    for sensor, offsets in samples.items():
+        offsets = np.asarray(offsets, dtype=np.float64) * 1000.0
+        if not len(offsets):
+            continue
+        median = np.median(offsets, axis=0)
+        pooled[sensor] = {
+            'median_mm': median,
+            'spread_mm': 1.4826 * np.median(np.abs(offsets - median), axis=0),
+            'n': len(offsets),
+        }
+    return pooled
 
 
 def _marker_names(path: Path) -> List[str]:
@@ -239,6 +282,19 @@ def _merge_takes(takes: List[Dict[str, WorldTrace]], lags: List[float],
             rotations[covered] = placed.rotations[covered]
             valid |= covered
 
+        # HOLD the nearest covered pose across the gaps between takes. Leaving them at the
+        # zeros and identity they were initialised to would put the subject at the world
+        # origin between takes -- a multi-metre step that double-differentiates into
+        # acceleration spikes of order 1e4 m/s^2. Those frames are invalid, so nothing scores
+        # them, but they sit in the same arrays that filters and finite differences run over,
+        # and a spike that large leaks through any filter into the valid data either side.
+        # Holding gives the gaps a constant pose instead: zero velocity, and inert.
+        covered = np.flatnonzero(valid)
+        if len(covered):
+            hold = np.maximum.accumulate(np.where(valid, np.arange(len(timestamps)), 0))
+            hold[:covered[0]] = covered[0]
+            positions, rotations = positions[hold], rotations[hold]
+
         merged[segment] = WorldTrace(timestamps, positions, rotations, valid=valid)
     return merged
 
@@ -278,8 +334,17 @@ def load_trial(session_dir: Union[str, Path], trial: str,
         world_traces = _merge_takes(takes, lags, reference.timestamps, target_rate)
         lag = 0.0                       # already on the IMU's clock
 
-    return assemble_plate_trials(imu_traces, _pair_world_traces(world_traces, imu_traces),
-                                 align_plate_trials, lag=lag)
+    plates = assemble_plate_trials(imu_traces, _pair_world_traces(world_traces, imu_traces),
+                                   align_plate_trials, lag=lag)
+
+    # Put each plate's mocap origin on its IMU rather than on its marker cluster. Only
+    # meaningful once the sensor-to-segment rotation has been applied, so it is skipped
+    # along with the alignment; a sensor with no measured offset is left where it is.
+    if align_plate_trials:
+        plates = {name: shift_world_origin(
+            plate, np.asarray(CLUSTER_TO_IMU_OFFSET_MM.get(name, (0.0, 0.0, 0.0))) / 1000.0)
+            for name, plate in plates.items()}
+    return plates
 
 
 def mocap_takes_for(session_dir: Union[str, Path], trial: str) -> List[Path]:

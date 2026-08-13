@@ -12,6 +12,8 @@ Skips cleanly if data/ has not been populated, so it is safe in a bare checkout.
 import os
 import unittest
 
+from test.fixtures import require_data
+
 os.environ.setdefault("DISABLE_TQDM", "True")
 
 import numpy as np
@@ -39,7 +41,7 @@ class TestGravityConvention(unittest.TestCase):
     def setUpClass(cls):
         cls.subject, cls.activity = _first_available_trial()
         if cls.subject is None:
-            raise unittest.SkipTest(f"No source data found under {paths.DATA_DIR}")
+            require_data(False, f"no source data under {paths.DATA_DIR}")
         cls.plates = load_raw_data(cls.subject, cls.activity)
 
     def test_expected_gravity_matches_the_data(self):

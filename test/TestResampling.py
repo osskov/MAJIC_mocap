@@ -20,6 +20,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from src.toolchest.IMUTrace import IMUTrace
+from src.toolchest.PlateTrial import PlateTrial
 from src.toolchest.WorldTrace import WorldTrace
 from src.toolchest.building import assembly
 from src.toolchest.finite_difference_utils import (DEFAULT_WINDOW_SECONDS,
@@ -345,10 +346,17 @@ class TestTrialAlignment(unittest.TestCase):
                                        atol=1e-9)
 
     def test_t_zero_is_the_first_overlap_and_inertial_data_before_it_is_kept(self):
+        """Re-zeroing is a TRIAL-level step now, not something _to_common_grid does.
+
+        It moved because the origin has to be shared: computing it per plate put the plates
+        of one trial on clocks up to 350 ms apart. So the contract is exercised through
+        _trial_origin and _rezero, the way assemble_plate_trials applies them.
+        """
         imu, world = self._streams(100.0, 100.0)
 
-        aligned_imu, aligned_world = assembly._to_common_grid(
-            imu, world, 100.0, self.TRUE_LAG)
+        on_grid = {'only': assembly._to_common_grid(imu, world, 100.0, self.TRUE_LAG)}
+        aligned_imu, aligned_world = assembly._rezero(*on_grid['only'],
+                                                      assembly._trial_origin(on_grid))
 
         # The IMU began 5 s before the mocap, so that record survives at negative time.
         self.assertAlmostEqual(aligned_imu.timestamps[0], -self.TRUE_LAG, places=2)
@@ -383,6 +391,75 @@ class TestTrialAlignment(unittest.TestCase):
         imu = IMUTrace(imu_time, synthetic.gyro, synthetic.acc, synthetic.mag)
 
         self.assertAlmostEqual(assembly._lag_seconds(imu, world), offset, places=3)
+
+
+class TestOneClockPerTrial(unittest.TestCase):
+    """Every plate in a trial shares t = 0. Joint angles difference plates BY INDEX.
+
+    The invariant was stated in assembly's docstring and had no test, because every
+    _to_common_grid case here is single-plate and the _shared_lag ones only check the lag
+    value. It was broken in the data: imove/s16/t0_static_pose_001 had four plates 350 ms
+    (14 samples) ahead of the other eleven, so its knee angles differenced a thigh against a
+    shank across that offset, labelled with a third plate's clock.
+    """
+
+    @staticmethod
+    def _trial(first_valid_frames):
+        """One IMU + world per entry, each becoming valid at a different frame."""
+        timestamps = np.arange(3000) / 100.0
+        imu_traces, world_traces = {}, {}
+        for index, first in enumerate(first_valid_frames):
+            synthetic = WorldTrace(timestamps, np.zeros((len(timestamps), 3)),
+                                   motion(timestamps).as_matrix()).calculate_imu_trace(
+                                       skip_lin_acc=True)
+            valid = np.zeros(len(timestamps), dtype=bool)
+            valid[first:] = True
+            name = f'plate{index}'
+            imu_traces[name] = IMUTrace(timestamps, synthetic.gyro, synthetic.acc,
+                                        synthetic.mag)
+            world_traces[name] = WorldTrace(timestamps, np.zeros((len(timestamps), 3)),
+                                            motion(timestamps).as_matrix(), valid=valid)
+        return imu_traces, world_traces
+
+    def test_ragged_validity_still_gives_one_shared_origin(self):
+        plates = assembly.assemble_plate_trials(*self._trial([0, 14, 14, 40]),
+                                                align_plate_trials=False)
+
+        origins = {name: plate.imu_trace.timestamps[0] for name, plate in plates.items()}
+        self.assertEqual(len(set(np.round(list(origins.values()), 9))), 1,
+                         f"plates landed on different clocks: {origins}")
+
+    def test_t_zero_is_the_first_instant_any_plate_has_truth(self):
+        """Earliest rather than latest, so one ragged plate cannot drag the whole trial."""
+        plates = assembly.assemble_plate_trials(*self._trial([25, 40, 90]),
+                                                align_plate_trials=False)
+
+        reference = next(iter(plates.values()))
+        zero = int(np.searchsorted(reference.imu_trace.timestamps, 0.0))
+        self.assertAlmostEqual(reference.imu_trace.timestamps[zero], 0.0, places=9)
+        self.assertTrue(any(np.asarray(p.valid)[zero] for p in plates.values()),
+                        "some plate must have ground truth at t=0")
+        for name, plate in plates.items():
+            self.assertFalse(np.asarray(plate.valid)[:zero].any(),
+                             f"{name} has coverage before t=0, so t=0 is not the start")
+
+    def test_the_cross_plate_check_catches_a_mismatch(self):
+        """The guard itself, driven directly -- an assert nothing can trip is not a guard."""
+        imu_traces, world_traces = self._trial([0, 0])
+        plates = assembly.assemble_plate_trials(imu_traces, world_traces,
+                                                align_plate_trials=False)
+        good = next(iter(plates.values()))
+        shifted = PlateTrial('shifted',
+                             IMUTrace(good.imu_trace.timestamps + 0.35, good.imu_trace.gyro,
+                                      good.imu_trace.acc, good.imu_trace.mag),
+                             WorldTrace(good.world_trace.timestamps + 0.35,
+                                        good.world_trace.positions,
+                                        good.world_trace.rotations,
+                                        valid=good.world_trace.valid))
+
+        with self.assertRaises(ValueError) as caught:
+            assembly._assert_one_clock({'good': good, 'shifted': shifted})
+        self.assertIn('clocks that differ', str(caught.exception))
 
 
 class TestSyncSpreadGuard(unittest.TestCase):

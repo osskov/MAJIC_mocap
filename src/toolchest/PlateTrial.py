@@ -7,6 +7,41 @@ import matplotlib.pyplot as plt
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
+
+def _skew(vectors: np.ndarray) -> np.ndarray:
+    """(N, 3) -> (N, 3, 3) cross-product matrices."""
+    zero = np.zeros(len(vectors))
+    return np.stack([
+        np.stack([zero, -vectors[:, 2], vectors[:, 1]], axis=1),
+        np.stack([vectors[:, 2], zero, -vectors[:, 0]], axis=1),
+        np.stack([-vectors[:, 1], vectors[:, 0], zero], axis=1)], axis=1)
+
+
+# An order-4 Butterworth run through filtfilt needs more than 27 samples of padding, and a
+# run barely longer than that carries no resolvable low-frequency content anyway.
+_MIN_FILTER_RUN = 60
+
+# Frames discarded at each end of a valid run, in periods of the analysis cutoff. Covers both
+# the filter's own edge transient and the far larger spike that double-differentiating a
+# position step produces at a gap boundary.
+_EDGE_TRANSIENT_PERIODS = 4.0
+
+
+def _contiguous_runs(mask: np.ndarray):
+    """(start, stop) for each maximal run of True, so filters never cross a gap."""
+    padded = np.concatenate([[False], np.asarray(mask, dtype=bool), [False]])
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return list(zip(edges[0::2], edges[1::2]))
+
+
+def _lowpass(values: np.ndarray, cutoff_hz: float, sample_rate: float) -> np.ndarray:
+    """Zero-phase Butterworth along axis 0, shape preserved."""
+    from scipy.signal import butter, sosfiltfilt
+    sos = butter(4, cutoff_hz, btype='low', fs=sample_rate, output='sos')
+    flat = sosfiltfilt(sos, values.reshape(len(values), -1), axis=0)
+    return flat.reshape(values.shape)
+
+
 class PlateTrial:
     """
     Contains a synchronized time-series of motion data for a single rigid body.
@@ -134,6 +169,107 @@ class PlateTrial:
             self.imu_trace.copy(),
             self.world_trace.copy()
         )
+
+    def fit_sensor_offset(self, lowpass_hz: float = 8.0,
+                          excitation_percentile: float = 50.0) -> np.ndarray:
+        """Where the IMU sits relative to the mocap origin, in metres, in the SENSOR frame.
+
+        Two rigidly connected points on one body differ only by the lever-arm term, so
+
+            R f_imu - f_mocap  =  A p,     A = [alpha]x + omega omega^T - |omega|^2 I
+
+        is linear in p with three unknowns and thousands of equations.
+
+        GRAVITY IS SOLVED FOR, NOT SUPPLIED. Taking the mocap's specific force with no gravity
+        term at all leaves R^T a_origin, so the residual against the real accelerometer is
+
+            b = f_imu - R^T a_origin  =  R^T gamma  +  A p
+
+        with gamma the gravity contribution to the reading. That is linear in gamma AND p
+        together, so stacking [R^T | A] recovers both from six unknowns against thousands of
+        equations. The alternative -- estimating gamma as the mean rotated accelerometer
+        reading and subtracting it -- makes the answer depend on that estimate, and any error
+        in it leaves a residue proportional to R^T, which is correlated with orientation and
+        therefore lands squarely in p. Solving jointly removes the dependence entirely, and
+        the recovered |gamma| is a free check: it has to come back at about 9.81.
+
+        LOW-PASSED BY DEFAULT, and that is not cosmetic. A is built from twice-differentiated
+        marker positions, so its noise grows as f^2 while the accelerometer's does not; the
+        two sides of the equation disagree most exactly where the motion is fastest. Filtering
+        is EXACT here rather than approximate, because p is a constant: for any linear filter
+        L, L[A p] = L[A] p = L[b], so it is the same constraint restricted to a band where the
+        rigid-body model holds. Measured on IMoVE, 8 Hz roughly halves both the trial-to-trial
+        spread and the repeat scatter; below 5 Hz A shrinks and the system goes ill-conditioned.
+
+        Only the most excited half of the frames are used, because A p is what carries the
+        signal and frames where A is small contribute noise in proportion.
+
+        The result is in the sensor frame whether or not the plate was aligned at load time:
+        the sensor-to-segment rotation is re-solved from the gyros here, and is the identity
+        when assembly has already applied it.
+        """
+        from .gyro_utils import calculate_best_fit_rotation
+
+        valid = np.asarray(self.valid)
+        if valid.sum() < 100:
+            raise ValueError(f"{self.name}: only {valid.sum()} valid frames to fit against.")
+
+        # No gravity term: the residual below then carries it, and it is solved for.
+        synthetic = self.world_trace.calculate_imu_trace()
+
+        rotation = calculate_best_fit_rotation(synthetic.gyro[valid],
+                                               self.imu_trace.gyro[valid])
+        residual = (self.imu_trace.acc @ rotation.T) - synthetic.acc
+
+        omega = synthetic.gyro
+        alpha = synthetic._finite_difference_gyros('polyfit')
+        lever = (_skew(alpha) + np.einsum('ni,nj->nij', omega, omega)
+                 - (omega ** 2).sum(axis=1)[:, None, None] * np.eye(3))
+        # Body-frame gravity direction per sample, the other half of the design matrix.
+        # COPIED, not a view: transpose returns a view onto the world trace's own rotations,
+        # and the filtering below writes in place. Without the copy this method silently
+        # corrupts the plate it was called on -- and because a segment's three sensors share
+        # one WorldTrace, fitting the H sensor would have poisoned M and L behind it.
+        orientation = np.asarray(self.world_trace.rotations).transpose(0, 2, 1).copy()
+
+        if lowpass_hz is not None and lowpass_hz < 0.5 * self.sample_rate:
+            # Legitimate on every block because gamma and p are both CONSTANT, so a linear
+            # filter passes straight through them: L[R^T gamma + A p] = L[R^T] gamma + L[A] p.
+            #
+            # Filtered RUN BY RUN, never across a gap. Invalid stretches hold a constant pose,
+            # so the boundary into one is a step in acceleration, and filtering over it drags
+            # the step back into real data. On IMoVE's long walks -- one inertial record
+            # spanning three mocap takes, hence six such boundaries -- that alone moved the
+            # recovered offset from 13 mm to 200 mm.
+            # Each run's EDGES are discarded as well. Two transients meet there: the filter's
+            # own, and a much larger one from upstream -- calculate_imu_trace differentiates
+            # the whole position array twice before any of this, so the step between a held
+            # gap and the next real pose spikes the frames either side of it. On IMoVE's long
+            # walks that boundary appears six times per trial.
+            edge = int(np.ceil(_EDGE_TRANSIENT_PERIODS * self.sample_rate / lowpass_hz))
+            filterable = np.zeros(len(valid), dtype=bool)
+            for start, stop in _contiguous_runs(valid):
+                if stop - start < _MIN_FILTER_RUN:
+                    continue
+                for block in (lever, orientation, residual):
+                    block[start:stop] = _lowpass(block[start:stop], lowpass_hz,
+                                                 self.sample_rate)
+                trim = min(edge, (stop - start) // 4)
+                filterable[start + trim:stop - trim] = True
+            valid = valid & filterable
+            if not valid.any():
+                raise ValueError(f"{self.name}: no run of valid frames is long enough to "
+                                 f"filter at {lowpass_hz} Hz.")
+
+        strength = np.linalg.norm(lever, axis=(1, 2))
+        used = valid & (strength >= np.percentile(strength[valid], excitation_percentile))
+
+        design = np.concatenate([orientation[used], lever[used]], axis=2)
+        solution, *_ = np.linalg.lstsq(design.reshape(-1, 6),
+                                       residual[used].reshape(-1), rcond=None)
+        self._fitted_gravity = solution[:3]
+        # Back into the sensor's own frame; a no-op when the plate was aligned at load.
+        return rotation.T @ solution[3:]
 
     def project_imu_trace(self, local_offset: np.ndarray) -> IMUTrace:
         r"""

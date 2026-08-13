@@ -11,7 +11,9 @@ generated artifact lands under `results/`, with a provenance manifest sidecar.
 import os
 from pathlib import Path
 os.environ["DISABLE_TQDM"] = "True"
+import ast
 import hashlib
+import warnings
 import re
 import time
 import multiprocessing
@@ -287,23 +289,99 @@ TRIAL_DATASET = 'alborno'
 # now owns every step between a file on disk and a PlateTrial — parsing, reconstruction,
 # sync, alignment. It determines a cached trial's contents as directly as the physics does,
 # and leaving any of it out would be exactly the fail-open hole this list exists to avoid.
-_CONTENT_MODULES = ('PlateTrial.py', 'WorldTrace.py', 'IMUTrace.py',
-                    'gyro_utils.py', 'finite_difference_utils.py',
-                    'building/xsens.py', 'building/reconstruction.py',
-                    'building/assembly.py', 'building/alborno.py')
+# Every module whose contents can change what lands in a cached trial. A module missing from
+# here is a SILENT stale cache: the parquet keeps being served after the code that produced
+# it changed. `resampling.py` was missing until 2026-08-12, which is the worst possible
+# omission -- it is the module whose rewrite moved the measured cluster-to-IMU offsets by
+# 70-90%, and it only failed loudly because PlateTrial.py happened to be edited alongside it.
+# SHARED core: everything that shapes a cached trial regardless of which dataset it came
+# from. Split from the per-reader modules below so that editing one dataset's parser does not
+# invalidate the other dataset's artifacts -- alborno.py was invalidating all 262 IMoVE
+# trials, which is fail-closed but needlessly so.
+_CORE_MODULES = ('PlateTrial.py', 'WorldTrace.py', 'IMUTrace.py', 'gyro_utils.py',
+                 'finite_difference_utils.py', 'resampling.py', 'building/assembly.py',
+                 'building/reconstruction.py', 'building/sources.py')
+
+# Per-dataset readers, hashed only into their own dataset's key.
+_READER_MODULES = {
+    'alborno': ('building/alborno.py', 'building/xsens.py'),
+    'imove': ('building/imove_mocap.py', 'building/xsens.py'),
+}
+
+# Kept as the union so anything still asking for "every module that matters" gets the honest
+# answer, and so a new reader cannot be added without appearing here.
+_CONTENT_MODULES = tuple(sorted(set(_CORE_MODULES).union(
+    *(mods for mods in _READER_MODULES.values()))))
 
 # Cutoff for the alignment-residual diagnostic below.
 _RESIDUAL_LOWPASS_HZ = 10.0
 
+# Low-passed alignment residual above which a plate is called SUSPECT and recorded as such in
+# the manifest. Chosen off the observed spread -- Subject01/walking's eight plates sit at
+# 9-19 deg/s -- so it flags a plate roughly double the worst normal one.
+#
+# It lands in the manifest rather than only in the build log because the two audiences are
+# different people at different times: the build printed this an hour ago to whoever was
+# watching a terminal, while the person who needs it is the one computing joint angles now.
+# Reconstruction failures already get a mechanism that reaches them (`valid`, which
+# propagates into the error statistics); alignment failures had a print.
+RESIDUAL_WARN_DEG_S = 25.0
 
-@lru_cache(maxsize=1)
-def _toolchest_digest() -> str:
-    """SHA-256 over the toolchest modules that produce a cached trial's contents."""
+
+def _semantic_source(path: Path) -> bytes:
+    """A module's CODE, with comments and docstrings removed.
+
+    Hashing raw bytes made every prose edit a full rebuild, and this codebase is deliberately
+    comment-dense -- most invalidations were re-explaining something, not changing behaviour.
+    Parsing to an AST and dumping it drops comments (the tokenizer never keeps them) and this
+    strips docstrings explicitly, so the digest moves on semantic edits and only those.
+
+    Still FAIL-CLOSED, which is the property that matters: it is derived from the whole file
+    rather than from an enumerated list of the constants someone remembered to include, so a
+    new behaviour cannot slip in unhashed. Falls back to raw bytes if a file will not parse,
+    because refusing to hash is worse than hashing too much.
+
+    `ast.unparse`, NOT `ast.dump`. dump emits internal field names, which change between
+    CPython releases -- 3.12 and 3.13 produce different digests for identical source, so two
+    interpreters on one machine could not share a cache and each invalidated the other's
+    281 artifacts on every switch. unparse emits canonical source and was verified identical
+    across both. A digest that moves when the interpreter does is fail-closed but useless.
+    """
+    source = path.read_bytes()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+            continue
+        body = node.body
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            node.body = body[1:] or [ast.Pass()]
+    return ast.unparse(tree).encode()
+
+
+@lru_cache(maxsize=None)
+def _toolchest_digest(dataset: str = None) -> str:
+    """SHA-256 over the code that produces a cached trial's contents.
+
+    Scoped: the shared core plus `dataset`'s own reader. Passing None hashes everything,
+    which is what a caller wanting "did any of it change" should ask for.
+    """
+    modules = list(_CORE_MODULES)
+    if dataset is None:
+        modules = list(_CONTENT_MODULES)
+    else:
+        modules += list(_READER_MODULES.get(dataset, ()))
+
     digest = hashlib.sha256()
     toolchest = Path(__file__).resolve().parent.parent / 'src' / 'toolchest'
-    for name in sorted(_CONTENT_MODULES):
+    for name in sorted(set(modules)):
         digest.update(name.encode())
-        digest.update((toolchest / name).read_bytes())
+        digest.update(_semantic_source(toolchest / name))
     return digest.hexdigest()[:16]
 
 
@@ -337,8 +415,18 @@ def _source_inventory(folder: Path, globs: Tuple[str, ...]) -> List[Dict[str, An
             for p in sorted(found) if p.is_file() and not p.name.startswith('.')]
 
 
-def trial_cache_key(subject: str, trial: str, align: bool,
-                    dataset: str = TRIAL_DATASET) -> Dict[str, Any]:
+def _content_key(frame, plates: Dict[str, PlateTrial]) -> Dict[str, int]:
+    """What the artifact should contain, so a SHORT READ is a miss rather than a wrong answer.
+
+    cached_trial_status never opened the parquet -- it compared manifest fields and returned
+    'fresh'. A truncated file therefore passed. Both numbers are already computed for the
+    diagnostics; they just were not in the part that gets checked.
+    """
+    return {'n_rows': int(len(frame)), 'n_plates': int(len(plates))}
+
+
+def trial_cache_key(subject: str, trial: str, dataset: str = TRIAL_DATASET,
+                    content: Dict[str, int] = None) -> Dict[str, Any]:
     """Everything that determines a cached trial's contents.
 
     Compared field-by-field against the stored manifest on load; any difference is a cache
@@ -348,9 +436,9 @@ def trial_cache_key(subject: str, trial: str, align: bool,
     source = get_source(dataset)
     return {
         'schema_version': trial_io.SCHEMA_VERSION,
-        'toolchest_digest': _toolchest_digest(),
-        'align_plate_trials': align,
+        'toolchest_digest': _toolchest_digest(dataset),
         'sources': _source_inventory(source.source_dir(subject, trial), source.source_globs),
+        **(content or {}),
     }
 
 
@@ -426,18 +514,38 @@ def trial_diagnostics(plates: Dict[str, PlateTrial]) -> Dict[str, Any]:
         'n_invalid_frames_any_plate': int(sum(
             ~np.logical_and.reduce([p.valid for p in plates.values()]))),
         'plates': per_plate,
+        # Derived at write time so load_trial can warn without recomputing anything.
+        'suspect': sorted(name for name, stats in per_plate.items()
+                          if stats.get('gyro_residual_lowpass_rms_deg_s', 0.0)
+                          > RESIDUAL_WARN_DEG_S),
     }
 
 
 def save_cached_trial(plates: Dict[str, PlateTrial], subject: str, trial: str,
-                      align: bool = True, dataset: str = TRIAL_DATASET) -> Path:
-    """Writes a trial's PlateTrials plus the manifest that validates them on load."""
+                      dataset: str = TRIAL_DATASET) -> Path:
+    """Writes a trial's PlateTrials plus the manifest that validates them on load.
+
+    ATOMIC. The parquet goes to a temporary name and is renamed into place, because the two
+    writes below are not one operation: interrupt a --force run between them and the PREVIOUS
+    manifest is still on disk. Its cache key is unchanged -- that is precisely what --force
+    means -- so a half-written parquet validates as fresh and stays that way forever.
+    os.replace is atomic within a filesystem, so a reader sees the old file or the new one.
+    """
     source = get_source(dataset)
     path = ensure_parent(paths.cached_trial_path(dataset, subject, trial))
-    trial_io.plates_to_frame(plates).to_parquet(path, engine='pyarrow', index=False)
+    frame = trial_io.plates_to_frame(plates)
+
+    staging = path.with_suffix(path.suffix + '.tmp')
+    try:
+        frame.to_parquet(staging, engine='pyarrow', index=False)
+        os.replace(staging, path)
+    finally:
+        staging.unlink(missing_ok=True)
+
     write_manifest(
         path,
-        cache_key=trial_cache_key(subject, trial, align, dataset),
+        cache_key=trial_cache_key(subject, trial, dataset,
+                                  content=_content_key(frame, plates)),
         dataset=dataset, subject=subject, trial=trial,
         source=str(source.source_dir(subject, trial).relative_to(paths.REPO_ROOT)),
         diagnostics=trial_diagnostics(plates),
@@ -445,7 +553,7 @@ def save_cached_trial(plates: Dict[str, PlateTrial], subject: str, trial: str,
     return path
 
 
-def cached_trial_status(subject: str, trial: str, align: bool = True,
+def cached_trial_status(subject: str, trial: str,
                         dataset: str = TRIAL_DATASET) -> Tuple[str, Optional[str]]:
     """(status, reason) for one trial's cache entry, without loading the parquet.
 
@@ -480,13 +588,42 @@ def cached_trial_status(subject: str, trial: str, align: bool = True,
     if stored is None:
         return 'stale', 'manifest predates cache_key'
 
-    expected = trial_cache_key(subject, trial, align, dataset)
+    expected = trial_cache_key(subject, trial, dataset)
     for field, want in expected.items():
         if stored.get(field) != want:
             if field == 'sources':
                 return 'stale', 'source files changed'
             return 'stale', f'{field}: cached {stored.get(field)!r} != current {want!r}'
+
+    # The only field checked against the ARTIFACT rather than against the inputs. Everything
+    # above compares manifest to code and source files, which a truncated parquet passes
+    # unchanged -- and a --force run interrupted between the two writes leaves exactly that.
+    # Reading the row count costs a footer read, not a load.
+    claimed_rows = stored.get('n_rows')
+    if claimed_rows is None:
+        return 'stale', 'manifest predates the content check'
+    actual_rows = _parquet_row_count(path)
+    if actual_rows != claimed_rows:
+        return 'stale', (f'n_rows: file holds {actual_rows}, manifest claims {claimed_rows} '
+                         f'— the artifact is truncated')
     return 'fresh', None
+
+
+def _parquet_row_count(path: Path) -> Optional[int]:
+    """Rows in a parquet, from its footer. None if the file cannot be opened at all."""
+    import pyarrow.parquet as pq
+    try:
+        return int(pq.ParquetFile(path).metadata.num_rows)
+    except Exception:
+        return None
+
+
+class SuspectTrialWarning(UserWarning):
+    """A loaded trial has plates whose alignment residual is above the warn threshold."""
+
+
+class SuspectTrial(RuntimeError):
+    """Raised instead of the warning when `load_trial(..., strict=True)`."""
 
 
 class StaleTrialCache(RuntimeError):
@@ -500,7 +637,7 @@ class StaleTrialCache(RuntimeError):
     """
 
 
-def load_trial(subject: str, trial: str, align: bool = True,
+def load_trial(subject: str, trial: str, strict: bool = False,
                dataset: str = TRIAL_DATASET) -> Dict[str, PlateTrial]:
     """One trial's PlateTrials, read from its parquet.
 
@@ -509,22 +646,36 @@ def load_trial(subject: str, trial: str, align: bool = True,
 
     Raises StaleTrialCache if the artifact is missing or no longer matches its inputs.
     """
-    status, reason = cached_trial_status(subject, trial, align, dataset)
+    status, reason = cached_trial_status(subject, trial, dataset)
     if status != 'fresh':
         detail = f" ({reason})" if reason else ""
         raise StaleTrialCache(
             f"{dataset}/{subject}/{trial}: trial cache is {status}{detail}. "
             f"Run: python -m experiments.build_trials --dataset {dataset}")
     path = paths.cached_trial_path(dataset, subject, trial)
+
+    # Alignment quality reaches the caller, not just the build log. `strict` turns it into a
+    # refusal for callers that would rather not compute a joint angle at all than compute one
+    # from a plate whose mocap and IMU disagree by twice the worst normal amount.
+    suspect = ((read_manifest(path) or {}).get('diagnostics') or {}).get('suspect') or []
+    if suspect:
+        message = (f"{dataset}/{subject}/{trial}: {len(suspect)} plate(s) exceed "
+                   f"{RESIDUAL_WARN_DEG_S:.0f} deg/s of alignment residual and may have a bad "
+                   f"sync, a bad sensor-to-segment rotation, or corrupt markers underneath: "
+                   f"{', '.join(suspect)}")
+        if strict:
+            raise SuspectTrial(message)
+        warnings.warn(message, SuspectTrialWarning, stacklevel=2)
+
     return trial_io.plates_from_frame(pd.read_parquet(path, engine='pyarrow'))
 
 
-def load_raw_data(subject: str, activity: str, align: bool = True) -> Dict[str, PlateTrial]:
+def load_raw_data(subject: str, activity: str) -> Dict[str, PlateTrial]:
     """Deprecated name for `load_trial`, kept so existing experiments keep working.
 
     Misleading now: it does not load raw data, it reads a built trial.
     """
-    return load_trial(subject, activity, align=align)
+    return load_trial(subject, activity)
 
 
 # ==============================================================================

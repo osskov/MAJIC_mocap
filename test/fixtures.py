@@ -9,6 +9,9 @@ WorldTrace alongside the real physics.
 `generate_1dof_plate`, `generate_2dof_plate` and `generate_3dof_plate` take the parent plate
 as their first argument; they were instance methods.
 """
+import os
+import unittest
+
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -39,6 +42,31 @@ def markers_from_poses(positions, rotations):
     return tuple(
         np.einsum('nij,j->ni', rotations, local) + positions
         for local in (MARKER_O_LOCAL, MARKER_D_LOCAL, MARKER_X_LOCAL, MARKER_Y_LOCAL)
+    )
+
+
+def require_data(condition: bool, what: str) -> None:
+    """FAIL when the source data or built cache is missing, unless told to skip.
+
+    The strongest tests in this suite need `data/` (a large external download) or a built
+    parquet cache, and they used to skip themselves when either was absent. That is the right
+    instinct locally and the wrong outcome everywhere else: a clean checkout ran a materially
+    weaker suite and still reported green, so "all tests pass" meant one thing on a machine
+    with the data and something much weaker on CI or a collaborator's first checkout.
+
+    Failing by default makes the gap visible. `MAJIC_ALLOW_MISSING_DATA=1` restores skipping
+    for the case where someone genuinely cannot download 40 GB and wants the rest of the
+    suite -- an explicit, recorded choice rather than a silent default.
+    """
+    if condition:
+        return
+    if os.environ.get('MAJIC_ALLOW_MISSING_DATA'):
+        raise unittest.SkipTest(f"{what} (MAJIC_ALLOW_MISSING_DATA is set)")
+    raise AssertionError(
+        f"{what}.\n"
+        f"These tests exercise the real build path and cannot verify it without the data. "
+        f"Fetch it (see README) and run `python -m experiments.build_trials --dataset "
+        f"alborno`, or set MAJIC_ALLOW_MISSING_DATA=1 to skip them and accept a weaker suite."
     )
 
 
@@ -170,7 +198,9 @@ def generate_1dof_plate(
     duration = parent_world_trace.timestamps[-1] - parent_world_trace.timestamps[0]
 
     angle = generate_smooth_motion_profile(num_samples, duration, max_amp=np.pi)
-    R_joint_motion = Rotation.from_euler('z', angle)
+    # angle[:, None], not angle. scipy 1.17 requires the last dimension to match the number
+    # of sequence axes, so from_euler('z', (N,)) now raises where it used to broadcast.
+    R_joint_motion = Rotation.from_euler('z', angle[:, None])
 
     R_parent_matrices = parent.world_trace.rotations
     R_p2j_mat = parent_to_joint_rotation.as_matrix()
@@ -253,9 +283,9 @@ def generate_2dof_plate(
     x_angles = generate_smooth_motion_profile(num_samples=num_samples,duration=duration, max_amp=np.pi/6) # Abduction/Adduction
     
     # Convert to a (N, 3, 3) stack of rotation matrices
-    R_j1 = Rotation.from_euler('z', z_angles)
-    R_carrying = Rotation.from_euler('y', carrying_angle * np.ones(num_samples))
-    R_j2 = Rotation.from_euler('x', x_angles)
+    R_j1 = Rotation.from_euler('z', z_angles[:, None])
+    R_carrying = Rotation.from_euler('y', (carrying_angle * np.ones(num_samples))[:, None])
+    R_j2 = Rotation.from_euler('x', x_angles[:, None])
 
     R_j1j2_mat = (R_j1 * R_carrying * R_j2).as_matrix()
 

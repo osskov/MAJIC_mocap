@@ -66,7 +66,10 @@ def load_world_traces(trc_path: Union[str, Path],
         lines = [f.readline() for _ in range(6)]
 
     headers = lines[3].strip().split('\t')
-    imu_headers = [h for h in headers if ('_o' in h.lower())]
+    # ENDSWITH, not 'in'. Each plate contributes four marker columns named <plate>_o/_d/_x/_y
+    # and the origin is the one that names the plate. A substring test would also match a
+    # marker called e.g. 'shank_offset_d', quietly treating it as a plate origin.
+    imu_headers = [h for h in headers if h.lower().endswith('_o')]
 
     df = pd.read_csv(trc_path, delimiter='\t', skiprows=6, header=None, engine='c')
     timestamps = df.iloc[:, 1].to_numpy(dtype=np.float64)
@@ -142,9 +145,16 @@ def load_trial(folder_path: Union[str, Path],
     folder = Path(folder_path).resolve()
     imu_traces = load_imu_traces(folder)
 
-    trc_files = list(folder.glob("*.trc"))
+    # SORTED, because glob order is filesystem order. Every trial folder holds exactly one
+    # .trc today, so this has never mattered -- but "whichever the filesystem returned first"
+    # is not something a cached artifact should depend on.
+    trc_files = sorted(folder.glob("*.trc"))
     if not trc_files:
         raise FileNotFoundError(f"No .trc file found in {folder}")
+    if len(trc_files) > 1:
+        raise ValueError(f"{folder.name} holds {len(trc_files)} .trc files "
+                         f"({[f.name for f in trc_files]}); which one is the trial is not "
+                         f"something this should guess at.")
     world_traces = load_world_traces(trc_files[0])
 
     return assemble_plate_trials(imu_traces=imu_traces, world_traces=world_traces,

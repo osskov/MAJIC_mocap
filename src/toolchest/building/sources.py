@@ -42,7 +42,7 @@ class TrialSource:
     enumerate_trials: Callable[[], List[Tuple[str, str]]]
     source_dir: Callable[[str, str], Path]
     source_globs: Tuple[str, ...]
-    load: Callable[[str, str, bool], Dict[str, PlateTrial]]
+    load: Callable[[str, str], Dict[str, PlateTrial]]
 
 
 # ==============================================================================
@@ -73,9 +73,11 @@ ALBORNO = TrialSource(
     # Deliberately narrower than "everything under the folder": the trial directories also
     # hold a 66 MB .mtb (the raw Xsens binary, never parsed) and a 'madgwick (al borno)/'
     # subdirectory of third-party outputs whose filenames COLLIDE with the real IMU ones.
-    source_globs=('*.trc', 'imu data/*.txt', '*.txt'),
-    load=lambda subject, trial, align: alborno.load_trial(
-        _alborno_dir(subject, trial), align_plate_trials=align),
+    # No bare '*.txt': every Al Borno trial keeps its IMU files in 'imu data/', verified
+    # across all 19, so the loose glob only ever meant "any stray note dropped in the folder
+    # invalidates this trial".
+    source_globs=('*.trc', 'imu data/*.txt'),
+    load=lambda subject, trial: alborno.load_trial(_alborno_dir(subject, trial)),
 )
 
 
@@ -121,8 +123,7 @@ IMOVE = TrialSource(
     # long-walk trial legitimately reads three mocap files whose names it cannot predict
     # from the trial name alone.
     source_globs=('mocap_data/*.csv', 'imu_data/*.txt'),
-    load=lambda session, trial, align: imove_mocap.load_trial(
-        _imove_dir(session, trial), trial, align_plate_trials=align),
+    load=lambda session, trial: imove_mocap.load_trial(_imove_dir(session, trial), trial),
 )
 
 
