@@ -122,6 +122,50 @@ class TestSelectionGuards(unittest.TestCase):
             self.assertEqual(self._main(), 1)
 
 
+class TestReportBuild(unittest.TestCase):
+    """report_build decides whether a real build reports success to a shell script."""
+
+    @staticmethod
+    def _result(action, **extra):
+        base = {'subject': '01', 'activity': 'walking', 'action': action}
+        if action == 'built':
+            base.update({'bytes': 1000, 'diagnostics': {}})
+        base.update(extra)
+        return base
+
+    def test_a_clean_build_returns_zero(self):
+        results = {('01', 'walking'): self._result('built'),
+                   ('02', 'walking'): self._result('skipped')}
+        self.assertEqual(build_trials.report_build(results, 'out'), 0)
+
+    def test_failures_are_counted_into_the_exit_code(self):
+        results = {('01', 'walking'): self._result('built'),
+                   ('02', 'walking'): self._result('failed', error='boom')}
+        self.assertEqual(build_trials.report_build(results, 'out'), 1)
+
+    def test_absent_trials_are_not_failures(self):
+        """Al Borno's 05, 08 and 10 have walking only, and that must not turn a green build
+        red -- the distinction only matters if it survives to the exit code."""
+        results = {('05', 'complexTasks'): self._result('absent')}
+        self.assertEqual(build_trials.report_build(results, 'out'), 0)
+
+    def test_a_failure_prints_its_traceback(self):
+        results = {('01', 'walking'): self._result(
+            'failed', error='boom', traceback='Traceback...\n  ValueError: boom')}
+        with mock.patch('builtins.print') as printed:
+            build_trials.report_build(results, 'out')
+        printed_text = ' '.join(str(c) for c in printed.call_args_list)
+        self.assertIn('ValueError', printed_text)
+
+    def test_suspect_plates_are_summarised(self):
+        results = {('01', 'walking'): self._result('built', diagnostics={'plates': {
+            'femur_r_imu': {'gyro_residual_lowpass_rms_deg_s': 40.0}}})}
+        with mock.patch('builtins.print') as printed:
+            build_trials.report_build(results, 'out')
+        printed_text = ' '.join(str(c) for c in printed.call_args_list)
+        self.assertIn('femur_r_imu', printed_text)
+
+
 class TestStatusGrid(unittest.TestCase):
     """The grid is the only thing that makes 262 trials legible at a glance."""
 
@@ -134,6 +178,14 @@ class TestStatusGrid(unittest.TestCase):
         self.assertEqual(build_trials._natural_key('t2'), ['t', 2, ''])
         self.assertLess(build_trials._natural_key('t2'), build_trials._natural_key('t10'))
         self.assertLess(build_trials._natural_key('s4'), build_trials._natural_key('s13'))
+
+    def test_columns_do_not_collide_when_leading_tokens_repeat(self):
+        """Labels are the leading token because trial names are long and repetitive -- but
+        two trials sharing one would render as two identically-labelled columns."""
+        keys = [('s2', 't1_walking_001'), ('s2', 't1_running_002')]
+        table = build_trials.status_grid(keys, 'imove', statuses={k: 'fresh' for k in keys})
+        labels = [c.header for c in table.columns[1:]]
+        self.assertEqual(len(set(labels)), len(labels), labels)
 
     def test_a_trial_absent_from_a_session_renders_blank(self):
         """s13l has no t1, and a blank cell has to mean 'not in this dataset' rather than

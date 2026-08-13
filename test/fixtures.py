@@ -70,6 +70,23 @@ def require_data(condition: bool, what: str) -> None:
     )
 
 
+def require_cache(condition: bool, what: str) -> None:
+    """SKIP when the built cache is stale or missing, unlike require_data which FAILS.
+
+    The two conditions are not the same and were being treated identically. Absent source
+    data means the test genuinely cannot verify anything, and quietly passing is a lie --
+    that stays a hard failure. A stale cache means the code moved and the artifacts have not
+    caught up, which is the normal state halfway through an edit: any semantic change to a
+    core module invalidates all 281 trials, and a full rebuild is minutes. Failing there
+    would make the suite red during ordinary work and train everyone to ignore it.
+    """
+    if condition:
+        return
+    raise unittest.SkipTest(
+        f"{what}. Rebuild with `python -m experiments.build_trials --dataset alborno` "
+        f"(and --dataset imove) to run this.")
+
+
 def generate_smooth_motion_profile(
         num_samples: int,
         duration: float,

@@ -12,7 +12,7 @@ Skips cleanly if data/ has not been populated, so it is safe in a bare checkout.
 import os
 import unittest
 
-from test.fixtures import require_data
+from test.fixtures import require_cache, require_data
 
 os.environ.setdefault("DISABLE_TQDM", "True")
 
@@ -20,8 +20,9 @@ import numpy as np
 
 import paths
 from experiments import experiment_utils
-from experiments.experiment_utils import (EXPECTED_GRAVITY, ACTIVITIES, SUBJECTS, load_raw_data,
-                                          measure_world_frame_gravity, check_gravity_convention)
+from experiments.experiment_utils import (EXPECTED_GRAVITY, ACTIVITIES, SUBJECTS,
+                                          StaleTrialCache, check_gravity_convention,
+                                          load_raw_data, measure_world_frame_gravity)
 from src.toolchest.building import alborno
 
 # The measured spread across this dataset is 0.035 m/s^2, so this is a sharp bound.
@@ -42,7 +43,11 @@ class TestGravityConvention(unittest.TestCase):
         cls.subject, cls.activity = _first_available_trial()
         if cls.subject is None:
             require_data(False, f"no source data under {paths.DATA_DIR}")
-        cls.plates = load_raw_data(cls.subject, cls.activity)
+        try:
+            cls.plates = load_raw_data(cls.subject, cls.activity)
+        except StaleTrialCache as stale:
+            # A stale cache means the code moved, not that this cannot be verified.
+            require_cache(False, str(stale))
 
     def test_expected_gravity_matches_the_data(self):
         """The constant must agree with the accelerometers, in axis, sign and magnitude."""

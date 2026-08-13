@@ -12,13 +12,21 @@ one: a `cache_key` recording the inputs and code version it was built from (chec
 on load, so a stale entry is a miss rather than a wrong answer), and `diagnostics`
 holding per-plate alignment residuals for triage.
 
-    python -m experiments.cache_trials                 # build whatever is missing or stale
-    python -m experiments.cache_trials --check         # report status, write nothing
-    python -m experiments.cache_trials --force         # rebuild everything
-    python -m experiments.cache_trials --subjects 01 02 --activities walking
+    python -m experiments.build_trials --dataset alborno            # build what is stale
+    python -m experiments.build_trials --dataset imove --check      # report, write nothing
+    python -m experiments.build_trials --dataset imove --force      # rebuild everything
+    python -m experiments.build_trials --dataset alborno --subjects 01 02 --trials walking
+    python -m experiments.build_trials --dataset imove --quiet      # no status grid
+    python -m experiments.build_trials --dataset imove --check --verbose   # per-trial reasons
 
-Nothing else has to change to benefit: `load_raw_data` consults the cache already,
-and falls back to loading from source when there is nothing valid to use.
+Exits NON-ZERO when anything failed, or when --check finds work outstanding, so a build can
+gate a script. The status grid (sessions down, trials across) is the at-a-glance version;
+--quiet suppresses it for headless runs.
+
+THE PARQUET IS THE INTERFACE. There is no fallback: `load_trial` raises StaleTrialCache
+rather than parsing from source, because a silent fallback made a stale cache cost time and
+nothing else -- which also made it invisible, and let one run mix cached and freshly-parsed
+trials with no record of which was which. Build first, then read.
 """
 import os
 os.environ["DISABLE_TQDM"] = "True"
@@ -99,7 +107,8 @@ _STATUS_MARKS = {
     'stale':   ('[yellow]▵[/yellow]', 'built from different code or inputs'),
     'missing': ('[dim]·[/dim]', 'never built'),
     'failed':  ('[red]✗[/red]', 'the build raised'),
-    'absent':  ('[dim] [/dim]', 'the source trial does not exist'),
+    # A blank made "not in this dataset" indistinguishable from a rendering failure.
+    'absent':  ('[dim]–[/dim]', 'not part of this session'),
 }
 
 
@@ -120,10 +129,13 @@ def status_grid(row_keys: List[Tuple[str, str]], dataset: str,
     table = Table(title=f"[bold magenta]{dataset}[/bold magenta]", show_header=True,
                   header_style="bold cyan")
     table.add_column("session", style="bold")
-    for trial in trials:
-        # Trial names are long and highly repetitive ('t6_drop_jump_001'); the leading token
-        # is what distinguishes them and is narrow enough to fit 13 across.
-        table.add_column(trial.split('_')[0], justify="center")
+    # Trial names are long and repetitive ('t6_drop_jump_001'), so the leading token is what
+    # distinguishes them -- but only while it is unique. Two trials sharing one would render
+    # as two identically-labelled columns, so fall back to the full name when that happens.
+    leading = [trial.split('_')[0] for trial in trials]
+    labels = (leading if len(set(leading)) == len(leading) else list(trials))
+    for label in labels:
+        table.add_column(label, justify="center")
 
     present = set(row_keys)
     for session in sessions:

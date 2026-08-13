@@ -96,6 +96,11 @@ class PlateTrial:
         assert isinstance(world_trace, WorldTrace)
 
         self.name = name
+        # Where this plate's world trace was moved to, in the sensor frame, metres. Zero means
+        # the pose still describes the marker cluster rather than the IMU. Set by
+        # assembly.shift_world_origin; not carried through the parquet, which is why the
+        # build records it in the manifest instead.
+        self.sensor_offset = np.zeros(3)
         self.imu_trace = imu_trace
         self.world_trace = world_trace
 

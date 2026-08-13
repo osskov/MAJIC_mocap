@@ -1,4 +1,4 @@
-"""Re-derive imove_mocap.CLUSTER_TO_IMU_OFFSET_MM from the cached trials.
+"""Re-derive imove_mocap.RIGID_SENSOR_OFFSET_MM from the cached trials.
 
 Run this when TestClusterOffset fails, or when the loader changes in a way that could move
 the answer -- which it demonstrably can: replacing linear interpolation with band-limited
@@ -17,10 +17,16 @@ import os
 
 os.environ.setdefault("DISABLE_TQDM", "True")
 
+import warnings
+
 import numpy as np
 
-from experiments.experiment_utils import StaleTrialCache, load_trial
-from src.toolchest.building.imove_mocap import pool_cluster_offsets
+from experiments.experiment_utils import (StaleTrialCache, SuspectTrialWarning, load_trial)
+
+# This loads every trial on purpose, so the per-trial suspect warning -- which is the right
+# thing when someone loads ONE trial -- would be 151 lines of noise here.
+warnings.simplefilter('ignore', SuspectTrialWarning)
+from src.toolchest.building.imove_mocap import _fit_iteratively, pool_cluster_offsets
 from src.toolchest.building.sources import get_source
 
 # A static pose has no lever arm to see, so its fit is singular rather than merely noisy.
@@ -47,13 +53,31 @@ def collect(cutoff_hz, limit=None, dataset='imove', sessions=None):
         except (FileNotFoundError, ValueError):
             skipped += 1
             continue
+        # The build already shifted each pose onto its sensor, so a fit here returns what
+        # REMAINS. The absolute offset is that plus what was applied, which the manifest
+        # records per plate. Skipping this step would drive the constant to zero one refit at
+        # a time, each run looking like a small correction on the last.
+        applied = _applied_offsets(dataset, session, trial)
         for name, plate in plates.items():
-            try:
-                samples.setdefault(name, []).append(
-                    plate.fit_sensor_offset(lowpass_hz=cutoff_hz))
-            except (ValueError, np.linalg.LinAlgError):
+            # ITERATED, not a single step. The fit reads about 16% low -- `A` comes from
+            # twice-differentiated markers, so noise in the regressor biases least squares
+            # toward zero -- and one pass therefore lands short. Taking one step here is what
+            # made the previous run report 77 -> 89 mm instead of the answer: it was a Newton
+            # step from the current constant rather than the fixed point.
+            residual = _fit_iteratively(plate, lowpass_hz=cutoff_hz)
+            if residual is None:
                 continue
+            samples.setdefault(name, []).append(residual + applied.get(name, 0.0))
     return {name: np.array(values) for name, values in samples.items()}, skipped
+
+
+def _applied_offsets(dataset, session, trial):
+    """{sensor: offset in metres} that the build applied, from the manifest."""
+    import paths
+    manifest = paths.read_manifest(paths.cached_trial_path(dataset, session, trial)) or {}
+    plates = (manifest.get('diagnostics') or {}).get('plates') or {}
+    return {name: np.asarray(stats.get('sensor_offset_mm', (0.0, 0.0, 0.0))) / 1000.0
+            for name, stats in plates.items()}
 
 
 def report(pooled, cutoff_hz):
@@ -111,7 +135,9 @@ def main():
             fast, _ = collect(cutoff, args.limit, sessions=long_walk)
             rate_agreement((slow, fast))
 
-    print("\nPaste the medians into imove_mocap.CLUSTER_TO_IMU_OFFSET_MM.")
+    print("\nPaste the BOLTED medians into imove_mocap.RIGID_SENSOR_OFFSET_MM. The taped\n"
+          "sensors are fitted per trial, so their medians are only fallback nominals for\n"
+          "imove_mocap.NOMINAL_SENSOR_OFFSET_MM.")
 
 
 if __name__ == '__main__':

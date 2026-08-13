@@ -295,12 +295,16 @@ TRIAL_DATASET = 'alborno'
 # omission -- it is the module whose rewrite moved the measured cluster-to-IMU offsets by
 # 70-90%, and it only failed loudly because PlateTrial.py happened to be edited alongside it.
 # SHARED core: everything that shapes a cached trial regardless of which dataset it came
-# from. Split from the per-reader modules below so that editing one dataset's parser does not
+# from. `trial_io.py` is in here because it WRITES the parquet -- change the float32 cast,
+# the plate sort order or the rot_ij convention and every artifact is different, yet its only
+# guard was a hand-maintained SCHEMA_VERSION. That is exactly the "someone forgets to bump
+# the constant" failure this digest exists to make impossible. Split from the per-reader modules below so that editing one dataset's parser does not
 # invalidate the other dataset's artifacts -- alborno.py was invalidating all 262 IMoVE
 # trials, which is fail-closed but needlessly so.
 _CORE_MODULES = ('PlateTrial.py', 'WorldTrace.py', 'IMUTrace.py', 'gyro_utils.py',
-                 'finite_difference_utils.py', 'resampling.py', 'building/assembly.py',
-                 'building/reconstruction.py', 'building/sources.py')
+                 'finite_difference_utils.py', 'resampling.py', 'trial_io.py',
+                 'building/assembly.py', 'building/reconstruction.py',
+                 'building/sources.py')
 
 # Per-dataset readers, hashed only into their own dataset's key.
 _READER_MODULES = {
@@ -501,6 +505,10 @@ def trial_diagnostics(plates: Dict[str, PlateTrial]) -> Dict[str, Any]:
             'n_frames': len(plate),
             'acc_norm_median': float(np.median(np.linalg.norm(plate.imu_trace.acc, axis=1))),
             'mag_norm_median': float(np.median(np.linalg.norm(plate.imu_trace.mag, axis=1))),
+            # What shift_world_origin moved this plate's pose by, so the shift is auditable
+            # and a re-derivation can add it back. Without it a refit measures the RESIDUAL
+            # and pasting that in as the new constant walks it to zero one run at a time.
+            'sensor_offset_mm': [float(v) for v in np.asarray(plate.sensor_offset) * 1000.0],
             **_alignment_residuals(plate),
         }
     return {
@@ -555,6 +563,13 @@ def save_cached_trial(plates: Dict[str, PlateTrial], subject: str, trial: str,
 
 def cached_trial_status(subject: str, trial: str,
                         dataset: str = TRIAL_DATASET) -> Tuple[str, Optional[str]]:
+    """(status, reason). See `_cached_trial_state`, which also hands back the manifest."""
+    status, reason, _ = _cached_trial_state(subject, trial, dataset)
+    return status, reason
+
+
+def _cached_trial_state(subject: str, trial: str, dataset: str = TRIAL_DATASET
+                        ) -> Tuple[str, Optional[str], Optional[Dict[str, Any]]]:
     """(status, reason) for one trial's cache entry, without loading the parquet.
 
     status is one of:
@@ -574,26 +589,26 @@ def cached_trial_status(subject: str, trial: str,
     source = get_source(dataset)
     folder = source.source_dir(subject, trial)
     if not folder.is_dir() or not _source_inventory(folder, source.source_globs):
-        return 'absent', f'no source trial at {folder.relative_to(paths.REPO_ROOT)}'
+        return 'absent', f'no source trial at {folder.relative_to(paths.REPO_ROOT)}', None
 
     path = paths.cached_trial_path(dataset, subject, trial)
     if not path.exists():
-        return 'missing', None
+        return 'missing', None, None
 
     manifest = read_manifest(path)
     if manifest is None:
-        return 'stale', 'no manifest sidecar'
+        return 'stale', 'no manifest sidecar', None
 
     stored = manifest.get('cache_key')
     if stored is None:
-        return 'stale', 'manifest predates cache_key'
+        return 'stale', 'manifest predates cache_key', manifest
 
     expected = trial_cache_key(subject, trial, dataset)
     for field, want in expected.items():
         if stored.get(field) != want:
             if field == 'sources':
-                return 'stale', 'source files changed'
-            return 'stale', f'{field}: cached {stored.get(field)!r} != current {want!r}'
+                return 'stale', 'source files changed', manifest
+            return 'stale', f'{field}: cached {stored.get(field)!r} != current {want!r}', manifest
 
     # The only field checked against the ARTIFACT rather than against the inputs. Everything
     # above compares manifest to code and source files, which a truncated parquet passes
@@ -601,12 +616,12 @@ def cached_trial_status(subject: str, trial: str,
     # Reading the row count costs a footer read, not a load.
     claimed_rows = stored.get('n_rows')
     if claimed_rows is None:
-        return 'stale', 'manifest predates the content check'
+        return 'stale', 'manifest predates the content check', manifest
     actual_rows = _parquet_row_count(path)
     if actual_rows != claimed_rows:
         return 'stale', (f'n_rows: file holds {actual_rows}, manifest claims {claimed_rows} '
-                         f'— the artifact is truncated')
-    return 'fresh', None
+                         f'— the artifact is truncated'), manifest
+    return 'fresh', None, manifest
 
 
 def _parquet_row_count(path: Path) -> Optional[int]:
@@ -646,7 +661,7 @@ def load_trial(subject: str, trial: str, strict: bool = False,
 
     Raises StaleTrialCache if the artifact is missing or no longer matches its inputs.
     """
-    status, reason = cached_trial_status(subject, trial, dataset)
+    status, reason, manifest = _cached_trial_state(subject, trial, dataset)
     if status != 'fresh':
         detail = f" ({reason})" if reason else ""
         raise StaleTrialCache(
@@ -657,7 +672,7 @@ def load_trial(subject: str, trial: str, strict: bool = False,
     # Alignment quality reaches the caller, not just the build log. `strict` turns it into a
     # refusal for callers that would rather not compute a joint angle at all than compute one
     # from a plate whose mocap and IMU disagree by twice the worst normal amount.
-    suspect = ((read_manifest(path) or {}).get('diagnostics') or {}).get('suspect') or []
+    suspect = ((manifest or {}).get('diagnostics') or {}).get('suspect') or []
     if suspect:
         message = (f"{dataset}/{subject}/{trial}: {len(suspect)} plate(s) exceed "
                    f"{RESIDUAL_WARN_DEG_S:.0f} deg/s of alignment residual and may have a bad "

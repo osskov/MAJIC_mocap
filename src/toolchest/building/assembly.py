@@ -226,15 +226,26 @@ def shift_world_origin(plate: PlateTrial, offset_m: np.ndarray) -> PlateTrial:
     constant is checked, rather than by comparing it against a stored copy of itself.
     """
     offset_m = np.asarray(offset_m, dtype=np.float64)
+    # Adding zero cannot change either the pose or the accumulated total, so return the plate
+    # itself rather than a numerically-identical copy. The iterative fit relies on this: its
+    # last step is small by construction and there is no reason to rebuild the arrays for it.
     if not offset_m.any():
         return plate
 
     rotations = np.asarray(plate.world_trace.rotations)
     positions = (np.asarray(plate.world_trace.positions)
                  + np.einsum('nij,j->ni', rotations, offset_m))
-    shifted = WorldTrace(plate.world_trace.timestamps, positions, rotations,
-                         valid=plate.world_trace.valid)
-    return PlateTrial(plate.name, plate.imu_trace, shifted)
+    shifted = PlateTrial(plate.name, plate.imu_trace,
+                         WorldTrace(plate.world_trace.timestamps, positions, rotations,
+                                    valid=plate.world_trace.valid))
+    # ACCUMULATED, not replaced, so shifting twice records the total. That matters because
+    # the fit is applied iteratively: it reads low, so one pass lands short of the truth.
+    #
+    # Recorded so the shift is auditable and, more importantly, so a re-derivation can add it
+    # back. fit_sensor_offset on a shifted plate returns what REMAINS, and a refit that pasted
+    # that in as the new constant would drive it to zero one run at a time.
+    shifted.sensor_offset = np.asarray(plate.sensor_offset) + offset_m
+    return shifted
 
 
 def _to_common_grid(imu_trace: IMUTrace, world_trace: WorldTrace, target_rate: float,

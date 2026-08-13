@@ -25,6 +25,7 @@ the data rather than from documentation, and each one is a trap:
 The device-to-segment map is not in the data at all; it comes from the authors' code at
 github.com/CMU-MBL/IMoveLab.
 """
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -76,24 +77,71 @@ FOOT_TOKENS = ('CAL', 'MT', 'DP')
 CLUSTER_TOLERANCE_M = 0.010
 FOOT_TOLERANCE_M = 0.025
 
-# Where each IMU sits relative to its marker cluster's origin, in MILLIMETRES, in that
-# sensor's own frame. Filled by `pool_cluster_offsets` over the whole dataset; see
-# experiments/refit_cluster_offset.py to re-derive.
+# Cluster -> sensor offset for the sensors that are BOLTED TO THE CLUSTER: the Mid sensor on
+# each limb, and the pelvis. These share one mounting bracket per segment, so the offset is
+# hardware -- one number for every subject and every trial -- and belongs here as a constant.
 #
-# This is hardware, not anatomy: the cluster is bolted to the IMU and DEVICE_TO_SENSOR
-# assigns one physical unit to a given segment for every subject, so there is one constant
-# per sensor rather than one per subject. Fitting it per trial instead would be worse, not
-# more precise -- single-trial fits are unstable and occasionally diverge outright.
+# Measured across ~230 trials each; see experiments/refit_cluster_offset.py. Their between-fit
+# spread is 3.9-4.8 mm per axis, which is what a fixed mounting should look like.
+RIGID_SENSOR_OFFSET_MM: Dict[str, Tuple[float, float, float]] = {
+    'THIGH_L_M': (-8.1, -15.6, 26.7),
+    'THIGH_R_M': (-11.5, -7.8, 25.0),
+    'SHANK_L_M': (6.2, -12.4, 0.5),
+    'SHANK_R_M': (7.0, -6.9, 3.8),
+    'PELVIS_M': (10.1, -4.6, -17.6),
+}
+
+# TWO THINGS ABOUT THE ABOVE ARE UNRESOLVED, and neither is visible in the numbers themselves.
 #
-# It is NOT zero, which is what the plate figure suggests and what a fitter would otherwise
-# assume. At running-level excitation the neglected lever term A p reaches 1-3 m/s^2, and
-# because this anchors the absolute positions of the H and L sensors (sensor-to-sensor
-# constraints only ever give differences) an error here displaces all three equally.
+# The magnitudes disagree by 3x across segments -- shank 10.5-13.9, pelvis 20.8, thigh
+# 28.6-32.0 mm -- and |p| is rotation-invariant, so this is NOT explained by the IMUs sitting
+# differently in their brackets. Identical hardware on identical plates should not do that.
+# Left agrees with right to 3.3-3.4 mm within each segment type, so the fits themselves are
+# sound; it is the between-segment difference that has no mechanism.
 #
-# UNLIKE DEVICE_TO_SENSOR, THIS DEPENDS ON THE PIPELINE THAT MEASURED IT. Fixing the
-# resampler moved it by 70-90%. TestClusterOffset re-fits it from cached trials and fails
-# when the two drift apart, which is the guard that would have caught that.
-CLUSTER_TO_IMU_OFFSET_MM: Dict[str, Tuple[float, float, float]] = {}
+# And the two sample rates disagree: the thighs read 3x larger at 40 Hz than at 100 Hz while
+# the shanks read SMALLER, so it is not one global rate bias. The 100 Hz long-walk sessions
+# involve no resampling at all, which makes them the more trustworthy side -- and there the
+# thigh and shank values are much closer to each other, which would be consistent with the
+# shared offset the segments ought to have. So both problems may be the same defect.
+#
+# These values are therefore the best current estimate, dominated by the 40 Hz sessions
+# because they are 238 of 243 trials. TestClusterOffset.test_the_two_sample_rates_agree is
+# marked as an expected failure and documents this.
+
+# Everything else is TAPED ON, near the same spot each time but not at it: the High and Low
+# sensors flanking each Mid, and the feet, which have no cluster at all. Their offset is a
+# property of the trial, not of the hardware, so it is FITTED PER TRIAL in `load_trial` and
+# these values serve only as a fallback when that fit diverges.
+#
+# The data says the same thing the taping does: their between-fit spread is 8.5-21.1 mm per
+# axis against the bolted sensors' 3.9-4.8, and the feet's is worse still.
+NOMINAL_SENSOR_OFFSET_MM: Dict[str, Tuple[float, float, float]] = {
+    'THIGH_L_H': (73.3, -11.1, 15.0),
+    'THIGH_L_L': (-89.2, -14.9, 24.8),
+    'THIGH_R_H': (67.6, -3.6, 12.3),
+    'THIGH_R_L': (-88.0, -10.3, 21.8),
+    'SHANK_L_H': (77.1, -5.6, 5.4),
+    'SHANK_L_L': (-83.0, -16.1, 3.2),
+    'SHANK_R_H': (76.7, -3.5, 6.7),
+    'SHANK_R_L': (-77.1, -1.5, 3.5),
+    'FOOT_L_M': (2.5, -0.6, 41.8),
+    'FOOT_R_M': (4.2, -12.0, 40.3),
+}
+
+# A per-trial fit further than this from its nominal is not a re-placed sensor, it is a
+# diverged solve -- one IMoVE trial returned a magnitude sd of 205 mm. Taping varies by
+# centimetres, so 60 mm is generous for the physics and still catches that.
+FIT_PLAUSIBILITY_MM = 60.0
+
+
+class ImplausibleOffsetFitWarning(UserWarning):
+    """A per-trial sensor-offset fit was rejected and the nominal used instead."""
+
+
+class UnknownDeviceWarning(UserWarning):
+    """An IMU file whose device id is not in DEVICE_TO_SENSOR, so its segment has no plate."""
+
 
 _HEADER_ROWS = 7          # rows before the first data row
 _NAME_ROW = 3             # 'modified_rizzoli:LTH1' etc.
@@ -222,12 +270,23 @@ def load_world_traces(csv_path: Union[str, Path]) -> Dict[str, WorldTrace]:
 def load_imu_traces(session_dir: Union[str, Path], trial: str) -> Dict[str, 'IMUTrace']:
     """{sensor name: IMUTrace} for one trial, keyed as DEVICE_TO_SENSOR names them."""
     session_dir = Path(session_dir)
-    traces = {}
+    traces, unknown = {}, []
     for path in sorted((session_dir / 'imu_data').glob(f'{trial}-000_*.txt')):
         device = path.name.split('-000_')[1][:-4]
         sensor = DEVICE_TO_SENSOR.get(device)
-        if sensor is not None:
-            traces[sensor] = read_xsens_txt(path)
+        if sensor is None:
+            unknown.append(device)
+            continue
+        traces[sensor] = read_xsens_txt(path)
+
+    if unknown:
+        # Not silent. A session recorded with a replacement sensor would otherwise build
+        # happily with 14 plates instead of 15, and nothing downstream compares n_plates
+        # against what was expected -- the segment would simply be absent.
+        warnings.warn(
+            f"{session_dir.name}/{trial}: {len(unknown)} IMU file(s) carry device ids that "
+            f"are not in DEVICE_TO_SENSOR and were skipped: {sorted(unknown)}. Their "
+            f"segments will have no plate.", UnknownDeviceWarning, stacklevel=2)
     return traces
 
 
@@ -337,13 +396,106 @@ def load_trial(session_dir: Union[str, Path], trial: str,
     plates = assemble_plate_trials(imu_traces, _pair_world_traces(world_traces, imu_traces),
                                    align_plate_trials, lag=lag)
 
-    # Put each plate's mocap origin on its IMU rather than on its marker cluster. Only
-    # meaningful once the sensor-to-segment rotation has been applied, so it is skipped
-    # along with the alignment; a sensor with no measured offset is left where it is.
+    # Put each plate's mocap origin on its IMU rather than on its marker cluster, so the
+    # pose describes where the sensor actually is and the lever-arm term stops contaminating
+    # every acceleration comparison. Only meaningful once the sensor-to-segment rotation has
+    # been applied, so it is skipped along with the alignment.
     if align_plate_trials:
-        plates = {name: shift_world_origin(
-            plate, np.asarray(CLUSTER_TO_IMU_OFFSET_MM.get(name, (0.0, 0.0, 0.0))) / 1000.0)
-            for name, plate in plates.items()}
+        plates = {name: shift_world_origin(plate, offset)
+                  for name, (plate, offset) in _sensor_offsets(plates).items()}
+    return plates
+
+
+def _fit_iteratively(plate: PlateTrial, iterations: int = 4,
+                     converged_mm: float = 0.2,
+                     lowpass_hz: float = 8.0) -> Optional[np.ndarray]:
+    """Total sensor offset, by fitting, shifting, and re-fitting what remains.
+
+    One pass is not enough because the fit READS LOW. `A` is built from twice-differentiated
+    marker positions, so it carries noise, and least squares with error in the regressor is
+    biased toward zero -- regression dilution. Measured against the bolted sensors, a single
+    pass recovers about 84% of the offset.
+
+    Iterating removes that bias without needing to know how large it is. The fit returns
+    k * (p_true - p_applied) for some unknown k in (0, 1], so the only place it can return zero
+    is p_applied = p_true: the fixed point is the truth whatever k happens to be, and each pass
+    closes the remaining gap by a constant fraction. Four passes take a 16% shortfall under
+    0.1%.
+
+    Returns None when the solve fails outright -- too little valid data or too little
+    excitation, as in a static pose.
+    """
+    total = np.zeros(3)
+    current = plate
+    previous_step = None
+    for _ in range(iterations):
+        try:
+            step = current.fit_sensor_offset(lowpass_hz=lowpass_hz)
+        except (ValueError, np.linalg.LinAlgError):
+            return None if not total.any() else total
+
+        size = np.linalg.norm(step) * 1000.0
+        # A contraction's steps shrink. One that grows means the residual is not being
+        # explained by a lever arm at all -- bail with what was accumulated before it, rather
+        # than letting the divergence compound into the total.
+        if previous_step is not None and size > previous_step:
+            break
+        previous_step = size
+
+        total = total + step
+        if size < converged_mm:
+            break
+        current = shift_world_origin(current, step)
+    return total
+
+
+def _sensor_offsets(plates: Dict[str, PlateTrial]
+                    ) -> Dict[str, Tuple[PlateTrial, np.ndarray]]:
+    """{sensor: (plate, offset in metres)}, constant where the sensor is bolted on and fitted
+    where it is taped on.
+
+    The split is physical. The Mid sensor on each limb and the pelvis sensor share a bracket
+    with their marker cluster, so their offset is hardware: one number for every subject and
+    trial, and fitting it per trial would only add noise to something already known. The High
+    and Low sensors and the feet are taped near the same spot each session but not at it, so
+    for them a single constant is the wrong model no matter how well it is measured -- the
+    offset genuinely differs trial to trial and has to be fitted there.
+
+    The measured scatter agrees: 3.9-4.8 mm per axis on the bolted sensors against 8.5-21.1 on
+    the taped ones. That gap is the re-placement, not the estimator.
+
+    A fitted offset is checked against its nominal before being trusted, because the per-trial
+    solve does occasionally diverge -- one trial returned a magnitude sd of 205 mm, which
+    would put the mocap origin further from the sensor than doing nothing at all.
+    """
+    resolved = {}
+    for name, plate in plates.items():
+        rigid = RIGID_SENSOR_OFFSET_MM.get(name)
+        if rigid is not None:
+            resolved[name] = (plate, np.asarray(rigid) / 1000.0)
+            continue
+
+        nominal = NOMINAL_SENSOR_OFFSET_MM.get(name)
+        if nominal is None:
+            raise ValueError(
+                f"{name} is in neither RIGID_SENSOR_OFFSET_MM nor "
+                f"NOMINAL_SENSOR_OFFSET_MM, so its lever-arm error would be kept silently. "
+                f"Add it, or derive both with experiments/refit_cluster_offset.py.")
+        nominal = np.asarray(nominal) / 1000.0
+
+        fitted = _fit_iteratively(plate)
+
+        if fitted is None or np.linalg.norm(fitted - nominal) * 1000.0 > FIT_PLAUSIBILITY_MM:
+            warnings.warn(
+                f"{name}: per-trial offset fit "
+                f"{'failed' if fitted is None else f'{np.round(fitted * 1000, 1)} mm'} is not "
+                f"usable; falling back to the nominal {np.round(nominal * 1000, 1)} mm.",
+                ImplausibleOffsetFitWarning, stacklevel=3)
+            fitted = nominal
+        resolved[name] = (plate, fitted)
+    return resolved
+
+
     return plates
 
 

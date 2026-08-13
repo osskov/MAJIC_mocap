@@ -1,8 +1,9 @@
 import json
 import os
 import unittest
+import warnings
 
-from test.fixtures import require_data
+from test.fixtures import require_cache, require_data
 from unittest import mock
 
 import numpy as np
@@ -446,15 +447,16 @@ class TestStrictLoading(unittest.TestCase):
     """
 
     def test_a_missing_trial_raises_and_names_the_build_command(self):
-        with mock.patch.object(eu, 'cached_trial_status', return_value=('missing', None)):
+        with mock.patch.object(eu, '_cached_trial_state',
+                               return_value=('missing', None, None)):
             with self.assertRaises(eu.StaleTrialCache) as ctx:
                 eu.load_trial('01', 'walking')
         self.assertIn('build_trials', str(ctx.exception))
         self.assertIn('--dataset alborno', str(ctx.exception))
 
     def test_a_stale_trial_raises_with_the_reason(self):
-        with mock.patch.object(eu, 'cached_trial_status',
-                               return_value=('stale', 'toolchest_digest: ...')):
+        with mock.patch.object(eu, '_cached_trial_state',
+                               return_value=('stale', 'toolchest_digest: ...', None)):
             with self.assertRaises(eu.StaleTrialCache) as ctx:
                 eu.load_trial('01', 'walking')
         self.assertIn('toolchest_digest', str(ctx.exception))
@@ -464,7 +466,7 @@ class TestStrictLoading(unittest.TestCase):
         if not paths.raw_trial_dir('01', 'walking').is_dir():
             require_data(False, "no source data")
         if eu.cached_trial_status('01', 'walking')[0] != 'fresh':
-            require_data(False, "trial cache not built")
+            require_cache(False, "trial cache not built or stale")
         with mock.patch.object(sources.alborno, 'load_trial') as reader:
             plates = eu.load_trial('01', 'walking')
         reader.assert_not_called()
@@ -474,6 +476,78 @@ class TestStrictLoading(unittest.TestCase):
         with mock.patch.object(eu, 'load_trial', return_value={'x': None}) as inner:
             eu.load_raw_data('01', 'walking')
         inner.assert_called_once()
+
+
+class TestSuspectReporting(unittest.TestCase):
+    """The warning is the whole point of the `suspect` field, and had no tests.
+
+    trial_diagnostics' producer was covered; the consumer was not. The purpose of this API is
+    that an alignment failure reaches the person computing joint angles rather than dying in
+    a build log an hour earlier -- so "does it actually reach them" is the assertion that
+    matters. The manifest is JSON, so a suspect trial can be staged by editing it.
+    """
+
+    DATASET = '_suspect_dataset'
+
+    def setUp(self):
+        real = sources.get_source('alborno')
+        self.source = sources.TrialSource(
+            name=self.DATASET, enumerate_trials=lambda: [('01', 'walking')],
+            source_dir=real.source_dir, source_globs=real.source_globs, load=real.load)
+        self._patch = mock.patch.dict(sources.SOURCES, {self.DATASET: self.source})
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        self.tmp = paths.TRIALS_DIR / self.DATASET
+        self.addCleanup(lambda: __import__('shutil').rmtree(self.tmp, ignore_errors=True))
+
+        require_data(paths.raw_trial_dir('01', 'walking').is_dir(), "no source data")
+        eu.save_cached_trial(make_plates(), '01', 'walking', dataset=self.DATASET)
+        self.path = paths.cached_trial_path(self.DATASET, '01', 'walking')
+
+    def _set_suspect(self, names):
+        manifest_path = paths.manifest_path(self.path)
+        manifest = json.loads(manifest_path.read_text())
+        manifest['diagnostics']['suspect'] = names
+        manifest_path.write_text(json.dumps(manifest))
+
+    def test_a_clean_trial_neither_warns_nor_raises(self):
+        self._set_suspect([])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            eu.load_trial('01', 'walking', dataset=self.DATASET)
+        self.assertEqual([w for w in caught
+                          if issubclass(w.category, eu.SuspectTrialWarning)], [])
+
+    def test_a_suspect_trial_warns_and_names_the_plates(self):
+        self._set_suspect(['femur_r_imu', 'tibia_r_imu'])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            eu.load_trial('01', 'walking', dataset=self.DATASET)
+
+        suspect = [w for w in caught if issubclass(w.category, eu.SuspectTrialWarning)]
+        self.assertEqual(len(suspect), 1)
+        self.assertIn('femur_r_imu', str(suspect[0].message))
+        self.assertIn('tibia_r_imu', str(suspect[0].message))
+
+    def test_strict_raises_instead_of_warning(self):
+        """For callers that would rather compute no joint angle than one from a plate whose
+        mocap and IMU disagree by twice the worst normal amount."""
+        self._set_suspect(['femur_r_imu'])
+        with self.assertRaises(eu.SuspectTrial) as caught:
+            eu.load_trial('01', 'walking', dataset=self.DATASET, strict=True)
+        self.assertIn('femur_r_imu', str(caught.exception))
+
+    def test_strict_is_silent_on_a_clean_trial(self):
+        self._set_suspect([])
+        self.assertTrue(eu.load_trial('01', 'walking', dataset=self.DATASET, strict=True))
+
+    def test_the_data_still_loads_when_it_warns(self):
+        """A warning is not a refusal -- the plates must come back usable."""
+        self._set_suspect(['femur_r_imu'])
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            plates = eu.load_trial('01', 'walking', dataset=self.DATASET)
+        self.assertEqual(len(plates), 2)
 
 
 class TestRealTrialRoundTrip(unittest.TestCase):
