@@ -29,7 +29,8 @@ class TestWorkerDecisions(unittest.TestCase):
     """What build_trial_worker does with each cache status."""
 
     def _run(self, status, force=False, load=None, save=None):
-        source = _StubSource(load or (lambda subject, trial: {'plate': object()}))
+        source = _StubSource(
+            load or (lambda subject, trial, report=None: {'plate': object()}))
         with mock.patch.dict(sources.SOURCES, {'_stub': source}), \
              mock.patch.object(build_trials, 'cached_trial_status',
                                return_value=(status, None)), \
@@ -40,7 +41,7 @@ class TestWorkerDecisions(unittest.TestCase):
                 ('01', 'walking'), ['build'], {}, dataset='_stub', force=force)
 
     @staticmethod
-    def _fake_save(plates, subject, trial, dataset):
+    def _fake_save(plates, subject, trial, dataset, report=None):
         path = mock.MagicMock()
         path.stat.return_value.st_size = 1234
         return path
@@ -66,7 +67,7 @@ class TestWorkerDecisions(unittest.TestCase):
     def test_a_raising_reader_fails_only_its_own_trial(self):
         """The exception must be caught and turned into a result, not escape the worker and
         take an hour-long build down with it."""
-        def explode(subject, trial):
+        def explode(subject, trial, report=None):
             raise ValueError('marker reconstruction gave up')
 
         result = self._run('missing', load=explode)
@@ -77,7 +78,7 @@ class TestWorkerDecisions(unittest.TestCase):
     def test_a_failure_keeps_its_traceback(self):
         """str(e) alone routinely does not say which of several call paths raised, and the
         build that surfaced it costs minutes to reproduce."""
-        def explode(subject, trial):
+        def explode(subject, trial, report=None):
             raise ValueError('deep in the stack')
 
         result = self._run('missing', load=explode)
@@ -91,7 +92,7 @@ class TestSelectionGuards(unittest.TestCase):
     """--subjects and --trials are validated against what is actually on disk."""
 
     def setUp(self):
-        self.source = _StubSource(lambda subject, trial: {})
+        self.source = _StubSource(lambda subject, trial, report=None: {})
         self._patch = mock.patch.dict(sources.SOURCES, {'_stub': self.source})
         self._patch.start()
         self.addCleanup(self._patch.stop)

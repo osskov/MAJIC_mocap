@@ -13,12 +13,14 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import scipy.signal as signal
+from scipy.spatial.transform import Rotation
 from tqdm.auto import tqdm
 
 from ..IMUTrace import IMUTrace
 from ..PlateTrial import PlateTrial
 from ..WorldTrace import WorldTrace
 from ..gyro_utils import calculate_best_fit_rotation
+from .report import BuildReport
 
 # Robust spread (MAD) of the per-plate lag estimates above which the cross-correlation is
 # finding different peaks rather than one noisy peak, making their median meaningless.
@@ -29,7 +31,20 @@ from ..gyro_utils import calculate_best_fit_rotation
 SYNC_SPREAD_LIMIT_S = 1.0
 
 
-def align_world_to_imu(plate: 'PlateTrial') -> 'PlateTrial':
+def _angle_to_nearest_axis(axis: np.ndarray, norm: float) -> float:
+    """Angle from a rotation axis to the closest coordinate axis, in degrees.
+
+    Separates a mounting convention from a fit that latched onto something else: a sensor
+    clipped into a bracket the wrong way round is near an axis, an arbitrary direction is not.
+    """
+    if norm <= 1e-12:
+        return 0.0
+    unit = axis / norm
+    return float(np.degrees(np.arccos(np.clip(np.abs(unit).max(), 0.0, 1.0))))
+
+
+def align_world_to_imu(plate: 'PlateTrial',
+                       report: 'BuildReport' = None) -> 'PlateTrial':
     """
     Aligns the WorldTrace's orientation to the IMUTrace's orientation.
 
@@ -69,6 +84,22 @@ def align_world_to_imu(plate: 'PlateTrial') -> 'PlateTrial':
     else:
         raise ValueError(f"{plate.name}: no valid frames to align against.")
     
+    if report is not None:
+        # The rotation itself, which nothing has ever looked at. An offset near a plate axis
+        # is a mounting convention; an arbitrary one is a fit that found something else. And
+        # `n_frames_used` is the conditioning caveat: a static pose yields a small residual
+        # and a meaningless rotation, which the residual alone cannot distinguish.
+        angle = float(np.degrees(np.arccos(
+            np.clip((np.trace(R_wt_it) - 1.0) / 2.0, -1.0, 1.0))))
+        axis = Rotation.from_matrix(R_wt_it).as_rotvec()
+        norm = float(np.linalg.norm(axis))
+        report.add('S7_alignment', 'plate', plate.name,
+                   offset_angle_deg=angle,
+                   offset_axis=(axis / norm if norm > 1e-12 else np.zeros(3)),
+                   angle_to_nearest_plate_axis_deg=_angle_to_nearest_axis(axis, norm),
+                   n_frames_used=int(valid.sum()),
+                   valid_fraction=float(valid.mean()))
+
     # 3. Apply this static rotation to all orientations in the world trace.
     #    new_R_world = old_R_world @ R_wt_it
     world_rots_np = plate.world_trace.rotations
@@ -87,6 +118,7 @@ def assemble_plate_trials(
     world_traces: Dict[str, 'WorldTrace'],
     align_plate_trials: bool,
     lag: float = None,
+    report: 'BuildReport' = None,
 ) -> Dict[str, 'PlateTrial']:
     """
     Factory method to create a list of PlateTrial objects from raw data.
@@ -128,6 +160,11 @@ def assemble_plate_trials(
     for name in imu_traces:
         if name not in world_traces and not disable_tqdm:
             print(f"IMU {name} not found in world traces. Skipping.")
+    if report is not None:
+        report.add('S3_pairing', 'trial', 'trial',
+                   n_imu=len(imu_traces), n_world=len(world_traces), n_paired=len(paired),
+                   unmatched_imu=sorted(set(imu_traces) - set(world_traces)),
+                   unmatched_world=sorted(set(world_traces) - set(imu_traces)))
     if not paired:
         return {}
 
@@ -152,7 +189,7 @@ def assemble_plate_trials(
     # mocap takes at roughly 2 s, 1756 s and 3564 s into it, so there is no single lag to
     # find. Their reader syncs each take itself and merges them, then passes lag=0.
     if lag is None:
-        lag = _shared_lag(paired, disable_tqdm)
+        lag = _shared_lag(paired, report=report, disable_tqdm=disable_tqdm)
 
     resampled = {}
     for name, (imu, world) in paired.items():
@@ -160,7 +197,7 @@ def assemble_plate_trials(
 
     # One origin for the trial, applied to every plate. See _trial_origin: doing this per
     # plate silently puts joint-angle pairs on clocks that differ by a few samples.
-    origin = _trial_origin(resampled)
+    origin = _trial_origin(resampled, report=report)
     resampled = {name: _rezero(imu, world, origin)
                  for name, (imu, world) in resampled.items()}
 
@@ -172,7 +209,7 @@ def assemble_plate_trials(
                                    disable=disable_tqdm):
         new_plate_trial = PlateTrial(name, imu[:n_frames], world[:n_frames])
         if align_plate_trials:
-            new_plate_trial = align_world_to_imu(new_plate_trial)
+            new_plate_trial = align_world_to_imu(new_plate_trial, report=report)
         plate_trials[name] = new_plate_trial
 
     _assert_one_clock(plate_trials)
@@ -288,7 +325,8 @@ def _to_common_grid(imu_trace: IMUTrace, world_trace: WorldTrace, target_rate: f
                                  sampled.rotations, valid=sampled.valid)
 
 
-def _trial_origin(resampled: Dict[str, Tuple[IMUTrace, WorldTrace]]) -> float:
+def _trial_origin(resampled: Dict[str, Tuple[IMUTrace, WorldTrace]],
+                  report: 'BuildReport' = None) -> float:
     """The one instant that becomes t = 0, shared by every plate in the trial.
 
     THIS IS AN INVARIANT, not a convenience. Joint angles difference two plates against each
@@ -303,14 +341,27 @@ def _trial_origin(resampled: Dict[str, Tuple[IMUTrace, WorldTrace]]) -> float:
     truth. Taking the latest instead would let one ragged plate drag the whole trial's clock
     forward and push every other plate's good data into negative time.
     """
-    firsts = []
-    for imu_trace, world_trace in resampled.values():
+    firsts, named = [], {}
+    for name, (imu_trace, world_trace) in resampled.items():
         observed = np.flatnonzero(world_trace.valid)
         if len(observed):
-            firsts.append(float(imu_trace.timestamps[observed[0]]))
+            first = float(imu_trace.timestamps[observed[0]])
+            firsts.append(first)
+            named[name] = first
     if not firsts:
         raise ValueError("No plate has any overlap between its IMU and mocap records.")
-    return min(firsts)
+    origin = min(firsts)
+
+    if report is not None:
+        # The spread is the s16 defect as a routine measurement: when plates disagree about
+        # when ground truth starts, the ones that start late spend that long on a held pose.
+        for name, first in named.items():
+            report.add('S6_timeline', 'plate', name, first_valid_time_s=first,
+                       deviation_from_origin_s=first - origin)
+        report.add('S6_timeline', 'trial', 'trial', origin_s=origin,
+                   origin_spread_s=max(firsts) - origin, n_plates_with_overlap=len(firsts),
+                   n_plates_without_overlap=len(resampled) - len(firsts))
+    return origin
 
 
 def _rezero(imu_trace: IMUTrace, world_trace: WorldTrace, origin: float
@@ -340,6 +391,7 @@ def _world_on_timestamps(world_trace: WorldTrace, new_timestamps: np.ndarray,
 
 
 def _shared_lag(paired: Dict[str, Tuple[IMUTrace, WorldTrace]],
+                report: 'BuildReport' = None,
                 disable_tqdm: bool = True) -> float:
     """One lag in SECONDS for the whole trial: world clock + lag = IMU clock.
 
@@ -353,6 +405,14 @@ def _shared_lag(paired: Dict[str, Tuple[IMUTrace, WorldTrace]],
     """
     lags = np.array([_lag_seconds(imu, world) for imu, world in paired.values()])
     lag = float(np.median(lags))
+
+    if report is not None:
+        # Per plate, because the trial-level MAD says a trial is fine without saying which
+        # plate dragged it. A plate whose own estimate sits far from the median has a bad
+        # gyro trace even when the median absorbs it and the trial builds cleanly.
+        for name, value in zip(paired, lags):
+            report.add('S4_sync', 'plate', name,
+                       lag_s=float(value), deviation_from_median_s=float(value - lag))
 
     # Robust spread, not max-minus-min. One plate finding the wrong peak is exactly what the
     # median is there to absorb, and a range test throws away that protection: s24's
@@ -373,6 +433,11 @@ def _shared_lag(paired: Dict[str, Tuple[IMUTrace, WorldTrace]],
             f"(robust spread {spread:.1f} s; min {lags.min():.1f}, median {lag:.1f}, "
             f"max {lags.max():.1f}). One recording session has one lag, so most likely the "
             f"trial has too little motion for gyro cross-correlation to find a peak.")
+
+    if report is not None:
+        report.add('S4_sync', 'trial', 'trial', lag_median_s=lag, lag_mad_s=spread,
+                   spread_vs_limit=spread / SYNC_SPREAD_LIMIT_S, n_plates=len(lags),
+                   lag_min_s=float(lags.min()), lag_max_s=float(lags.max()))
 
     outliers = int((deviation > SYNC_SPREAD_LIMIT_S).sum())
     if outliers and not disable_tqdm:

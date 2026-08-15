@@ -23,6 +23,11 @@ authors = [
 ]
 # requirements.txt stays the single list of dependencies, so there is only one
 # place to edit and no chance of the two drifting apart.
+#
+# Two of them are needed only by building/biplane.py: ezc3d reads Vicon's .c3d, and openpyxl
+# is what pandas uses for the trigger workbook. Both are hard requirements of that reader
+# rather than optional extras -- without them the biplane dataset cannot be enumerated, let
+# alone built -- so they sit in the main list rather than behind a marker.
 dynamic = ["dependencies"]
 
 [project.urls]
@@ -41,7 +46,7 @@ majic-noise-sensitivity = "experiments.noise_sensitivity:main"
 majic-ekf-oracle-comparison = "experiments.ekf_oracle_comparison:main"
 majic-drift-observability = "experiments.drift_observability:main"
 majic-acceleration-projection = "experiments.acceleration_projection:main"
-majic-sensor-distributions = "experiments.sensor_distributions:main"
+majic-global-assumptions = "experiments.global_assumptions:main"
 majic-relative-vs-absolute = "experiments.relative_vs_absolute:main"
 majic-normalization-comparison = "experiments.normalization_comparison:main"
 majic-plot-paper-figures = "plotting.paper_figures:main"
@@ -53,7 +58,7 @@ majic-plot-noise-sensitivity = "plotting.noise_sensitivity:main"
 majic-plot-ekf-oracle-comparison = "plotting.ekf_oracle_comparison:main"
 majic-plot-drift-observability = "plotting.drift_observability:main"
 majic-plot-acceleration-projection = "plotting.acceleration_projection:main"
-majic-plot-sensor-distributions = "plotting.sensor_distributions:main"
+majic-plot-global-assumptions = "plotting.global_assumptions:main"
 majic-plot-relative-vs-absolute = "plotting.relative_vs_absolute:main"
 
 [tool.setuptools.dynamic]

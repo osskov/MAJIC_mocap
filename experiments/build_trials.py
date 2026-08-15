@@ -46,6 +46,7 @@ from experiments.experiment_utils import (
     TRIAL_DATASET, cached_trial_status, run_tracked_grid, save_cached_trial,
 )
 from experiments.experiment_utils import RESIDUAL_WARN_DEG_S
+from src.toolchest.building.report import BuildReport
 from src.toolchest.building.sources import SOURCES, get_source
 
 
@@ -75,8 +76,14 @@ def build_trial_worker(row_key: Tuple[str, str], stage_labels: List[str], shared
         # Straight to the dataset's reader. This is the thing that BUILDS the parquet, so
         # it is the one place that may touch source files at all — everything else in the
         # codebase goes through experiment_utils.load_trial, which reads only the artifact.
-        plates = source.load(subject, activity)
-        path = save_cached_trial(plates, subject, activity, dataset=dataset)
+        # Collected unconditionally. The report is the only record of what the build
+        # measured -- reconstruction residuals, per-plate lags, alignment rotations -- and
+        # every one of those numbers is computed anyway, so the cost is the list that holds
+        # them. Making it opt-in would mean the answer to "was this trial any good" required
+        # rebuilding, which is the situation it exists to end.
+        report = BuildReport()
+        plates = source.load(subject, activity, report)
+        path = save_cached_trial(plates, subject, activity, dataset=dataset, report=report)
 
         manifest = paths.read_manifest(path) or {}
         diagnostics = manifest.get('diagnostics', {})

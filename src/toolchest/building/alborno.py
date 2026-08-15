@@ -41,8 +41,8 @@ MARKER_FAULT_THRESHOLD = 2.0
 MM_DETECTION_THRESHOLD = 1000.0
 
 
-def load_world_traces(trc_path: Union[str, Path],
-                      method: str = 'merged') -> Dict[str, WorldTrace]:
+def load_world_traces(trc_path: Union[str, Path], method: str = 'merged',
+                      report: 'BuildReport' = None) -> Dict[str, WorldTrace]:
     """Every marker plate in a .trc, reconstructed, repaired and keyed by segment name.
 
     `method` selects the reconstruction:
@@ -94,34 +94,60 @@ def load_world_traces(trc_path: Union[str, Path],
 
         clean_name = imu_o_name.lower().replace('_o', '')
         if method == 'merged':
-            positions, rotations, valid, report = reconstruct_plate(
+            positions, rotations, valid, fit = reconstruct_plate(
                 np.stack([o_loc, d_loc, x_loc, y_loc], axis=1), timestamps, name=clean_name)
-            if report['flipped'] or report['interpolated'] or report['unresolved']:
+            if report is not None:
+                _record_reconstruction(report, trc_path.stem, clean_name, fit, valid,
+                                       timestamps)
+            if fit['flipped'] or fit['interpolated'] or fit['unresolved']:
                 print(f"Warning: {trc_path.name}/{clean_name}: marker reconstruction repaired "
-                      f"({report['flipped']} frame(s) un-flipped from a relabeling, "
-                      f"{report['interpolated']} transition frame(s) interpolated, "
-                      f"{report['unresolved']} unexplained discontinuity(ies), "
-                      f"{report['n_repaired_by_dropping_a_marker']} frame(s) fixed by dropping "
+                      f"({fit['flipped']} frame(s) un-flipped from a relabeling, "
+                      f"{fit['interpolated']} transition frame(s) interpolated, "
+                      f"{fit['unresolved']} unexplained discontinuity(ies), "
+                      f"{fit['n_repaired_by_dropping_a_marker']} frame(s) fixed by dropping "
                       f"a marker) — {int((~valid).sum())} frame(s) marked invalid; "
-                      f"fit residual median {report['residual_median_mm']:.2f} mm.")
+                      f"fit residual median {fit['residual_median_mm']:.2f} mm.")
         else:
             positions, rotations = _reconstruct_from_markers(
                 o_loc, d_loc, x_loc, y_loc, threshold=MARKER_FAULT_THRESHOLD
             )
-            positions, rotations, valid, report = repair_reconstruction_glitches(
+            positions, rotations, valid, fit = repair_reconstruction_glitches(
                 positions, rotations, timestamps, name=clean_name)
-            if any(report.values()):
+            if report is not None:
+                _record_reconstruction(report, trc_path.stem, clean_name, fit, valid,
+                                       timestamps)
+            if any(fit.values()):
                 print(f"Warning: {trc_path.name}/{clean_name}: marker reconstruction repaired "
-                      f"({report['flipped']} frame(s) un-flipped from swapped marker labels, "
-                      f"{report['interpolated']} transition frame(s) interpolated, "
-                      f"{report['unresolved']} discontinuity(ies) not attributable to a swap) "
+                      f"({fit['flipped']} frame(s) un-flipped from swapped marker labels, "
+                      f"{fit['interpolated']} transition frame(s) interpolated, "
+                      f"{fit['unresolved']} discontinuity(ies) not attributable to a swap) "
                       f"— {int((~valid).sum())} frame(s) marked invalid; "
                       f"see repair_reconstruction_glitches.")
         world_traces[clean_name] = WorldTrace(timestamps, positions, rotations, valid=valid)
     return world_traces
 
 
-def load_imu_traces(folder_path: Union[str, Path]) -> Dict[str, IMUTrace]:
+def _record_reconstruction(report, take, segment, fit, valid, timestamps) -> None:
+    """The reconstruction quality numbers, which until now only ever reached a print()."""
+    valid = np.asarray(valid, dtype=bool)
+    runs = np.diff(np.flatnonzero(
+        np.concatenate([[True], valid[1:] != valid[:-1], [True]])))
+    invalid_runs = runs[0::2] if not valid[0] else runs[1::2]
+    # fit's own keys first, so an explicit value here wins a name collision --
+    # fit_plate_to_template already reports n_frames, and letting it override the
+    # count taken from `timestamps` would silently mean two different things.
+    metrics = {key: value for key, value in fit.items() if key != 'name'}
+    metrics.update({
+        'valid_fraction': float(valid.mean()),
+        'n_invalid_frames': int((~valid).sum()),
+        'n_invalid_runs': int(len(invalid_runs)),
+        'invalid_run_max': float(invalid_runs.max()) if len(invalid_runs) else 0.0,
+        'n_frames': int(len(timestamps)),
+    })
+    report.add('S2_reconstruction', 'segment', f'{take}/{segment}', **metrics)
+
+
+def load_imu_traces(folder_path: Union[str, Path], report=None) -> Dict[str, IMUTrace]:
     """Every Xsens .txt in a trial folder, keyed by filename stem.
 
     The stem IS the segment name, and has to match the .trc marker names — that pairing is
@@ -131,7 +157,8 @@ def load_imu_traces(folder_path: Union[str, Path]) -> Dict[str, IMUTrace]:
     imu_dir = folder / 'imu data' if (folder / 'imu data').is_dir() else folder
 
     imu_files = list(imu_dir.glob("*.txt"))
-    imu_traces = {f.name.replace('.txt', ''): read_xsens_txt(f) for f in imu_files}
+    imu_traces = {f.name.replace('.txt', ''): read_xsens_txt(f, report=report)
+                  for f in imu_files}
 
     if not imu_traces:
         raise FileNotFoundError(f"No IMU .txt files found in: {imu_dir}")
@@ -139,11 +166,11 @@ def load_imu_traces(folder_path: Union[str, Path]) -> Dict[str, IMUTrace]:
     return imu_traces
 
 
-def load_trial(folder_path: Union[str, Path],
-               align_plate_trials: bool = True) -> Dict[str, PlateTrial]:
+def load_trial(folder_path: Union[str, Path], align_plate_trials: bool = True,
+               report: 'BuildReport' = None) -> Dict[str, PlateTrial]:
     """One subject/activity folder -> its synchronized PlateTrials."""
     folder = Path(folder_path).resolve()
-    imu_traces = load_imu_traces(folder)
+    imu_traces = load_imu_traces(folder, report=report)
 
     # SORTED, because glob order is filesystem order. Every trial folder holds exactly one
     # .trc today, so this has never mattered -- but "whichever the filesystem returned first"
@@ -155,7 +182,7 @@ def load_trial(folder_path: Union[str, Path],
         raise ValueError(f"{folder.name} holds {len(trc_files)} .trc files "
                          f"({[f.name for f in trc_files]}); which one is the trial is not "
                          f"something this should guess at.")
-    world_traces = load_world_traces(trc_files[0])
+    world_traces = load_world_traces(trc_files[0], report=report)
 
     return assemble_plate_trials(imu_traces=imu_traces, world_traces=world_traces,
-                                 align_plate_trials=align_plate_trials)
+                                 align_plate_trials=align_plate_trials, report=report)

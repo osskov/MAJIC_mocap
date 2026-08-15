@@ -97,7 +97,7 @@ DEFAULT_MAG_STD = 0.05
 #
 # Acc is gravity's magnitude. Mag is 1.0 because these are Xsens exports, whose
 # magnetometer channels are normalized at calibration so a nominal Earth field reads 1.0
-# (see MAG_UNIT in experiments/sensor_distributions.py); measured |mag| medians across
+# (see MAG_UNIT in experiments/global_assumptions.py); measured |mag| medians across
 # this dataset run 0.4-1.1, so this is a nominal, not a per-sensor calibration.
 NOMINAL_ACC_MAGNITUDE = float(np.linalg.norm(EXPECTED_GRAVITY))
 NOMINAL_MAG_MAGNITUDE = 1.0
@@ -310,6 +310,9 @@ _CORE_MODULES = ('PlateTrial.py', 'WorldTrace.py', 'IMUTrace.py', 'gyro_utils.py
 _READER_MODULES = {
     'alborno': ('building/alborno.py', 'building/xsens.py'),
     'imove': ('building/imove_mocap.py', 'building/xsens.py'),
+    # No xsens here: the biplane half's IMUs are MC10 BioStamps with their own CSV export,
+    # and its ground truth is fluoroscopy rather than markers.
+    'imove_biplane': ('building/biplane.py',),
 }
 
 # Kept as the union so anything still asking for "every module that matters" gets the honest
@@ -529,8 +532,14 @@ def trial_diagnostics(plates: Dict[str, PlateTrial]) -> Dict[str, Any]:
     }
 
 
+def build_report_path(dataset: str, subject: str, trial: str) -> Path:
+    """Where a trial's BuildReport sidecar lives, beside its parquet."""
+    path = paths.cached_trial_path(dataset, subject, trial)
+    return path.with_suffix('.build.parquet')
+
+
 def save_cached_trial(plates: Dict[str, PlateTrial], subject: str, trial: str,
-                      dataset: str = TRIAL_DATASET) -> Path:
+                      dataset: str = TRIAL_DATASET, report=None) -> Path:
     """Writes a trial's PlateTrials plus the manifest that validates them on load.
 
     ATOMIC. The parquet goes to a temporary name and is renamed into place, because the two
@@ -549,6 +558,20 @@ def save_cached_trial(plates: Dict[str, PlateTrial], subject: str, trial: str,
         os.replace(staging, path)
     finally:
         staging.unlink(missing_ok=True)
+
+    # The build report, if one was collected. Written the same atomic way, but NOT part of
+    # the cache key: it describes the artifact rather than determining it, so adding a metric
+    # must not invalidate 281 trials. A missing or outdated sidecar therefore means
+    # "tier-1 unavailable for this trial", which build_quality reports rather than treating
+    # as staleness.
+    if report is not None:
+        report_path = build_report_path(dataset, subject, trial)
+        report_staging = report_path.with_suffix(report_path.suffix + '.tmp')
+        try:
+            report.to_frame().to_parquet(report_staging, engine='pyarrow', index=False)
+            os.replace(report_staging, report_path)
+        finally:
+            report_staging.unlink(missing_ok=True)
 
     write_manifest(
         path,
@@ -827,7 +850,7 @@ def _compute_scaled_mag(plate: PlateTrial, expected_mag: np.ndarray,
     WHAT IS ACTUALLY BEING SCALED. Everything that makes this sensor's reading differ from
     one common rigid field — the lab's ferrous distortion (which is what dominates: it
     scales with sensor height and is localized in lab coordinates, see
-    experiments/sensor_distributions.py), plus that sensor's own calibration gain error and
+    experiments/global_assumptions.py), plus that sensor's own calibration gain error and
     noise, plus any error in e itself. It is an upper bound on the field anomaly rather
     than an isolate of it, so read the sweep's x-axis as "total inconsistency between this
     sensor and the assumed field", not as "milligauss of ferrous distortion". The
@@ -959,7 +982,7 @@ def project_pair_to_joint_center(parent_trial: PlateTrial, child_trial: PlateTri
     Factored out because o^J is only comparable to the value the filter gates on if it is
     computed after the identical projection, and the analysis scripts that want o^J without
     running the EKF (experiments/drift_observability.py,
-    experiments/sensor_distributions.py) would otherwise each carry their own copy of these
+    experiments/global_assumptions.py) would otherwise each carry their own copy of these
     four lines. Returns copies: projection replaces imu_trace, so operating in place would
     silently change every later use of the caller's plates.
     """

@@ -1,0 +1,586 @@
+"""What the build did to the data, measured per processing step across every trial.
+
+A build produces 281 artifacts and a scroll of warnings. Whether any given one is trustworthy
+is answerable today only by rebuilding it and watching the terminal, and whether a pipeline
+change improved or damaged things is not answerable at all. This turns both into tables.
+
+THREE TIERS, and the split matters because it decides what can disagree with what.
+
+  Tier 1 is the build itself, via building/report.BuildReport. Reconstruction residuals,
+  per-plate sync lags, alignment rotations -- all of it already computed and, until now,
+  printed and dropped. Free, and it is the only tier that can see inside a build.
+
+  Tier 2 is this module: it reads those sidecars plus the built parquets and derives what
+  tier 1 cannot know because it only ever sees one trial -- population spreads, per-sensor
+  pooling, dataset comparisons.
+
+  Tier 3 is plotting/build_quality.py, which reads ONLY the tables written here. Nothing in
+  the plotting layer reloads a trial, so no number in a figure can disagree with the parquet
+  beside it.
+
+WHAT THIS DELIBERATELY DOES NOT DO. It does not gate a build, it does not change what a build
+produces, and it runs no filters. It reports. A health score appears, and it is a triage aid
+printed beside its own components, never a pass/fail.
+
+REPLICATE STRUCTURE IS MEASURED, NOT ASSUMED. IMoVE's THIGH_L_H, _M and _L share one
+WorldTrace and one reconstruction, so every reconstruction-derived metric is bit-identical
+across the three and counting them as three replicates inflates n threefold on exactly the
+numbers the report leads with. Alignment and lever-arm metrics are per-sensor and do
+replicate. `icc_report` measures which is which rather than taking anyone's word, and the
+blocking follows from it.
+
+    python -m experiments.build_quality --dataset imove
+    python -m experiments.build_quality --dataset alborno --only-tables reconstruction sync
+"""
+import argparse
+import os
+
+os.environ.setdefault("DISABLE_TQDM", "True")
+
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+import paths
+from experiments.experiment_utils import (TRIAL_DATASET, build_report_path,
+                                          cached_trial_status)
+from experiments.experiment_utils import RESIDUAL_WARN_DEG_S
+from src.toolchest.building.report import STEPS
+from src.toolchest.building.sources import get_source
+
+EXPERIMENT_NAME = "build_quality"
+EXPERIMENT_DIR = paths.experiment_dir(EXPERIMENT_NAME)
+
+# The spine every pooled table is reported on, matching sensor_distributions so the two pool
+# together without anyone re-deciding what a summary is.
+QUANTILES = [0.05, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
+
+# Per metric family, what counts as one independent observation. Derived from measured ICCs
+# (see `icc_report`) rather than asserted: the three IMoVE placements on a segment share a
+# reconstruction, so blocking reconstruction metrics on the sensor would trebly count one
+# measurement, while alignment genuinely differs per sensor.
+BLOCKING = {
+    'S2_reconstruction': ('dataset', 'subject', 'trial', 'entity'),
+    'S3_pairing': ('dataset', 'subject', 'trial'),
+    'S4_sync': ('dataset', 'subject', 'trial'),
+    'S6_timeline': ('dataset', 'subject', 'trial'),
+    'S7_alignment': ('dataset', 'subject', 'trial', 'entity'),
+}
+
+# An ICC at or above this means the grouping's members are not independent replicates.
+ICC_DEPENDENT = 0.95
+
+TRIAL_TABLES = ('index', 'report_rows', 'reconstruction', 'sync', 'timeline', 'alignment',
+                'icc_report', 'health', 'coverage', 'invalid_sections',
+                'plate_diagnostics')
+
+# A run of invalid frames shorter than this is a blink, not a gap. Reported separately so a
+# trial with one dropped frame is not filed beside one missing a whole limb.
+SHORT_INVALID_RUN = 5
+
+
+def analysis_constants(dataset: str) -> Dict[str, object]:
+    """Everything a reader needs to reproduce these numbers, recorded in every manifest."""
+    return {'dataset': dataset, 'quantiles': QUANTILES, 'blocking': {k: list(v) for k, v
+                                                                     in BLOCKING.items()},
+            'icc_dependent_threshold': ICC_DEPENDENT, 'steps': list(STEPS)}
+
+
+def _dataset_dir(dataset: str) -> Path:
+    return EXPERIMENT_DIR / dataset
+
+
+def _save(frame: pd.DataFrame, name: str, dataset: str, **manifest_extra) -> Path:
+    path = _dataset_dir(dataset) / f'{name}.parquet'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(path, engine='pyarrow', index=False)
+    paths.write_manifest(path, constants=analysis_constants(dataset),
+                         experiment=EXPERIMENT_NAME, table=name, n_rows=len(frame),
+                         **manifest_extra)
+    return path
+
+
+# ---------------------------------------------------------------------------- tier 2 loading
+
+def load_build_reports(dataset: str) -> Tuple[pd.DataFrame, List[Tuple[str, str]]]:
+    """Every trial's BuildReport sidecar, concatenated. Also returns what was unavailable.
+
+    A missing sidecar is NOT staleness -- the report is not part of the cache key, so a trial
+    built before the instrumentation existed is perfectly valid and simply has no tier-1 data.
+    Reported rather than raised, because on a partially rebuilt tree that is the normal state
+    and failing here would make the analysis unusable exactly when it is most wanted.
+    """
+    rows, unavailable = [], []
+    for subject, trial in get_source(dataset).enumerate_trials():
+        path = build_report_path(dataset, subject, trial)
+        if not path.exists():
+            unavailable.append((subject, trial))
+            continue
+        frame = pd.read_parquet(path)
+        frame.insert(0, 'trial', trial)
+        frame.insert(0, 'subject', subject)
+        frame.insert(0, 'dataset', dataset)
+        rows.append(frame)
+    if not rows:
+        return pd.DataFrame(), unavailable
+    return pd.concat(rows, ignore_index=True), unavailable
+
+
+def build_index(dataset: str) -> pd.DataFrame:
+    """One row per enumerated trial: cache status and the manifest's headline scalars.
+
+    This is the triage table. It is the only one that covers trials which FAILED to build,
+    because those have no parquet and no report -- and a failure taxonomy is most of the value
+    of looking at 281 trials at once.
+    """
+    rows = []
+    for subject, trial in get_source(dataset).enumerate_trials():
+        status, reason = cached_trial_status(subject, trial, dataset=dataset)
+        path = paths.cached_trial_path(dataset, subject, trial)
+        manifest = paths.read_manifest(path) or {}
+        diagnostics = manifest.get('diagnostics') or {}
+        rows.append({
+            'dataset': dataset, 'subject': subject, 'trial': trial,
+            'status': status, 'reason': reason or '',
+            'has_build_report': build_report_path(dataset, subject, trial).exists(),
+            'n_plates': diagnostics.get('n_plates'),
+            'n_frames': diagnostics.get('n_frames'),
+            'duration_s': diagnostics.get('duration_s'),
+            'sample_rate_hz': diagnostics.get('sample_rate_hz'),
+            'n_suspect_plates': len(diagnostics.get('suspect') or []),
+            'suspect_plates': ','.join(diagnostics.get('suspect') or []),
+            'bytes': path.stat().st_size if path.exists() else 0,
+        })
+    return pd.DataFrame(rows)
+
+
+def plate_diagnostics(dataset: str) -> pd.DataFrame:
+    """The per-plate numbers the manifest already holds, as a table.
+
+    `trial_diagnostics` computes a gyro residual, an accelerometer norm and a magnetometer
+    norm for every plate of every trial, and `build_index` reduced all of it to
+    `n_suspect_plates` -- a count of how many crossed 25 deg/s. The distribution behind that
+    threshold, and therefore any justification for it, was invisible.
+
+    Two of these are calibration checks nobody was looking at. `acc_norm_median` should sit
+    near 9.81 for any plate that spends time near-static, and a systematic departure is a
+    scale error that propagates into every acceleration comparison. `mag_norm_median` bears
+    directly on the heading-dependent ||mag|| artifact.
+    """
+    rows = []
+    for subject, trial in get_source(dataset).enumerate_trials():
+        manifest = paths.read_manifest(
+            paths.cached_trial_path(dataset, subject, trial)) or {}
+        plates = (manifest.get('diagnostics') or {}).get('plates') or {}
+        for plate, stats in plates.items():
+            row = {'dataset': dataset, 'subject': subject, 'trial': trial, 'plate': plate}
+            for key, value in stats.items():
+                if isinstance(value, (int, float)):
+                    row[key] = value
+                elif isinstance(value, (list, tuple)) and len(value) == 3:
+                    row[f'{key}_magnitude'] = float(np.linalg.norm(value))
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# -------------------------------------------------------------------------------- coverage
+
+def coverage_table(dataset: str, reports: pd.DataFrame) -> pd.DataFrame:
+    """Which sensor was present in which trial, and where it went missing if it was not.
+
+    The build FAILS SOFT on an untracked segment, deliberately: IMoVE's treadmill trials drop
+    whole marker groups -- s10's t2 has all four LTH markers absent for the entire take -- and
+    a reader has to be able to say "not tracked here" without failing the trial around it.
+    The cost is that a trial builds successfully with 8 plates instead of 15 and nothing says
+    so. This is the table that says so.
+
+    `expected` is the union of every plate name the dataset produced anywhere, which is
+    empirical rather than hardcoded, so it stays correct for a dataset this module has never
+    seen. The reason a sensor is missing is triangulated from the pairing step:
+
+      no_mocap      an IMU file exists but its segment never reconstructed
+      no_imu        the segment reconstructed but no sensor was mounted on it
+      neither       absent on both sides
+      trial_failed  the trial did not build at all, so nothing is known per sensor
+    """
+    plates_per_trial, expected = {}, set()
+    for subject, trial in get_source(dataset).enumerate_trials():
+        manifest = paths.read_manifest(
+            paths.cached_trial_path(dataset, subject, trial)) or {}
+        names = set(((manifest.get('diagnostics') or {}).get('plates') or {}).keys())
+        plates_per_trial[(subject, trial)] = names
+        expected |= names
+
+    pairing = reports[reports.step == 'S3_pairing'] if not reports.empty else pd.DataFrame()
+    unmatched = {}
+    if not pairing.empty:
+        for (subject, trial), group in pairing.groupby(['subject', 'trial']):
+            unmatched[(subject, trial)] = {
+                'imu': set(group[group.metric.str.startswith('unmatched_imu')].value_str
+                           .dropna()),
+                'world': set(group[group.metric.str.startswith('unmatched_world')].value_str
+                             .dropna()),
+            }
+
+    rows = []
+    for (subject, trial), present in plates_per_trial.items():
+        gaps = unmatched.get((subject, trial), {'imu': set(), 'world': set()})
+        for sensor in sorted(expected):
+            if sensor in present:
+                status = 'present'
+            elif not present:
+                status = 'trial_failed'
+            elif sensor in gaps['imu']:
+                status = 'no_mocap'
+            elif sensor in gaps['world']:
+                status = 'no_imu'
+            else:
+                status = 'neither'
+            rows.append({'dataset': dataset, 'subject': subject, 'trial': trial,
+                         'sensor': sensor, 'status': status,
+                         'present': status == 'present'})
+    return pd.DataFrame(rows)
+
+
+def invalid_sections(dataset: str) -> pd.DataFrame:
+    """Every run of untrustworthy ground truth, with where in the trial it sits.
+
+    Read from the built parquets rather than from the build report, because the report records
+    counts and this needs positions -- and only the `valid` column is loaded, so the cost is a
+    column read rather than a trial load.
+
+    WHERE a gap sits changes what it means. At the head or tail it is coverage: the mocap
+    started late or stopped early, and the inertial record extends past it. In the middle it is
+    occlusion or a fault, which is the kind that corrupts a joint angle mid-motion.
+    """
+    rows = []
+    for subject, trial in get_source(dataset).enumerate_trials():
+        path = paths.cached_trial_path(dataset, subject, trial)
+        if not path.exists():
+            continue
+        frame = pd.read_parquet(path, columns=['plate', 'valid'])
+        for plate, group in frame.groupby('plate', observed=True):
+            valid = group['valid'].to_numpy(dtype=bool)
+            if valid.all():
+                continue
+            edges = np.flatnonzero(
+                np.concatenate([[True], valid[1:] != valid[:-1], [True]]))
+            for start, stop in zip(edges[:-1], edges[1:]):
+                if valid[start]:
+                    continue
+                position = ('head' if start == 0 else
+                            'tail' if stop == len(valid) else 'middle')
+                rows.append({'dataset': dataset, 'subject': subject, 'trial': trial,
+                             'plate': str(plate), 'start_index': int(start),
+                             'length': int(stop - start), 'position': position,
+                             'n_frames': int(len(valid)),
+                             'short': bool(stop - start < SHORT_INVALID_RUN)})
+    return pd.DataFrame(rows)
+
+
+# ------------------------------------------------------------------------- per-step pivoting
+
+def step_table(reports: pd.DataFrame, step: str) -> pd.DataFrame:
+    """One step's long-form rows pivoted wide: one row per entity, one column per metric."""
+    subset = reports[reports.step == step]
+    if subset.empty:
+        return pd.DataFrame()
+    wide = subset.pivot_table(index=['dataset', 'subject', 'trial', 'entity_kind', 'entity'],
+                              columns='metric', values='value_num', aggfunc='first')
+    return wide.reset_index().rename_axis(None, axis=1)
+
+
+# -------------------------------------------------------------------------------------- ICC
+
+def intraclass_correlation(frame: pd.DataFrame, value: str, group: List[str]) -> float:
+    """Fraction of a metric's variance that is BETWEEN groups rather than within them.
+
+    1.0 means the members of a group are identical, so they are one observation wearing
+    several hats; 0.0 means they are independent. This is the measurement that decides the
+    blocking, and it exists because the obvious unit -- the sensor -- is wrong for every
+    reconstruction metric in IMoVE, where three sensors share one marker cluster.
+    """
+    values = frame[[*group, value]].dropna()
+    if values[value].nunique() <= 1 or len(values) < 4:
+        return float('nan')
+    grouped = values.groupby(group)[value]
+    counts = grouped.count()
+    if len(counts) < 2 or counts.max() < 2:
+        return float('nan')
+    grand = values[value].mean()
+    between = float((counts * (grouped.mean() - grand) ** 2).sum() / max(len(counts) - 1, 1))
+    within = float(grouped.apply(lambda s: ((s - s.mean()) ** 2).sum()).sum()
+                   / max(len(values) - len(counts), 1))
+    mean_count = float(counts.mean())
+    denominator = between + (mean_count - 1) * within
+    return float((between - within) / denominator) if denominator > 0 else float('nan')
+
+
+def icc_report(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Every metric's ICC across each candidate grouping, so the blocking is evidence-based.
+
+    Published rather than folded silently into the analysis, the way plotting/utils.py
+    publishes the ICCs behind DEFAULT_BLOCK_COLS. A reader who disagrees with the blocking can
+    see exactly what it was derived from.
+    """
+    candidates = {
+        'placement': ['dataset', 'subject', 'trial', 'segment'],
+        'trial': ['dataset', 'subject', 'trial'],
+        'session': ['dataset', 'subject'],
+    }
+    rows = []
+    for step, table in tables.items():
+        if table.empty or 'entity' not in table:
+            continue
+        table = table.copy()
+        # A plate name is '<SEGMENT>_<placement>' in IMoVE and a bare segment in Al Borno,
+        # so stripping the last underscore group gives the shared reconstruction's identity.
+        table['segment'] = table['entity'].astype(str).str.rsplit('_', n=1).str[0]
+        numeric = [c for c in table.columns
+                   if c not in ('dataset', 'subject', 'trial', 'entity_kind', 'entity',
+                                'segment') and pd.api.types.is_numeric_dtype(table[c])]
+        for metric in numeric:
+            for label, group in candidates.items():
+                if not set(group).issubset(table.columns):
+                    continue
+                rows.append({'step': step, 'metric': metric, 'grouping': label,
+                             'icc': intraclass_correlation(table, metric, group)})
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame['dependent'] = frame['icc'] >= ICC_DEPENDENT
+    return frame
+
+
+def warn_if_placements_split(icc: pd.DataFrame) -> List[str]:
+    """Metrics whose three placements are identical, i.e. must not be counted separately.
+
+    Mirrors plotting/utils._warn_if_sides_split. Silence here would mean an inflated n on
+    precisely the reconstruction metrics the report leads with.
+    """
+    if icc.empty:
+        return []
+    offenders = icc[(icc.grouping == 'placement') & icc.dependent]
+    return sorted(f"{row.step}.{row.metric}" for row in offenders.itertuples())
+
+
+# ----------------------------------------------------------------------------------- pooling
+
+def pooled_summary(table: pd.DataFrame, step: str) -> pd.DataFrame:
+    """Quantiles per metric, aggregated at this step's blocking level.
+
+    Blocked BEFORE pooling: a metric that is identical across a segment's three placements is
+    averaged into one value first, so it contributes one observation rather than three.
+    """
+    if table.empty:
+        return pd.DataFrame()
+    block = [c for c in BLOCKING.get(step, ('dataset', 'subject', 'trial'))
+             if c in table.columns]
+    numeric = [c for c in table.columns
+               if c not in ('dataset', 'subject', 'trial', 'entity_kind', 'entity')
+               and pd.api.types.is_numeric_dtype(table[c])]
+    if not numeric:
+        return pd.DataFrame()
+    blocked = table.groupby(block, dropna=False)[numeric].mean().reset_index()
+
+    rows = []
+    for metric in numeric:
+        values = blocked[metric].dropna()
+        if values.empty:
+            continue
+        entry = {'step': step, 'metric': metric, 'n': int(len(values)),
+                 'mean': float(values.mean()), 'std': float(values.std(ddof=1))
+                 if len(values) > 1 else 0.0}
+        entry.update({f'q{int(q * 100):02d}': float(values.quantile(q)) for q in QUANTILES})
+        rows.append(entry)
+    return pd.DataFrame(rows)
+
+
+def health_score(index: pd.DataFrame, tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """A triage ranking, and explicitly nothing more.
+
+    Components are normalized to [0, 1] where 1 is worse and averaged with equal weight. Equal
+    weight is a placeholder, not a claim: the plan's X4 fits weights from each metric's
+    correlation with downstream joint-angle error, and until that runs there is no evidence
+    for any other weighting. Printed WITH its components always, and never used as a gate.
+    """
+    frames = []
+    if 'S2_reconstruction' in tables and not tables['S2_reconstruction'].empty:
+        recon = tables['S2_reconstruction']
+        if 'residual_median_mm' in recon:
+            frames.append(recon.groupby(['subject', 'trial'])['residual_median_mm'].max()
+                          .rename('worst_residual_mm'))
+        if 'valid_fraction' in recon:
+            frames.append((1.0 - recon.groupby(['subject', 'trial'])['valid_fraction'].min())
+                          .rename('worst_invalid_fraction'))
+    if 'S4_sync' in tables and not tables['S4_sync'].empty and \
+            'lag_mad_s' in tables['S4_sync']:
+        frames.append(tables['S4_sync'].groupby(['subject', 'trial'])['lag_mad_s'].max()
+                      .rename('sync_mad_s'))
+    if 'S6_timeline' in tables and not tables['S6_timeline'].empty and \
+            'origin_spread_s' in tables['S6_timeline']:
+        frames.append(tables['S6_timeline'].groupby(['subject', 'trial'])['origin_spread_s']
+                      .max().rename('origin_spread_s'))
+    if 'S7_alignment' in tables and not tables['S7_alignment'].empty and \
+            'offset_angle_deg' in tables['S7_alignment']:
+        frames.append(tables['S7_alignment'].groupby(['subject', 'trial'])['offset_angle_deg']
+                      .std().rename('alignment_angle_spread_deg'))
+
+    if not frames:
+        return pd.DataFrame()
+    components = pd.concat(frames, axis=1).reset_index()
+    merged = index.merge(components, on=['subject', 'trial'], how='left')
+
+    columns = [c for c in components.columns if c not in ('subject', 'trial')]
+    normalized = []
+    for column in columns:
+        values = merged[column].astype(float)
+        span = values.max() - values.min()
+        normalized.append((values - values.min()) / span if span > 0
+                          else pd.Series(0.0, index=values.index))
+    merged['health'] = pd.concat(normalized, axis=1).mean(axis=1)
+    merged['n_suspect_plates'] = merged['n_suspect_plates'].fillna(0)
+    return merged.sort_values('health', ascending=False)
+
+
+# ------------------------------------------------------------------------------------ report
+
+def _header(number: int, title: str, subtitle: str = "") -> None:
+    print(f"\n{'=' * 78}\n{number}. {title}\n{'=' * 78}")
+    if subtitle:
+        print(subtitle)
+
+
+def run(dataset: str, only_tables: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:
+    """Build every table, print the console report, and return the tables."""
+    wanted = set(only_tables) if only_tables else set(TRIAL_TABLES)
+
+    index = build_index(dataset)
+    reports, unavailable = load_build_reports(dataset)
+
+    _header(0, "Coverage", f"{dataset}: {len(index)} trials enumerated")
+    print(index.status.value_counts().to_string())
+    print(f"\nbuild reports available for {int(index.has_build_report.sum())} of {len(index)}")
+    if unavailable:
+        print(f"  {len(unavailable)} trials have no tier-1 sidecar — built before the "
+              f"instrumentation, or not rebuilt since. Not staleness: the report is not part "
+              f"of the cache key.")
+    if reports.empty:
+        print("\nNo build reports at all. Rebuild with experiments/build_trials.py to collect "
+              "them, then re-run.")
+        return {'index': index}
+
+    coverage = coverage_table(dataset, reports)
+    diagnostics = plate_diagnostics(dataset)
+    sections = invalid_sections(dataset)
+
+    _header(1, "Coverage", "which sensors are in which trials, and where they went missing")
+    if not coverage.empty:
+        print(coverage.status.value_counts().to_string())
+        absent = coverage[~coverage.present]
+        if not absent.empty:
+            print(f"\n{len(absent)} sensor-trials absent. By sensor:")
+            print(absent.groupby('sensor').size().sort_values(ascending=False)
+                  .head(10).to_string())
+            worst = (coverage.groupby(['subject', 'trial'])['present']
+                     .agg(['sum', 'size']).sort_values('sum').head(8))
+            print("\nLeast-covered trials (sensors present / expected):")
+            for (subject, trial), row in worst.iterrows():
+                missing = sorted(absent[(absent.subject == subject) &
+                                        (absent.trial == trial)].sensor)
+                print(f"  {subject}/{trial:26s} {int(row['sum'])}/{int(row['size'])}"
+                      f"   missing {', '.join(m for m in missing[:6])}"
+                      f"{' ...' if len(missing) > 6 else ''}")
+
+    _header(2, "Invalid ground truth", "runs of untrustworthy pose, and where they sit")
+    if not sections.empty:
+        print(sections.groupby('position')['length'].describe()[['count', '50%', 'max']]
+              .to_string())
+        print(f"\n{int((~sections.short).sum())} runs are longer than "
+              f"{SHORT_INVALID_RUN} frames; {int(sections.short.sum())} are blinks.")
+        middle = sections[(sections.position == 'middle') & (~sections.short)]
+        if not middle.empty:
+            print(f"\n{len(middle)} MID-TRIAL gaps — the kind that corrupts a joint angle "
+                  f"mid-motion rather than trimming an edge:")
+            worst = middle.nlargest(8, 'length')
+            for row in worst.itertuples():
+                print(f"  {row.subject}/{row.trial}/{row.plate}: {row.length} frames "
+                      f"at index {row.start_index} of {row.n_frames}")
+    else:
+        print("no invalid runs anywhere — every plate's pose is trustworthy throughout")
+
+    tables = {step: step_table(reports, step) for step in STEPS}
+    tables = {step: table for step, table in tables.items() if not table.empty}
+
+    _header(3, "Per-step metrics", "pooled at each step's blocked level; see icc_report")
+    summaries = []
+    for number, (step, table) in enumerate(sorted(tables.items()), start=1):
+        summary = pooled_summary(table, step)
+        if summary.empty:
+            continue
+        summaries.append(summary)
+        print(f"\n--- {step}  ({len(table)} entities, blocked to n={summary.n.max()})")
+        print(summary[['metric', 'n', 'q50', 'q95', 'q99']].to_string(index=False))
+
+    icc = icc_report(tables)
+    _header(4, "Replicate structure", "measured ICCs, and the blocking they imply")
+    if not icc.empty:
+        print(icc.groupby('grouping')['icc'].describe()[['count', '50%', 'max']].to_string())
+        split = warn_if_placements_split(icc)
+        if split:
+            print(f"\n{len(split)} metrics are IDENTICAL across a segment's placements — "
+                  f"counting them per sensor would inflate n threefold:")
+            for name in split[:8]:
+                print(f"    {name}")
+
+    if not diagnostics.empty:
+        _header(6, "Per-plate diagnostics",
+                "the distribution behind RESIDUAL_WARN_DEG_S, and two calibration checks")
+        for column, target in (('gyro_residual_lowpass_rms_deg_s', None),
+                               ('acc_norm_median', 9.81), ('mag_norm_median', 1.0)):
+            if column not in diagnostics:
+                continue
+            values = diagnostics[column].dropna()
+            print(f"  {column:34s} n={len(values):5d} "
+                  f"q50 {values.quantile(0.5):7.2f}  q95 {values.quantile(0.95):7.2f}  "
+                  f"max {values.max():8.2f}" + (f"   (expect ~{target})" if target else ""))
+        if 'gyro_residual_lowpass_rms_deg_s' in diagnostics:
+            over = diagnostics['gyro_residual_lowpass_rms_deg_s'] > RESIDUAL_WARN_DEG_S
+            print(f"\n  {int(over.sum())} of {len(diagnostics)} plates exceed "
+                  f"{RESIDUAL_WARN_DEG_S:.0f} deg/s "
+                  f"({100 * over.mean():.1f}%)")
+
+    health = health_score(index, tables)
+    _header(5, "Trial health", "a triage ranking, not a gate — components shown beside it")
+    if not health.empty:
+        columns = ['subject', 'trial', 'health'] + \
+                  [c for c in health.columns if c.endswith(('_mm', '_s', '_deg', '_fraction'))]
+        print(health[columns].head(15).to_string(index=False))
+
+    written = {'index': index, 'report_rows': reports, 'icc_report': icc, 'health': health,
+               'coverage': coverage, 'invalid_sections': sections,
+               'plate_diagnostics': diagnostics}
+    written.update({step.split('_', 1)[1]: table for step, table in tables.items()})
+    if summaries:
+        written['summary'] = pd.concat(summaries, ignore_index=True)
+
+    for name, frame in written.items():
+        if frame is not None and not frame.empty and (name in wanted or 'summary' == name):
+            _save(frame, name, dataset)
+    print(f"\nTables written to {_dataset_dir(dataset).relative_to(paths.REPO_ROOT)}")
+    return written
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--dataset', default=TRIAL_DATASET)
+    parser.add_argument('--only-tables', nargs='+', default=None,
+                        help=f"Subset of {TRIAL_TABLES}")
+    args = parser.parse_args()
+    run(args.dataset, args.only_tables)
+
+
+if __name__ == '__main__':
+    main()

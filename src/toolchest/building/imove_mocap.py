@@ -249,7 +249,8 @@ def segment_labels(path: Path) -> Dict[str, List[str]]:
     return labels
 
 
-def load_world_traces(csv_path: Union[str, Path]) -> Dict[str, WorldTrace]:
+def load_world_traces(csv_path: Union[str, Path],
+                      report: 'BuildReport' = None) -> Dict[str, WorldTrace]:
     """One Motive take -> {segment: WorldTrace}, skipping segments it does not track.
 
     A missing segment is NOT an error. The treadmill trials drop whole marker groups -- s10's
@@ -265,18 +266,49 @@ def load_world_traces(csv_path: Union[str, Path]) -> Dict[str, WorldTrace]:
         positions, timestamps = markers
         tolerance = FOOT_TOLERANCE_M if segment.startswith('FOOT') else CLUSTER_TOLERANCE_M
         try:
-            pose, rotations, valid, _ = fit_plate_to_template(
+            pose, rotations, valid, fit = fit_plate_to_template(
                 positions, timestamps, residual_tolerance=tolerance,
                 name=f'{csv_path.stem}/{segment}')
         except ValueError:
             # Raised when fewer than three markers are ever present, i.e. the segment was
             # not tracked in this take at all.
             continue
+        if report is not None:
+            _record_reconstruction(report, csv_path.stem, segment, fit, valid, timestamps,
+                                   tolerance)
         traces[segment] = WorldTrace(timestamps, pose, rotations, valid=valid)
     return traces
 
 
-def load_imu_traces(session_dir: Union[str, Path], trial: str) -> Dict[str, 'IMUTrace']:
+def _record_reconstruction(report, take, segment, fit, valid, timestamps, tolerance) -> None:
+    """Everything fit_plate_to_template already computed and the reader used to discard.
+
+    The residuals and per-marker fault counts are the only direct evidence of how good the
+    ground truth is, and until now they reached a `print()` and nothing else -- so the answer
+    to "which of these 281 trials should I not trust" required rebuilding and watching a
+    terminal scroll past.
+    """
+    valid = np.asarray(valid, dtype=bool)
+    runs = np.diff(np.flatnonzero(
+        np.concatenate([[True], valid[1:] != valid[:-1], [True]])))
+    invalid_runs = runs[0::2] if not valid[0] else runs[1::2]
+    # fit's own keys first, so an explicit value here wins a name collision --
+    # fit_plate_to_template already reports n_frames, and letting it override the
+    # count taken from `timestamps` would silently mean two different things.
+    metrics = {key: value for key, value in fit.items() if key != 'name'}
+    metrics.update({
+        'residual_tolerance_mm': tolerance * 1000.0,
+        'valid_fraction': float(valid.mean()),
+        'n_invalid_frames': int((~valid).sum()),
+        'n_invalid_runs': int(len(invalid_runs)),
+        'invalid_run_max': float(invalid_runs.max()) if len(invalid_runs) else 0.0,
+        'n_frames': int(len(timestamps)),
+    })
+    report.add('S2_reconstruction', 'segment', f'{take}/{segment}', **metrics)
+
+
+def load_imu_traces(session_dir: Union[str, Path], trial: str,
+                    report=None) -> Dict[str, 'IMUTrace']:
     """{sensor name: IMUTrace} for one trial, keyed as DEVICE_TO_SENSOR names them."""
     session_dir = Path(session_dir)
     traces, unknown = {}, []
@@ -286,7 +318,7 @@ def load_imu_traces(session_dir: Union[str, Path], trial: str) -> Dict[str, 'IMU
         if sensor is None:
             unknown.append(device)
             continue
-        traces[sensor] = read_xsens_txt(path)
+        traces[sensor] = read_xsens_txt(path, report=report)
 
     if unknown:
         # Not silent. A session recorded with a replacement sensor would otherwise build
@@ -304,7 +336,8 @@ def _sensors_for_segment(segment: str, available: Dict[str, 'IMUTrace']) -> List
     return [name for name in available if name.rsplit('_', 1)[0] == segment]
 
 
-def _take_lag(world: Dict[str, WorldTrace], imu: Dict[str, 'IMUTrace']) -> float:
+def _take_lag(world: Dict[str, WorldTrace], imu: Dict[str, 'IMUTrace'],
+              take: str = '', report=None) -> float:
     """One lag in seconds for a single Motive take, median over the segments it tracks.
 
     Each take is its own Motive recording with its own clock start, so a session's three
@@ -315,7 +348,18 @@ def _take_lag(world: Dict[str, WorldTrace], imu: Dict[str, 'IMUTrace']) -> float
             for segment, trace in world.items() if f'{segment}_M' in imu]
     if not lags:
         raise ValueError("No segment has both a cluster and an M sensor to sync on.")
-    return float(np.median(lags))
+    lag = float(np.median(lags))
+    if report is not None:
+        # The long walks are the only trials with three independent lag measurements against
+        # one inertial clock, and the median discarded all of them. On s5l a FOOT_L take sits
+        # 0.28 s off its siblings and nothing recorded it.
+        segments = [s for s in world if f'{s}_M' in imu]
+        for segment, value in zip(segments, lags):
+            report.add('S4_sync', 'take', f'{take}/{segment}', take_lag_s=float(value),
+                       deviation_from_take_median_s=float(value - lag))
+        report.add('S4_sync', 'take', take, take_lag_s=lag, n_segments=len(lags),
+                   take_lag_spread_s=float(np.ptp(lags)) if len(lags) > 1 else 0.0)
+    return lag
 
 
 def _merge_takes(takes: List[Dict[str, WorldTrace]], lags: List[float],
@@ -368,7 +412,8 @@ def _merge_takes(takes: List[Dict[str, WorldTrace]], lags: List[float],
 
 
 def load_trial(session_dir: Union[str, Path], trial: str,
-               align_plate_trials: bool = True) -> Dict[str, PlateTrial]:
+               align_plate_trials: bool = True,
+               report: 'BuildReport' = None) -> Dict[str, PlateTrial]:
     """One session's trial -> its synchronized PlateTrials.
 
     `trial` names the INERTIAL record. Usually one Motive take shares that name and the two
@@ -377,7 +422,7 @@ def load_trial(session_dir: Union[str, Path], trial: str,
     `_merge_takes` -- after which assembly is told the lag is already applied.
     """
     session_dir = Path(session_dir)
-    imu_traces = load_imu_traces(session_dir, trial)
+    imu_traces = load_imu_traces(session_dir, trial, report=report)
     if not imu_traces:
         raise ValueError(f"{session_dir.name}/{trial}: no IMU files for any known device.")
 
@@ -385,7 +430,7 @@ def load_trial(session_dir: Union[str, Path], trial: str,
     if not take_paths:
         raise ValueError(f"{session_dir.name}/{trial}: no mocap take matches this record.")
 
-    takes = [load_world_traces(path) for path in take_paths]
+    takes = [load_world_traces(path, report=report) for path in take_paths]
     takes = [take for take in takes if take]
     if not takes:
         raise ValueError(f"{session_dir.name}/{trial}: no segment reconstructed in any take.")
@@ -398,12 +443,13 @@ def load_trial(session_dir: Union[str, Path], trial: str,
         target_rate = min(reference.get_sample_frequency(),
                           min(t.get_sample_frequency() for take in takes
                               for t in take.values()))
-        lags = [_take_lag(take, imu_traces) for take in takes]
+        lags = [_take_lag(take, imu_traces, take=path.stem, report=report)
+                for take, path in zip(takes, take_paths)]
         world_traces = _merge_takes(takes, lags, reference.timestamps, target_rate)
         lag = 0.0                       # already on the IMU's clock
 
     plates = assemble_plate_trials(imu_traces, _pair_world_traces(world_traces, imu_traces),
-                                   align_plate_trials, lag=lag)
+                                   align_plate_trials, lag=lag, report=report)
 
     # Put each plate's mocap origin on its IMU rather than on its marker cluster, so the
     # pose describes where the sensor actually is and the lever-arm term stops contaminating
@@ -411,7 +457,8 @@ def load_trial(session_dir: Union[str, Path], trial: str,
     # been applied, so it is skipped along with the alignment.
     if align_plate_trials:
         plates = {name: shift_world_origin(plate, offset)
-                  for name, (plate, offset) in _sensor_offsets(plates).items()}
+                  for name, (plate, offset)
+                  in _sensor_offsets(plates, report=report).items()}
     return plates
 
 
@@ -459,7 +506,7 @@ def _fit_iteratively(plate: PlateTrial, iterations: int = 4,
     return total
 
 
-def _sensor_offsets(plates: Dict[str, PlateTrial]
+def _sensor_offsets(plates: Dict[str, PlateTrial], report=None
                     ) -> Dict[str, Tuple[PlateTrial, np.ndarray]]:
     """{sensor: (plate, offset in metres)}, constant where the sensor is bolted on and fitted
     where it is taped on.
@@ -503,6 +550,22 @@ def _sensor_offsets(plates: Dict[str, PlateTrial]
                 ImplausibleOffsetFitWarning, stacklevel=3)
             fitted = nominal
         resolved[name] = (plate, fitted)
+        if report is not None:
+            report.add('S8_lever_arm', 'plate', name,
+                       offset_mm=fitted * 1000.0,
+                       offset_magnitude_mm=float(np.linalg.norm(fitted) * 1000.0),
+                       nominal_magnitude_mm=float(np.linalg.norm(nominal) * 1000.0),
+                       distance_from_nominal_mm=float(
+                           np.linalg.norm(fitted - nominal) * 1000.0),
+                       used_fallback=bool(np.allclose(fitted, nominal)),
+                       bolted=False)
+    if report is not None:
+        for name in RIGID_SENSOR_OFFSET_MM:
+            if name in plates:
+                constant = np.asarray(RIGID_SENSOR_OFFSET_MM[name], dtype=float)
+                report.add('S8_lever_arm', 'plate', name, offset_mm=constant,
+                           offset_magnitude_mm=float(np.linalg.norm(constant)),
+                           used_fallback=False, bolted=True)
     return resolved
 
 

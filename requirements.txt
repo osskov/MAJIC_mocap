@@ -1,9 +1,11 @@
 AHRS
+ezc3d
 matplotlib
 mpmath
 networkx
 numba
 numpy
+openpyxl
 pandas
 pyarrow
 rich

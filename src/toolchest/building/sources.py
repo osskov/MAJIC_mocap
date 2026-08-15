@@ -20,7 +20,7 @@ from typing import Callable, Dict, List, Tuple
 import paths
 
 from ..PlateTrial import PlateTrial
-from . import alborno, imove_mocap
+from . import alborno, biplane, imove_mocap
 
 
 @dataclass(frozen=True)
@@ -77,7 +77,8 @@ ALBORNO = TrialSource(
     # across all 19, so the loose glob only ever meant "any stray note dropped in the folder
     # invalidates this trial".
     source_globs=('*.trc', 'imu data/*.txt'),
-    load=lambda subject, trial: alborno.load_trial(_alborno_dir(subject, trial)),
+    load=lambda subject, trial, report=None: alborno.load_trial(
+        _alborno_dir(subject, trial), report=report),
 )
 
 
@@ -123,13 +124,63 @@ IMOVE = TrialSource(
     # long-walk trial legitimately reads three mocap files whose names it cannot predict
     # from the trial name alone.
     source_globs=('mocap_data/*.csv', 'imu_data/*.txt'),
-    load=lambda session, trial: imove_mocap.load_trial(_imove_dir(session, trial), trial),
+    load=lambda session, trial, report=None: imove_mocap.load_trial(
+        _imove_dir(session, trial), trial, report=report),
+)
+
+
+# ==============================================================================
+# IMoVE / CMU-MBL — the biplane half: MC10 IMUs against fluoroscopy bone poses
+# ==============================================================================
+
+def _biplane_dir(subject: str, key: str) -> Path:
+    """The Kinematics directory for one capture.
+
+    A SOURCE-INVENTORY GAP LIVES HERE, and it is worth stating rather than discovering. A
+    biplane trial reads from three trees -- Kinematics, Vicon and IMUs -- but `source_dir`
+    names one directory and `source_globs` is a static tuple, so only the kinematics files
+    reach the cache key. Editing a .c3d or a BioStamp export will NOT invalidate the artifact
+    built from it.
+
+    That is fail-open, which this codebase rejects elsewhere, and it is a deliberate stopgap:
+    the alternative under the current TrialSource shape is to glob the whole 19 GB study for
+    every trial. The toolchest digest still catches reader changes, so what escapes is
+    specifically an edit to the raw data, which for a published dataset is rare. Fixing it
+    properly means letting a source report the paths it actually opened.
+    """
+    session, block, trial = key.split('/')
+    return biplane.BIPLANE_ROOT / 'Kinematics' / biplane.STUDY / subject / session / block / trial
+
+
+def _biplane_trials() -> List[Tuple[str, str]]:
+    """(subject, 'session/block/trial') for every capture that has a trigger time.
+
+    Gated on the trigger, because without one there is no way onto the IMU clock and the
+    trial cannot be assembled however complete its files are.
+    """
+    triggers = biplane.trigger_times()
+    found = []
+    for subject in sorted({s for s in triggers.subject.unique()}):
+        named = set(triggers[triggers.subject == subject].trial)
+        for session, block, trial in biplane.biplane_trials(subject):
+            if trial in named:
+                found.append((subject, f'{session}/{block}/{trial}'))
+    return found
+
+
+IMOVE_BIPLANE = TrialSource(
+    name='imove_biplane',
+    enumerate_trials=_biplane_trials,
+    source_dir=_biplane_dir,
+    source_globs=('HomoTransMatrices_*.csv',),
+    load=lambda subject, key, report=None: biplane.load_trial(subject, key, report=report),
 )
 
 
 SOURCES: Dict[str, TrialSource] = {
     ALBORNO.name: ALBORNO,
     IMOVE.name: IMOVE,
+    IMOVE_BIPLANE.name: IMOVE_BIPLANE,
 }
 
 
