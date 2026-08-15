@@ -388,3 +388,49 @@ class TestUnsyncableTrialsAreExcluded(unittest.TestCase):
             self.skipTest('no IMoVE source data')
         found = list(IMOVE_ROOT.glob('s*/imu_data/t0_static_pose_001-000_*.txt'))
         self.assertTrue(found, 'the source recordings should still be on disk')
+
+
+class TestPerTrialCoverageExpectation(unittest.TestCase):
+    """What a trial COULD have produced, when the dataset-wide roster is the wrong answer.
+
+    Coverage is scored against the union of every plate name the dataset produced anywhere,
+    which is right when every trial instruments the same body and wrong when the roster varies
+    by trial. A biplane trial images ONE knee, so four of the eight names belong to the other
+    leg -- and scoring against all eight reported 1552 absent sensor-trials in a dataset with
+    nothing actually missing, which made the table unreadable.
+    """
+
+    def test_a_biplane_trial_expects_only_its_own_side(self):
+        from src.toolchest.building.sources import get_source
+        expected = get_source('imove_biplane').expected_plates('12', 'Test1/A/RSDrop1')
+        self.assertEqual(len(expected), 4)
+        self.assertTrue(all('_right__' in name for name in expected), expected)
+
+    def test_the_other_side_gives_the_other_four(self):
+        from src.toolchest.building.sources import get_source
+        source = get_source('imove_biplane')
+        right = source.expected_plates('12', 'Test1/A/RSDrop1')
+        left = source.expected_plates('12', 'Test1/A/LSHop2')
+        self.assertEqual(right & left, set())
+        self.assertEqual(len(right | left), 8)
+
+    def test_both_references_are_expected_not_just_one(self):
+        """A site yields a Vicon plate AND a biplane plate; expecting one would report the
+        other as permanently absent."""
+        from src.toolchest.building.sources import get_source
+        expected = get_source('imove_biplane').expected_plates('12', 'Test1/A/RSDrop1')
+        self.assertEqual(sum('__vicon' in n for n in expected), 2)
+        self.assertEqual(sum('__biplane' in n for n in expected), 2)
+
+    def test_a_source_without_the_hook_falls_back_to_the_union(self):
+        """Al Borno and IMoVE instrument the same body every trial, so neither needs this and
+        neither should be made to define it."""
+        from src.toolchest.building.sources import get_source
+        for dataset in ('alborno', 'imove'):
+            self.assertIsNone(get_source(dataset).expected_plates)
+
+    def test_an_unparseable_trial_name_falls_back_rather_than_raising(self):
+        """None means 'use the union'. Returning an empty set instead would score every
+        sensor as unexpected and silently empty the table."""
+        from src.toolchest.building.sources import get_source
+        self.assertIsNone(get_source('imove_biplane').expected_plates('12', 'A/B/notatrial'))

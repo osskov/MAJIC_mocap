@@ -389,3 +389,40 @@ class TestLagUsesMeasuredFramesOnly(unittest.TestCase):
 
         lag, _ = bp.bracketed_lag(imu, trace, expected_lag_s=0.0, bracket_s=2.0)
         self.assertAlmostEqual(lag, shift, places=2)
+
+
+@require_data
+class TestViconReconstructionIsRecorded(unittest.TestCase):
+    """The Vicon clusters go through the same template fit as every other dataset's markers,
+    and the reader used to throw the fit report away -- so the biplane half was the one
+    dataset with no S2_reconstruction rows, and its marker dropout was invisible."""
+
+    def test_a_loaded_trial_emits_reconstruction_rows(self):
+        from src.toolchest.building.report import BuildReport
+        report = BuildReport()
+        bp.load_trial('01', 'Test1/A/LSDrop1', report=report)
+        frame = report.to_frame()
+        rows = frame[frame.step == 'S2_reconstruction']
+        self.assertFalse(rows.empty, 'S2_reconstruction emitted nothing')
+        # One entity per SITE, not per plate: the two references share one marker fit.
+        self.assertEqual(len(set(rows.entity)), 2)
+
+    def test_it_records_what_the_dropout_investigation_needs(self):
+        from src.toolchest.building.report import BuildReport
+        report = BuildReport()
+        bp.load_trial('01', 'Test1/A/LSDrop1', report=report)
+        frame = report.to_frame()
+        metrics = set(frame[frame.step == 'S2_reconstruction'].metric)
+        for name in ('residual_median_mm', 'valid_fraction',
+                     'min_marker_presence_fraction', 'n_frames_missing_a_marker'):
+            self.assertIn(name, metrics)
+
+    def test_the_biplane_poses_emit_no_reconstruction_rows(self):
+        """They are already poses -- the fluoroscopy solved them, there are no markers to fit.
+        A row here would claim a fit that never happened."""
+        from src.toolchest.building.report import BuildReport
+        report = BuildReport()
+        bp.load_trial('01', 'Test1/A/LSDrop1', report=report)
+        frame = report.to_frame()
+        entities = set(frame[frame.step == 'S2_reconstruction'].entity)
+        self.assertFalse(any('biplane' in e for e in entities), entities)

@@ -15,7 +15,7 @@ Adding a dataset means adding an entry here and a reader beside it. Nothing else
 """
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import paths
 
@@ -52,6 +52,17 @@ class TrialSource:
     source_globs: Tuple[str, ...]
     load: Callable[[str, str], Dict[str, PlateTrial]]
     extra_inputs: Optional[Callable[[str, str], List[Path]]] = None
+
+    # WHAT THIS TRIAL COULD HAVE PRODUCED, when the dataset-wide roster is the wrong answer.
+    #
+    # Coverage is otherwise scored against the union of every plate name the dataset produced
+    # anywhere, which is right when every trial instruments the same body -- Al Borno's eight
+    # segments, IMoVE's fifteen. It is wrong when the roster varies by trial: a biplane trial
+    # images ONE knee, so it can produce four plates out of the eight names that exist, and
+    # scoring it against all eight reported 1552 sensor-trials absent from a complete dataset.
+    #
+    # Returns None to mean "use the union", so a source that does not need this says nothing.
+    expected_plates: Optional[Callable[[str, str], Optional[Set[str]]]] = None
 
 
 # ==============================================================================
@@ -244,12 +255,29 @@ def _biplane_inputs(subject: str, key: str) -> List[Path]:
     return [p for p in found if p.exists()]
 
 
+def _biplane_expected(subject: str, key: str) -> Optional[Set[str]]:
+    """The four plates a biplane trial can produce: its imaged side, two sites, two references.
+
+    A trial's leading letter picks the knee the fluoroscopy imaged, so `RSDrop1` can only ever
+    yield the right thigh and right shank -- against Vicon and against biplane. The other four
+    names in the dataset belong to the other leg and are not missing from this trial in any
+    sense worth reporting.
+    """
+    side = biplane.trial_side(key.split('/')[-1])
+    if side is None:
+        return None
+    return {f'{site}_{side}__{reference}'
+            for site in biplane.BONE_TO_SITE.values()
+            for reference in ('vicon', 'biplane')}
+
+
 IMOVE_BIPLANE = TrialSource(
     name='imove_biplane',
     enumerate_trials=_biplane_trials,
     source_dir=_biplane_dir,
     source_globs=('HomoTransMatrices_*.csv',),
     load=lambda subject, key, report=None: biplane.load_trial(subject, key, report=report),
+    expected_plates=_biplane_expected,
     extra_inputs=_biplane_inputs,
 )
 

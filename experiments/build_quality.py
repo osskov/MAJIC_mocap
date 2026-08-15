@@ -221,22 +221,31 @@ def coverage_table(dataset: str, reports: pd.DataFrame) -> pd.DataFrame:
     The cost is that a trial builds successfully with 8 plates instead of 15 and nothing says
     so. This is the table that says so.
 
-    `expected` is the union of every plate name the dataset produced anywhere, which is
+    `expected` DEFAULTS to the union of every plate name the dataset produced anywhere --
     empirical rather than hardcoded, so it stays correct for a dataset this module has never
-    seen. The reason a sensor is missing is triangulated from the pairing step:
+    seen -- but a source may override it per trial via `TrialSource.expected_plates`. That
+    matters where the roster varies by trial rather than by dataset: a biplane trial images
+    one knee, so four of the eight names belong to the other leg and are not missing from it
+    in any sense worth reporting. Scored against the union those four counted as absent,
+    which reported 1552 absent sensor-trials in a complete dataset and made the table useless.
+
+    The reason a sensor is missing is triangulated from the pairing step:
 
       no_mocap      an IMU file exists but its segment never reconstructed
       no_imu        the segment reconstructed but no sensor was mounted on it
       neither       absent on both sides
       trial_failed  the trial did not build at all, so nothing is known per sensor
     """
-    plates_per_trial, expected = {}, set()
-    for subject, trial in get_source(dataset).enumerate_trials():
+    source = get_source(dataset)
+    plates_per_trial, expected, per_trial_expected = {}, set(), {}
+    for subject, trial in source.enumerate_trials():
         manifest = paths.read_manifest(
             paths.cached_trial_path(dataset, subject, trial)) or {}
         names = set(((manifest.get('diagnostics') or {}).get('plates') or {}).keys())
         plates_per_trial[(subject, trial)] = names
         expected |= names
+        if source.expected_plates is not None:
+            per_trial_expected[(subject, trial)] = source.expected_plates(subject, trial)
 
     pairing = reports[reports.step == 'S3_pairing'] if not reports.empty else pd.DataFrame()
     unmatched = {}
@@ -252,7 +261,10 @@ def coverage_table(dataset: str, reports: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for (subject, trial), present in plates_per_trial.items():
         gaps = unmatched.get((subject, trial), {'imu': set(), 'world': set()})
-        for sensor in sorted(expected):
+        # A per-trial roster wins; None from the hook falls back to the union, so a source can
+        # override some trials and not others.
+        roster = per_trial_expected.get((subject, trial)) or expected
+        for sensor in sorted(roster):
             if sensor in present:
                 status = 'present'
             elif not present:

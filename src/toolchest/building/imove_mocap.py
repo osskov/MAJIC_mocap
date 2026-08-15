@@ -36,7 +36,7 @@ from ..PlateTrial import PlateTrial
 from ..WorldTrace import WorldTrace
 from .assembly import (_lag_seconds, _world_on_timestamps, assemble_plate_trials,
                        shift_world_origin)
-from .reconstruction import fit_plate_to_template
+from .reconstruction import record_reconstruction, fit_plate_to_template
 from .xsens import read_xsens_txt
 
 # Device id -> "<SEGMENT>_<placement>", from CMU-MBL/IMoveLab. The eight sensors beyond the
@@ -274,37 +274,10 @@ def load_world_traces(csv_path: Union[str, Path],
             # not tracked in this take at all.
             continue
         if report is not None:
-            _record_reconstruction(report, csv_path.stem, segment, fit, valid, timestamps,
+            record_reconstruction(report, csv_path.stem, segment, fit, valid, timestamps,
                                    tolerance)
         traces[segment] = WorldTrace(timestamps, pose, rotations, valid=valid)
     return traces
-
-
-def _record_reconstruction(report, take, segment, fit, valid, timestamps, tolerance) -> None:
-    """Everything fit_plate_to_template already computed and the reader used to discard.
-
-    The residuals and per-marker fault counts are the only direct evidence of how good the
-    ground truth is, and until now they reached a `print()` and nothing else -- so the answer
-    to "which of these 281 trials should I not trust" required rebuilding and watching a
-    terminal scroll past.
-    """
-    valid = np.asarray(valid, dtype=bool)
-    runs = np.diff(np.flatnonzero(
-        np.concatenate([[True], valid[1:] != valid[:-1], [True]])))
-    invalid_runs = runs[0::2] if not valid[0] else runs[1::2]
-    # fit's own keys first, so an explicit value here wins a name collision --
-    # fit_plate_to_template already reports n_frames, and letting it override the
-    # count taken from `timestamps` would silently mean two different things.
-    metrics = {key: value for key, value in fit.items() if key != 'name'}
-    metrics.update({
-        'residual_tolerance_mm': tolerance * 1000.0,
-        'valid_fraction': float(valid.mean()),
-        'n_invalid_frames': int((~valid).sum()),
-        'n_invalid_runs': int(len(invalid_runs)),
-        'invalid_run_max': float(invalid_runs.max()) if len(invalid_runs) else 0.0,
-        'n_frames': int(len(timestamps)),
-    })
-    report.add('S2_reconstruction', 'segment', f'{take}/{segment}', **metrics)
 
 
 def load_imu_traces(session_dir: Union[str, Path], trial: str,

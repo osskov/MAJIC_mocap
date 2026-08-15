@@ -894,3 +894,34 @@ def world_trace_from_markers(markers: np.ndarray, timestamps: np.ndarray,
         markers, timestamps, template=template,
         residual_tolerance=residual_tolerance, name=name)
     return WorldTrace(timestamps, positions, rotations, valid=valid)
+
+
+def record_reconstruction(report, take, segment, fit, valid, timestamps, tolerance) -> None:
+    """Everything fit_plate_to_template already computed and a reader would otherwise discard.
+
+    Lives here rather than in one reader because every dataset reconstructs the same way and
+    should report the same way. It was private to the IMoVE mocap reader, so the biplane
+    reader -- which fits Vicon clusters with this very function -- recorded nothing at all.
+
+    The residuals and per-marker fault counts are the only direct evidence of how good the
+    ground truth is, and until now they reached a `print()` and nothing else -- so the answer
+    to "which of these 281 trials should I not trust" required rebuilding and watching a
+    terminal scroll past.
+    """
+    valid = np.asarray(valid, dtype=bool)
+    runs = np.diff(np.flatnonzero(
+        np.concatenate([[True], valid[1:] != valid[:-1], [True]])))
+    invalid_runs = runs[0::2] if not valid[0] else runs[1::2]
+    # fit's own keys first, so an explicit value here wins a name collision --
+    # fit_plate_to_template already reports n_frames, and letting it override the
+    # count taken from `timestamps` would silently mean two different things.
+    metrics = {key: value for key, value in fit.items() if key != 'name'}
+    metrics.update({
+        'residual_tolerance_mm': tolerance * 1000.0,
+        'valid_fraction': float(valid.mean()),
+        'n_invalid_frames': int((~valid).sum()),
+        'n_invalid_runs': int(len(invalid_runs)),
+        'invalid_run_max': float(invalid_runs.max()) if len(invalid_runs) else 0.0,
+        'n_frames': int(len(timestamps)),
+    })
+    report.add('S2_reconstruction', 'segment', f'{take}/{segment}', **metrics)

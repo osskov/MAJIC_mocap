@@ -17,9 +17,11 @@ FOUR THINGS DIFFER FROM EVERY OTHER READER HERE, and each one is a trap.
   with zeros and `HAS_MAGNETOMETER` says so out loud, because silently-zero magnetometer data
   would sail through a filter and produce a heading.
 
-  GROUND TRUTH IS ALREADY A POSE. The biplane pipeline outputs homogeneous transforms per
-  bone, so there is no marker reconstruction: no template fit, no un-flip pass, no
-  `S2_reconstruction`. The pose is what the fluoroscopy solved for.
+  ONE GROUND TRUTH IS ALREADY A POSE. The biplane pipeline outputs homogeneous transforms
+  per bone, so for those there is no marker reconstruction at all: no template fit, no
+  un-flip pass. The pose is what the fluoroscopy solved for. The Vicon clusters beside them
+  are ordinary marker plates and DO go through the usual fit, so a trial emits
+  `S2_reconstruction` rows for its Vicon half and none for its biplane half.
 
   THE GROUND TRUTH IS 0.48 SECONDS LONG against a two-hour inertial record. That is not a
   defect to work around -- it is what `PlateTrial.valid` exists for. A trial here is one long
@@ -544,10 +546,18 @@ class SyncWindowWarning(UserWarning):
     """The reference window does not match the IMU over the frames it claims."""
 
 
-def _vicon_world(subject: str, session: str, trial: str, side: str, site: str
-                 ) -> Optional[WorldTrace]:
-    """One Vicon marker cluster, reconstructed the same way every other dataset's is."""
-    from .reconstruction import fit_plate_to_template
+def _vicon_world(subject: str, session: str, trial: str, side: str, site: str,
+                 report=None) -> Optional[WorldTrace]:
+    """One Vicon marker cluster, reconstructed the same way every other dataset's is.
+
+    THE FIT REPORT IS RECORDED, which it was not. `fit_plate_to_template` returns residuals,
+    per-marker presence and fault counts, and this function threw all of it away -- so the
+    biplane half was the one dataset with no S2_reconstruction rows at all, and the marker
+    dropout that drives every coverage gap here was invisible in the build report. Same
+    recorder every other reader uses, so the tables pool.
+    """
+    from .reconstruction import (DEFAULT_PLATE_RESIDUAL_TOLERANCE_M,
+                                 fit_plate_to_template, record_reconstruction)
 
     labels = VICON_CLUSTERS.get((side, site))
     if labels is None:
@@ -557,10 +567,13 @@ def _vicon_world(subject: str, session: str, trial: str, side: str, site: str
         return None
     positions, timestamps = markers
     try:
-        pose, rotations, valid, _ = fit_plate_to_template(
+        pose, rotations, valid, fit = fit_plate_to_template(
             positions, timestamps, name=f'{subject}/{trial}/{site}')
     except ValueError:
         return None
+    if report is not None:
+        record_reconstruction(report, trial, site, fit, valid, timestamps,
+                              DEFAULT_PLATE_RESIDUAL_TOLERANCE_M)
     return WorldTrace(timestamps, pose, rotations, valid=valid)
 
 
@@ -625,7 +638,7 @@ def load_trial(subject: str, key: str, report=None) -> Dict[str, PlateTrial]:
         sensor = f'{site}_{side}'
         imu = read_mc10_imu(BIPLANE_ROOT / 'IMUs' / STUDY / subject / sensor,
                             window=(trigger - IMU_MARGIN_S, trigger + IMU_MARGIN_S))
-        vicon = _vicon_world(subject, session, trial, side, site)
+        vicon = _vicon_world(subject, session, trial, side, site, report=report)
         if imu is None or vicon is None:
             continue
         on_imu = WorldTrace(vicon.timestamps + trigger, vicon.positions, vicon.rotations,
