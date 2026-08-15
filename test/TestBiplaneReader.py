@@ -111,6 +111,33 @@ class TestAgainstTheFiles(unittest.TestCase):
         self.assertLess(np.abs(imu.gyro).max(), 50.0)
         np.testing.assert_array_equal(imu.mag, 0.0)
 
+    def test_the_gyro_resampling_is_band_limited_not_linear(self):
+        """The two exports are independent streams on their own timestamps, so the gyro must
+        be moved onto the accelerometer's grid -- and doing that with np.interp is the mistake
+        this repo already paid for: linear interpolation is sinc^2, and the band mismatch it
+        caused biased the cluster-to-IMU offset by 7-9 mm on the shank.
+
+        Checked on a tone rather than on the reader's output, because the difference is a
+        frequency-response property and real data has no known answer to compare against.
+        """
+        from src.toolchest.resampling import resample_values
+
+        rate = 250.0
+        source = np.arange(4000) / rate
+        target = source[:3900] + 0.4 / rate      # the fractional offset real exports have
+        tone = np.sin(2 * np.pi * 8.0 * source)
+        truth = np.sin(2 * np.pi * 8.0 * target)
+        interior = slice(200, -200)
+
+        banded = resample_values(np.column_stack([tone] * 3), source, target,
+                                 source_rate=rate, target_rate=rate)[:, 0]
+        linear = np.interp(target, source, tone)
+
+        banded_error = np.sqrt(((banded[interior] - truth[interior]) ** 2).mean())
+        linear_error = np.sqrt(((linear[interior] - truth[interior]) ** 2).mean())
+        self.assertLess(banded_error, linear_error / 100,
+                        f"band-limited {banded_error:.2e} vs linear {linear_error:.2e}")
+
     def test_the_gyro_is_interpolated_onto_the_accelerometer_grid(self):
         """accel.csv and gyro.csv are independent exports with their own timestamps."""
         trigger = self._trigger()
@@ -129,6 +156,26 @@ class TestAgainstTheFiles(unittest.TestCase):
         self.assertEqual(positions.shape[1], 4)
         self.assertLess(np.nanmax(np.abs(positions)), 10.0, "should be metres, not mm")
         self.assertAlmostEqual(1.0 / np.median(np.diff(timestamps)), 150.0, places=0)
+
+    def test_the_biplane_kinematics_carry_no_dropout_sentinel(self):
+        """The upstream pipeline treats zeros in its biplane stream as invalid and keeps only
+        the largest contiguous valid run. That handling does not apply to the export we read:
+        swept across all 15 subjects, 826 files and 61128 rows, there are no all-zero rows, no
+        non-rotation blocks and no non-numeric entries. Pinned on one trial so that if a future
+        export does carry a sentinel, this stops being silently true."""
+        import pandas as pd
+
+        columns = [f'[{i}][{j}]' for i in range(4) for j in range(4)]
+        matrices = pd.read_csv(
+            bp.BIPLANE_ROOT / 'Kinematics' / bp.STUDY / self.SUBJECT / self.SESSION /
+            self.BLOCK / self.TRIAL / 'HomoTransMatrices_Tibia-to-Lab.csv'
+        )[columns].apply(pd.to_numeric, errors='coerce').to_numpy(float).reshape(-1, 4, 4)
+
+        self.assertFalse(np.isnan(matrices).any(), "non-numeric entries present")
+        self.assertEqual(int((np.abs(matrices).sum(axis=(1, 2)) == 0).sum()), 0,
+                         "all-zero rows would be a dropout sentinel we are ingesting as pose")
+        determinants = np.linalg.det(matrices[:, :3, :3])
+        self.assertTrue((np.abs(determinants) > 0.5).all(), "non-rotation blocks present")
 
     def test_an_absent_marker_label_returns_none_rather_than_raising(self):
         self.assertIsNone(bp.read_vicon_c3d(

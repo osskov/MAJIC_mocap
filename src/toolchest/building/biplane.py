@@ -46,6 +46,7 @@ import pandas as pd
 import paths
 
 from ..IMUTrace import IMUTrace
+from ..resampling import resample_values
 from ..PlateTrial import PlateTrial
 from ..WorldTrace import WorldTrace
 
@@ -167,12 +168,28 @@ def read_mc10_imu(sensor_dir: Path,
         if keep.sum() < 2:
             return None
         accel, accel_time = accel[keep], accel_time[keep]
+        # The gyro is windowed too, with a margin, so the interpolant has support either side
+        # of the accelerometer's first and last sample instead of extrapolating to reach them.
+        margin = 1.0
+        gyro_keep = ((gyro_time >= accel_time[0] - margin)
+                     & (gyro_time <= accel_time[-1] + margin))
+        if gyro_keep.sum() < 8:
+            return None
+        gyro, gyro_time = gyro[gyro_keep], gyro_time[gyro_keep]
 
     acc = accel.iloc[:, 1:4].to_numpy(np.float64) * GRAVITY_MS2
     raw_gyro = np.radians(gyro.iloc[:, 1:4].to_numpy(np.float64))
-    # Interpolated, not assumed aligned: the two exports are independent streams.
-    resampled = np.column_stack([np.interp(accel_time, gyro_time, raw_gyro[:, axis])
-                                 for axis in range(3)])
+
+    # BAND-LIMITED, not linear. The two exports are independent streams on their own
+    # timestamps, so the gyro has to be put on the accelerometer's grid somehow -- and doing
+    # that with np.interp is the same mistake this repo already paid for once. Linear
+    # interpolation is not band-limited: its response is sinc^2, which cost -1.2 dB at 8 Hz
+    # when IMUTrace.resample used it, and the resulting band mismatch biased the IMoVE
+    # cluster-to-IMU offset by 7-9 mm on the shank. The upstream pipeline interpolates these
+    # two channels linearly as well, so this is a divergence from it on purpose.
+    resampled = resample_values(raw_gyro, gyro_time, accel_time,
+                                source_rate=1.0 / float(np.median(np.diff(gyro_time))),
+                                target_rate=1.0 / float(np.median(np.diff(accel_time))))
 
     return IMUTrace(accel_time, resampled, acc, np.zeros_like(acc))
 
