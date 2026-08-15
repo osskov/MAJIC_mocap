@@ -7,6 +7,7 @@ discovered as a wrong answer rather than as an error -- and several of them exis
 exactly that happened while the reader was being written.
 """
 import unittest
+import warnings
 
 import numpy as np
 
@@ -248,3 +249,81 @@ class TestRegistry(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestWindowLandedCheck(unittest.TestCase):
+    """Did the reference window land where the IMU was doing the same thing?
+
+    THE PEAK-TO-SIDELOBE RATIO DOES NOT ANSWER THIS. It scores how sharp the correlation peak
+    was -- that the estimator was confident, not that it was right -- and a confident wrong
+    answer is exactly what slipped through. On 12/Test1/A/LSHop3 the window landed where the
+    IMU reads 9.4 deg/s while the reference over the same frames reads 222.1, and nothing
+    said so.
+    """
+
+    @staticmethod
+    def _plate(name, scale=1.0, seconds=4.0, rate=250.0, valid_from=0):
+        from scipy.spatial.transform import Rotation
+        from src.toolchest.IMUTrace import IMUTrace
+        from src.toolchest.PlateTrial import PlateTrial
+        from src.toolchest.WorldTrace import WorldTrace
+
+        time = np.arange(int(seconds * rate)) / rate
+        angles = np.column_stack([0.7 * np.sin(2 * np.pi * 1.3 * time),
+                                  0.4 * np.sin(2 * np.pi * 0.9 * time),
+                                  0.2 * np.sin(2 * np.pi * 2.3 * time)])
+        world = WorldTrace(time, np.zeros((len(time), 3)),
+                           Rotation.from_euler('zyx', angles).as_matrix())
+        synthetic = world.calculate_imu_trace(skip_lin_acc=True)
+        # `scale` stands in for a misplaced window: the same shape at the wrong amplitude is
+        # what "the limb was moving this much / no it wasn't" looks like in one number.
+        imu = IMUTrace(time, synthetic.gyro * scale, synthetic.acc, synthetic.mag)
+        valid = np.zeros(len(time), dtype=bool)
+        valid[valid_from:] = True
+        return {name: PlateTrial(name, imu, WorldTrace(time, world.positions,
+                                                       world.rotations, valid=valid))}
+
+    def _ratios(self, plates):
+        from src.toolchest.building.biplane import _check_windows_landed
+        from src.toolchest.building.report import BuildReport
+        report = BuildReport()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            _check_windows_landed(plates, report)
+        frame = report.to_frame()
+        return frame, [w for w in caught if w.category is bp.SyncWindowWarning]
+
+    def test_a_matched_window_passes_and_is_recorded(self):
+        frame, fired = self._ratios(self._plate('ok'))
+        self.assertEqual(fired, [])
+        metrics = dict(zip(frame.metric, frame.value_num))
+        self.assertAlmostEqual(metrics['motion_ratio'], 1.0, places=6)
+        self.assertEqual(metrics['window_landed'], 1.0)
+
+    def test_a_misplaced_window_is_caught(self):
+        """The LSHop3 signature: the reference says the limb moved twenty times more than
+        the IMU did over the frames it claims."""
+        _, fired = self._ratios(self._plate('bad', scale=1 / 20.0))
+        self.assertEqual(len(fired), 1)
+        self.assertIn('wrong place', str(fired[0].message))
+
+    def test_it_is_symmetric(self):
+        """A window can be wrong in either direction — reference quieter than the IMU is the
+        same failure as reference louder, so the ratio is taken max-over-min."""
+        _, loud = self._ratios(self._plate('loud', scale=20.0))
+        _, quiet = self._ratios(self._plate('quiet', scale=1 / 20.0))
+        self.assertEqual(len(loud), len(quiet), 1)
+
+    def test_a_short_window_is_skipped_rather_than_judged(self):
+        """Below MIN_SYNC_CHECK_FRAMES the RMS is dominated by whichever few frames survived
+        and the ratio is noise, so a verdict there would be a coin flip presented as a fact."""
+        plates = self._plate('short', scale=1 / 20.0, valid_from=1000 - 5)
+        frame, fired = self._ratios(plates)
+        self.assertEqual(fired, [])
+        self.assertNotIn('motion_ratio', set(frame.metric))
+
+    def test_the_threshold_sits_in_the_measured_gap(self):
+        """Set from data, not picked: correctly-synced plates measured 1.00-2.75 across 104
+        plates and the broken trial's four read 5.88-23.70."""
+        self.assertGreater(bp.MAX_SYNC_MOTION_RATIO, 2.75)
+        self.assertLess(bp.MAX_SYNC_MOTION_RATIO, 5.88)

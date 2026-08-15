@@ -36,6 +36,7 @@ UNITS AND CONVENTIONS, all checked against the files:
                compose to the identity, which is how the convention was established.
 """
 import re
+import warnings
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -372,6 +373,30 @@ BIPLANE_PRETRIGGER_BRACKET_S = 0.5
 # peak is sharp: the ratios run 1.05-5.38 while the answers agree to 60 ms.
 MIN_PEAK_TO_SIDELOBE = 1.5
 
+# The window-landed check. See `_check_windows_landed`: the IMU and the reference, over the
+# same frames, must at least agree about how much the limb was moving.
+#
+# Set from the measured gap rather than picked. Over the 26 built trials of subject 12, 104
+# plates in total, the ratio is bimodal: everything that synced correctly lands in 1.00-2.75
+# (the top of that range being Rstatic1, where both signals are near zero and the ratio is
+# mostly noise, and the drop landings at 2.1-2.3), while the four plates of LSHop3 -- the one
+# trial whose window is demonstrably misplaced -- read 5.88-23.70. 4.0 sits in the middle of
+# the empty gap.
+#
+# DELIBERATELY NOT TIGHTER. Soft-tissue artifact, differentiation noise on a 1 s window and
+# the sensor-to-segment rotation itself all move this ratio, and none of them is a sync
+# failure. LDDrop2 reads 3.06 and is genuinely poor -- its alignment residual is the worst of
+# any non-broken plate at 2.2x signal -- but poor is not misplaced, and
+# `residual_fraction_of_signal` is the instrument for that. This check answers one question:
+# did the window land where the IMU was doing the same thing.
+MAX_SYNC_MOTION_RATIO = 4.0
+# Below this the RMS is dominated by whatever few frames survived, and the ratio is noise.
+MIN_SYNC_CHECK_FRAMES = 30
+
+
+class SyncWindowWarning(UserWarning):
+    """The reference window does not match the IMU over the frames it claims."""
+
 
 def _vicon_world(subject: str, session: str, trial: str, side: str, site: str
                  ) -> Optional[WorldTrace]:
@@ -514,7 +539,56 @@ def load_trial(subject: str, key: str, report=None) -> Dict[str, PlateTrial]:
                        biplane_peak_to_sidelobe=biplane_ratio,
                        biplane_sync_weak=bool(not np.isfinite(biplane_ratio)
                                               or biplane_ratio < MIN_PEAK_TO_SIDELOBE))
+
+    _check_windows_landed(plates, report)
     return plates
+
+
+def _check_windows_landed(plates: Dict[str, PlateTrial], report=None) -> None:
+    """Does the reference window sit where the IMU was actually doing the same thing?
+
+    THE PEAK-TO-SIDELOBE RATIO DOES NOT CATCH THIS. It scores how sharp the correlation peak
+    was, which says the estimator was confident, not that it was right -- and a confident
+    wrong answer is what this is for. On 12/Test1/A/LSHop3 the biplane window landed on a
+    stretch where the IMU reads 9.4 deg/s while the reference-derived angular velocity over
+    the same frames reads 222.1 deg/s. A twenty-fold disagreement about whether the limb was
+    moving at all is not soft-tissue artifact or a differentiation artifact; the window is
+    simply in the wrong place, and nothing said so.
+
+    Compared as a RATIO of RMS magnitudes, which is frame-independent -- no alignment has
+    been applied yet, so the two are in different frames and only their magnitudes can be
+    compared. That also makes the check blind to a rotation error, which is deliberate: this
+    asks whether the window landed, and `residual_fraction_of_signal` asks whether the
+    rotation is right.
+
+    A warning rather than a raise. A trial whose sync failed still has an IMU record and a
+    correctly-placed second reference, and dropping it outright would lose those too.
+    """
+    for name, plate in plates.items():
+        valid = np.asarray(plate.valid)
+        if valid.sum() < MIN_SYNC_CHECK_FRAMES:
+            continue
+        measured = float(np.degrees(
+            np.linalg.norm(plate.imu_trace.gyro[valid], axis=1)).mean())
+        synthetic = float(np.degrees(np.linalg.norm(
+            plate.world_trace.calculate_imu_trace(skip_lin_acc=True).gyro[valid],
+            axis=1)).mean())
+        if min(measured, synthetic) <= 0:
+            continue
+        ratio = max(measured, synthetic) / min(measured, synthetic)
+        landed = ratio <= MAX_SYNC_MOTION_RATIO
+        if report is not None:
+            report.add('S4_sync', 'plate', name,
+                       measured_gyro_rms_deg_s=measured,
+                       reference_gyro_rms_deg_s=synthetic,
+                       motion_ratio=ratio, window_landed=landed)
+        if not landed:
+            warnings.warn(
+                f"{name}: the reference window does not match the IMU over the same frames "
+                f"-- measured {measured:.1f} deg/s against {synthetic:.1f} from the "
+                f"reference, a factor of {ratio:.1f}. The lag estimate has almost certainly "
+                f"put the window in the wrong place; treat this plate as unsynced.",
+                SyncWindowWarning, stacklevel=2)
 
 
 def _on_grid(imu: IMUTrace, grid: np.ndarray, rate: float) -> IMUTrace:
