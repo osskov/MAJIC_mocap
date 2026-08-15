@@ -78,12 +78,28 @@ _TRIAL_PATTERN = re.compile(r'^(?P<side>[LR])(?P<task>[A-Za-z]+?)(?P<index>\d+)$
 # on 12/LDDrop3 the true lag is -11.53 s, and the correlation finds it identically at bracket
 # widths of 49 s and 289 s (|omega| correlation 0.86, against 0.21 for the best lag inside
 # 6 s). So the trigger locates the trial within the two-hour record and nothing finer.
-TRIGGER_BRACKET_S = 30.0
+#
+# WIDENED FROM 30 TO 75 s, because 30 was cutting off real answers. On 12/LSHop3 both sensors
+# independently peak at -42.60 s -- agreeing to 0.01 s, so this is the lag, not a spurious
+# match -- and a +/-30 s bracket cannot reach it, forcing the search to return +20.65 s
+# instead. 06/RSHop2 is the same at -41.63. The healthy population sits at -9 to -12 s, so
+# these are genuine trigger errors of 30-45 s rather than a different convention.
+#
+# Widening a bracket normally buys spurious matches, and here it does not, because the peak is
+# now taken on the SUMMED correlation of both sensors (see `joint_lag`): a false peak has to
+# be false in both at the same lag to win. IMU_MARGIN_S has to cover it or the record runs out
+# before the bracket does.
+TRIGGER_BRACKET_S = 75.0
+
+# Resolution of the common lag axis the per-sensor curves are interpolated onto in
+# `joint_lag`. Over a 150 s bracket this is 19 ms a step, well inside the 4 ms sample period
+# it is refining and far finer than the trigger error it is correcting.
+JOINT_LAG_SAMPLES = 8000
 
 # Margin kept either side of the trigger when slicing the two-hour inertial record. Must
 # comfortably exceed TRIGGER_BRACKET_S plus the Vicon capture length, or the correlation runs
 # out of record before it runs out of bracket.
-IMU_MARGIN_S = 60.0
+IMU_MARGIN_S = 120.0
 
 
 def _utc_offset_hours(when: pd.Timestamp) -> int:
@@ -333,6 +349,93 @@ def _valid_span(world_trace: WorldTrace) -> WorldTrace:
                       valid=valid[first:last])
 
 
+def _correlation_curve(imu_trace: IMUTrace, world_trace: WorldTrace):
+    """(candidate lags, correlation at each) for one sensor, or None if it cannot be formed.
+
+    Split out of `bracketed_lag` so several sensors' curves can be ADDED before a peak is
+    taken. See `joint_lag`.
+    """
+    from scipy import signal as scipy_signal
+
+    world_trace = _valid_span(world_trace)
+    rate = float(world_trace.get_sample_frequency())
+    resampled = imu_trace.resample(rate)
+    reference = np.linalg.norm(
+        world_trace.calculate_imu_trace(skip_lin_acc=True).gyro, axis=1)
+    measured = np.linalg.norm(resampled.gyro, axis=1)
+    if len(reference) < 4 or len(measured) < len(reference):
+        return None
+
+    correlation = scipy_signal.correlate(measured - measured.mean(),
+                                         reference - reference.mean(),
+                                         mode='valid', method='fft')
+    lags = resampled.timestamps[:len(correlation)] - world_trace.timestamps[0]
+    return lags, correlation
+
+
+def joint_lag(pairs: List[Tuple[IMUTrace, WorldTrace]], expected_lag_s: float,
+              bracket_s: float = TRIGGER_BRACKET_S):
+    """One lag for the trial, from the peak of the SUMMED correlation over all its sensors.
+
+    ONE TRIGGER AND ONE CAPTURE MEANS ONE LAG, so the sensors are not independent estimates to
+    be averaged -- they are repeated evidence about the same quantity, and the right way to
+    combine them is to add their correlation surfaces and take the peak once.
+
+    Taking a median of independent per-sensor peaks was the bug this replaces. On a periodic
+    task the correlation has near-equal peaks one cycle apart, the two sensors pick different
+    ones, and the median lands between them where NEITHER has support: 14/LSHop2 gave -12.59
+    and +22.53, whose median is +4.97, a lag no sensor voted for and 17 s from the truth.
+    Summing first cannot do that -- a peak spurious in one sensor has to be spurious in the
+    other at the same lag to survive, and on that trial the joint peak is -12.59, which is
+    sensor A's answer and the one the window-landed check confirms.
+
+    Curves are normalized before adding so a sensor with a larger signal does not simply
+    outvote the other, and interpolated onto a common lag axis because the two BioStamps
+    free-run and their sample instants differ by a couple of milliseconds.
+
+    Returns (lag, peak-to-sidelobe, per-sensor peaks). The per-sensor peaks are handed back
+    for the report rather than used: their spread is the diagnostic that says the sensors
+    disagreed, which is worth recording even when the joint peak resolves it.
+    """
+    curves = [c for c in (_correlation_curve(imu, world) for imu, world in pairs)
+              if c is not None]
+    if not curves:
+        return float('nan'), float('nan'), []
+
+    individual = [float(lags[int(np.argmax(correlation))]) for lags, correlation in curves]
+    if len(curves) == 1:
+        lags, correlation = curves[0]
+        return _peak_within(lags, correlation, expected_lag_s, bracket_s) + (individual,)
+
+    low = max(float(lags[0]) for lags, _ in curves)
+    high = min(float(lags[-1]) for lags, _ in curves)
+    if not high > low:
+        return float('nan'), float('nan'), individual
+    grid = np.linspace(low, high, JOINT_LAG_SAMPLES)
+    total = np.zeros_like(grid)
+    for lags, correlation in curves:
+        scale = float(np.abs(correlation).max()) or 1.0
+        total += np.interp(grid, lags, correlation / scale)
+    return _peak_within(grid, total, expected_lag_s, bracket_s) + (individual,)
+
+
+def _peak_within(lags: np.ndarray, correlation: np.ndarray, expected_lag_s: float,
+                 bracket_s: float) -> Tuple[float, float]:
+    """The best lag inside the bracket, and its peak-to-sidelobe ratio."""
+    inside = np.abs(lags - expected_lag_s) <= bracket_s
+    if not inside.any():
+        return float('nan'), float('nan')
+    candidates = np.flatnonzero(inside)
+    best = candidates[int(np.argmax(correlation[candidates]))]
+    # Sidelobe: the best competing peak at least a tenth of the bracket away, which is where
+    # a periodic signal puts its next match.
+    exclusion = max(int(0.1 * len(candidates)), 1)
+    far = candidates[np.abs(candidates - best) > exclusion]
+    peak = float(correlation[best])
+    sidelobe = float(correlation[far].max()) if len(far) else 0.0
+    return float(lags[best]), (peak / sidelobe if sidelobe > 0 else float('inf'))
+
+
 def bracketed_lag(imu_trace: IMUTrace, world_trace: WorldTrace, expected_lag_s: float,
                   bracket_s: float = TRIGGER_BRACKET_S) -> Tuple[float, float]:
     """Refine a trigger-derived lag by gyro correlation, searching only near it.
@@ -365,37 +468,10 @@ def bracketed_lag(imu_trace: IMUTrace, world_trace: WorldTrace, expected_lag_s: 
     #
     # This is the same hazard `assembly.align_world_to_imu` already masks for when it fits the
     # sensor-to-segment rotation; the lag search simply never did.
-    world_trace = _valid_span(world_trace)
-
-    rate = float(world_trace.get_sample_frequency())
-    resampled = imu_trace.resample(rate)
-    reference = np.linalg.norm(
-        world_trace.calculate_imu_trace(skip_lin_acc=True).gyro, axis=1)
-    measured = np.linalg.norm(resampled.gyro, axis=1)
-    if len(reference) < 4 or len(measured) < len(reference):
+    curve = _correlation_curve(imu_trace, world_trace)
+    if curve is None:
         return float('nan'), float('nan')
-
-    correlation = scipy_signal.correlate(measured - measured.mean(),
-                                         reference - reference.mean(),
-                                         mode='valid', method='fft')
-    starts = resampled.timestamps[:len(correlation)]
-    lags = starts - world_trace.timestamps[0]
-
-    inside = np.abs(lags - expected_lag_s) <= bracket_s
-    if not inside.any():
-        return float('nan'), float('nan')
-
-    candidates = np.flatnonzero(inside)
-    best = candidates[int(np.argmax(correlation[candidates]))]
-
-    # Sidelobe = the best peak at least half a reference-length away, which is the nearest
-    # place a periodic signal would put a competing match.
-    exclusion = max(int(0.5 * len(reference)), 1)
-    far = candidates[np.abs(candidates - best) > exclusion]
-    peak = float(correlation[best])
-    sidelobe = float(correlation[far].max()) if len(far) else 0.0
-    ratio = peak / sidelobe if sidelobe > 0 else float('inf')
-    return float(lags[best]), ratio
+    return _peak_within(*curve, expected_lag_s, bracket_s)
 
 
 # The biplane Time column is NOT relative to the Vicon trigger: it starts a constant ~2.98 s
@@ -410,9 +486,19 @@ BIPLANE_PRETRIGGER_S = 2.98
 BIPLANE_PRETRIGGER_BRACKET_S = 0.5
 
 # Below this, the correlation peak is not meaningfully better than its neighbours and the lag
-# it names should not be trusted. Recorded per plate rather than enforced, because the honest
-# evidence for these alignments is that they REPRODUCE across trials, not that any single
-# peak is sharp: the ratios run 1.05-5.38 while the answers agree to 60 ms.
+# it names should not be trusted. RECORDED, NOT ENFORCED, and now for a measured reason rather
+# than a cautious one.
+#
+# As a gate it fails badly. Over 380 trials, rejecting everything under 1.5 would throw out 41
+# trials to catch 3 that independently fail the window-landed check -- 38 good trials lost for
+# 3 bad ones caught. Loosening to 2.0 is worse: 94 rejected, 4 bad, 90 good gone. The reason is
+# that a low ratio means the correlation surface is FLAT, which happens whenever the task is
+# periodic, and a hop can be periodic and still be located correctly by the trigger bracket.
+#
+# So it stays a flag, and NOTHING is a gate here now. The disagreement it was meant to stand
+# in for is resolved rather than rejected: `joint_lag` sums the sensors' correlations before
+# taking a peak, so the periodic ambiguity that produced both the low ratios and the
+# disagreeing estimates is settled by the evidence rather than voted on.
 MIN_PEAK_TO_SIDELOBE = 1.5
 
 # The window-landed check. See `_check_windows_landed`: the IMU and the reference, over the
@@ -524,8 +610,12 @@ def load_trial(subject: str, key: str, report=None) -> Dict[str, PlateTrial]:
     # Vicon capture, so the lag is a property of the trial; estimating it per sensor and using
     # each answer separately let the thigh and shank disagree by 3.5 s on the first attempt,
     # which is physically impossible and left the gyro residual larger than the signal.
-    # Median over the sensors, for the same reason assembly._shared_lag takes one.
-    sources, lags, ratios = {}, [], []
+    #
+    # THE SENSORS ARE COMBINED BEFORE THE PEAK IS TAKEN, not after. A median of independent
+    # per-sensor peaks was the previous approach and it is wrong on a periodic task: the two
+    # pick different cycles and the median lands between them, at a lag neither supports. See
+    # `joint_lag`.
+    sources, pairs = {}, []
     for bone, site in BONE_TO_SITE.items():
         sensor = f'{site}_{side}'
         imu = read_mc10_imu(BIPLANE_ROOT / 'IMUs' / STUDY / subject / sensor,
@@ -535,15 +625,24 @@ def load_trial(subject: str, key: str, report=None) -> Dict[str, PlateTrial]:
             continue
         on_imu = WorldTrace(vicon.timestamps + trigger, vicon.positions, vicon.rotations,
                             valid=vicon.valid)
-        lag, ratio = bracketed_lag(imu, on_imu, 0.0)
         sources[sensor] = (bone, site, imu, vicon)
-        if np.isfinite(lag):
-            lags.append(lag)
-            ratios.append(ratio)
+        pairs.append((imu, on_imu))
 
     if not sources:
         return {}
-    vicon_lag = float(np.median(lags)) if lags else 0.0
+
+    # One peak over the summed correlation, plus the per-sensor peaks purely so the report can
+    # say whether they had agreed. The spread is a DIAGNOSTIC now, not a gate: where the
+    # sensors disagree the joint peak is the resolution, so rejecting the trial would throw
+    # away data the method can recover. 14/LSHop2's sensors gave -12.59 and +22.53; the joint
+    # peak is -12.59, and the window-landed check confirms it.
+    vicon_lag, vicon_ratio, per_sensor = joint_lag(pairs, 0.0)
+    if not np.isfinite(vicon_lag):
+        raise ValueError(
+            f"{subject}/{trial}: no correlation peak inside +/-{TRIGGER_BRACKET_S:.0f} s of "
+            f"the trigger, so there is no way onto the IMU clock.")
+    lags = per_sensor
+    ratios = [vicon_ratio]
     vicon_start = trigger + vicon_lag
 
     # ONE origin AND ONE GRID for the trial. A shared origin is not sufficient on its own:
