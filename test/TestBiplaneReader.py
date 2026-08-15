@@ -331,3 +331,61 @@ class TestWindowLandedCheck(unittest.TestCase):
         self.assertGreater(bp.MAX_SYNC_MOTION_RATIO, 3.0)
         # And loose enough to leave the 29 plates above 10 as the unambiguous catch.
         self.assertLess(bp.MAX_SYNC_MOTION_RATIO, 10.0)
+
+
+class TestLagUsesMeasuredFramesOnly(unittest.TestCase):
+    """The lag correlation runs on the valid span, not on interpolated pose.
+
+    The Vicon clusters lose markers heavily -- across 72 clusters only 65% of frames see all
+    four, and 24% see fewer than the three a pose needs -- and `fit_plate_to_template` fills
+    the rest by interpolation. Differentiating an interpolated pose gives an angular velocity
+    that was never measured, and correlating on it made the two sensors of a trial disagree
+    about the lag by up to 40 s. Restricting to the valid span cut the trials whose sensors
+    disagree by more than a second from 25 to 7.
+
+    Trimming rather than masking is safe here because every one of the 52 lost runs sits at a
+    trial EDGE -- median 529 frames, none in the interior -- so the valid part is contiguous.
+    """
+
+    @staticmethod
+    def _trace(n=800, invalid_head=200, invalid_tail=150, rate=250.0):
+        from scipy.spatial.transform import Rotation
+        from src.toolchest.WorldTrace import WorldTrace
+        time = np.arange(n) / rate
+        angles = np.column_stack([0.6 * np.sin(2 * np.pi * 1.1 * time),
+                                  0.3 * np.sin(2 * np.pi * 0.7 * time),
+                                  np.zeros(n)])
+        valid = np.ones(n, dtype=bool)
+        valid[:invalid_head] = False
+        valid[n - invalid_tail:] = False
+        return WorldTrace(time, np.zeros((n, 3)),
+                          Rotation.from_euler('zyx', angles).as_matrix(), valid=valid)
+
+    def test_it_trims_to_the_valid_span(self):
+        trace = self._trace()
+        trimmed = bp._valid_span(trace)
+        self.assertEqual(len(trimmed), 800 - 200 - 150)
+        self.assertTrue(np.asarray(trimmed.valid).all())
+        self.assertAlmostEqual(trimmed.timestamps[0], 200 / 250.0)
+
+    def test_a_fully_valid_trace_is_untouched(self):
+        trace = self._trace(invalid_head=0, invalid_tail=0)
+        self.assertIs(bp._valid_span(trace), trace)
+
+    def test_a_fully_invalid_trace_is_returned_whole(self):
+        """So the caller gets the same 'no peak' answer it would have got anyway, rather than
+        an empty array to reason about."""
+        trace = self._trace(invalid_head=800, invalid_tail=0)
+        self.assertIs(bp._valid_span(trace), trace)
+
+    def test_the_lag_keeps_its_meaning_after_trimming(self):
+        """L = s - w0 is invariant to where w0 is taken, so trimming must not shift the
+        answer. If it did, every biplane window would move by the length of the head gap."""
+        from src.toolchest.IMUTrace import IMUTrace
+        trace = self._trace()
+        synthetic = trace.calculate_imu_trace(skip_lin_acc=True)
+        shift = 0.4
+        imu = IMUTrace(trace.timestamps + shift, synthetic.gyro, synthetic.acc, synthetic.mag)
+
+        lag, _ = bp.bracketed_lag(imu, trace, expected_lag_s=0.0, bracket_s=2.0)
+        self.assertAlmostEqual(lag, shift, places=2)

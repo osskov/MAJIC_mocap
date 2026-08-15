@@ -317,6 +317,22 @@ def vicon_path(subject: str, session: str, trial: str) -> Path:
 
 # ----------------------------------------------------------------------------------- sync
 
+def _valid_span(world_trace: WorldTrace) -> WorldTrace:
+    """The trace trimmed to its first..last valid frame, or unchanged if it has no mask.
+
+    Returns the whole trace when nothing is valid, so a caller gets the same "no peak" answer
+    it would have got anyway rather than an empty array to reason about.
+    """
+    valid = np.asarray(world_trace.valid)
+    if valid.all() or not valid.any():
+        return world_trace
+    first, last = int(np.argmax(valid)), int(len(valid) - np.argmax(valid[::-1]))
+    return WorldTrace(world_trace.timestamps[first:last],
+                      world_trace.positions[first:last],
+                      world_trace.rotations[first:last],
+                      valid=valid[first:last])
+
+
 def bracketed_lag(imu_trace: IMUTrace, world_trace: WorldTrace, expected_lag_s: float,
                   bracket_s: float = TRIGGER_BRACKET_S) -> Tuple[float, float]:
     """Refine a trigger-derived lag by gyro correlation, searching only near it.
@@ -334,6 +350,22 @@ def bracketed_lag(imu_trace: IMUTrace, world_trace: WorldTrace, expected_lag_s: 
     confidently wrong. A caller that ignores it gets no warning.
     """
     from scipy import signal as scipy_signal
+
+    # CORRELATE ON MEASURED FRAMES ONLY. The Vicon clusters lose markers heavily -- across 72
+    # clusters only 65% of frames see all four, and 24% see fewer than the three a pose needs
+    # -- and `fit_plate_to_template` fills those by interpolation. Differentiating an
+    # interpolated pose gives an angular velocity that was never measured, and feeding it to a
+    # correlation is what made the two sensors of a trial disagree about the lag by up to 40 s.
+    #
+    # Trimming to the valid span rather than masking inside it, because EVERY ONE of the 52
+    # lost runs sits at a trial edge -- median 529 frames, 2.1 s, none in the interior. So the
+    # valid part is contiguous and a correlation over it needs no holes punched in it. The
+    # returned lag is unchanged in meaning: it is measured against the trimmed trace's own
+    # first timestamp, and L = s - w0 is invariant to where w0 is taken.
+    #
+    # This is the same hazard `assembly.align_world_to_imu` already masks for when it fits the
+    # sensor-to-segment rotation; the lag search simply never did.
+    world_trace = _valid_span(world_trace)
 
     rate = float(world_trace.get_sample_frequency())
     resampled = imu_trace.resample(rate)
