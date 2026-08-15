@@ -60,6 +60,20 @@ STUDY = 'HAKnee'
 # caller can refuse rather than quietly fuse a zero field.
 HAS_MAGNETOMETER = False
 
+# Below this a rigid pose is not determined: two points leave a free rotation about the line
+# through them. Three non-collinear points fix it exactly, which is why this is 3 and not 4.
+MIN_CLUSTER_MARKERS = 3
+
+# A marker present in fewer than this fraction of frames is dropped from the cluster, provided
+# MIN_CLUSTER_MARKERS survive. Presence as a LABEL is not presence as DATA: subject 18's
+# RrunStance1 exports RTSA and then fills it in 0.1% of frames, which leaves no frame where
+# all four are present -- and the template `fit_plate_to_template` estimates needs one, so it
+# raised and the whole sensor was dropped, taking the biplane plate with it.
+#
+# Low on purpose. A marker present a quarter of the time still constrains the frames it is in,
+# and this is meant to catch a channel that is dead rather than one that is intermittent.
+MIN_MARKER_PRESENCE = 0.25
+
 GRAVITY_MS2 = 9.80665
 MM_TO_M = 1e-3
 
@@ -298,8 +312,23 @@ VICON_CLUSTERS = {
 
 
 def read_vicon_c3d(path: Path, labels: List[str]
-                   ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """((N, M, 3) marker positions in METRES, (N,) seconds), or None if a label is absent.
+                   ) -> Optional[Tuple[np.ndarray, np.ndarray, List[str]]]:
+    """((N, M, 3) positions in METRES, (N,) seconds, the labels actually used).
+
+    None only if FEWER THAN THREE of the requested labels are in the file. Three
+    non-collinear markers determine a rigid pose exactly, so refusing a cluster for one
+    absent label threw away trials that reconstruct perfectly well: subject 02's export has
+    no RTIP at all, and that alone cost every one of its 13 right-side trials both of their
+    right-thigh plates. Across the dataset the same thing happens to subject 14's LTSA and
+    subject 17's RSIA, 30 cluster-trials in total, every one of them a single missing label.
+
+    WHAT IS LOST WITH THREE IS THE REDUNDANCY, NOT THE POSE. Four markers over-determine the
+    fit by one constraint, and that constraint is what makes the residual a fault detector --
+    it is how a displaced or mislabelled marker gets caught. On three, Kabsch is exact and the
+    residual collapses toward zero whether the markers are right or not. Measured on subject
+    02's left thigh, which has all four: 0.465 mm on four markers against 0.238 mm on three of
+    them. The three-marker figure is LOWER and means LESS. `n_markers_used` is recorded beside
+    every fit so a residual is never read without knowing which regime produced it.
 
     c3d stores points as (4, markers, frames) with the fourth row a residual: negative means
     the point was not reconstructed in that frame. Those become NaN here, which is what
@@ -311,7 +340,8 @@ def read_vicon_c3d(path: Path, labels: List[str]
     handle = ezc3d.c3d(str(path))
     names = [name.strip() for name in handle['parameters']['POINT']['LABELS']['value']]
     index = {name: position for position, name in enumerate(names)}
-    if not set(labels).issubset(index):
+    labels = [label for label in labels if label in index]
+    if len(labels) < MIN_CLUSTER_MARKERS:
         return None
 
     points = handle['data']['points']                    # (4, markers, frames)
@@ -325,7 +355,15 @@ def read_vicon_c3d(path: Path, labels: List[str]
         residual = points[3, index[label], :]
         marker[residual < 0] = np.nan
         columns.append(marker)
-    return np.stack(columns, axis=1), np.arange(points.shape[2]) / rate
+
+    # Then again on DATA rather than labels. See MIN_MARKER_PRESENCE.
+    stacked = np.stack(columns, axis=1)
+    presence = np.isfinite(stacked).all(axis=2).mean(axis=0)
+    keep = presence >= MIN_MARKER_PRESENCE
+    if keep.sum() >= MIN_CLUSTER_MARKERS and not keep.all():
+        stacked = stacked[:, keep]
+        labels = [label for label, alive in zip(labels, keep) if alive]
+    return stacked, np.arange(points.shape[2]) / rate, labels
 
 
 def vicon_path(subject: str, session: str, trial: str) -> Path:
@@ -565,13 +603,17 @@ def _vicon_world(subject: str, session: str, trial: str, side: str, site: str,
     markers = read_vicon_c3d(vicon_path(subject, session, trial), labels)
     if markers is None:
         return None
-    positions, timestamps = markers
+    positions, timestamps, used = markers
     try:
         pose, rotations, valid, fit = fit_plate_to_template(
             positions, timestamps, name=f'{subject}/{trial}/{site}')
     except ValueError:
         return None
     if report is not None:
+        # Recorded because it changes how the residual beside it should be read: on three
+        # markers the fit is exact and the residual measures noise rather than fault.
+        fit = dict(fit, n_markers_used=len(used),
+                   n_markers_absent=len(labels) - len(used))
         record_reconstruction(report, trial, site, fit, valid, timestamps,
                               DEFAULT_PLATE_RESIDUAL_TOLERANCE_M)
     return WorldTrace(timestamps, pose, rotations, valid=valid)

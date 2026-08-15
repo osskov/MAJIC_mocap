@@ -153,8 +153,9 @@ class TestAgainstTheFiles(unittest.TestCase):
             bp.vicon_path(self.SUBJECT, self.SESSION, self.TRIAL),
             bp.VICON_CLUSTERS[('left', 'lateral_shank')])
         self.assertIsNotNone(markers)
-        positions, timestamps = markers
+        positions, timestamps, used = markers
         self.assertEqual(positions.shape[1], 4)
+        self.assertEqual(len(used), 4)
         self.assertLess(np.nanmax(np.abs(positions)), 10.0, "should be metres, not mm")
         self.assertAlmostEqual(1.0 / np.median(np.diff(timestamps)), 150.0, places=0)
 
@@ -178,9 +179,45 @@ class TestAgainstTheFiles(unittest.TestCase):
         determinants = np.linalg.det(matrices[:, :3, :3])
         self.assertTrue((np.abs(determinants) > 0.5).all(), "non-rotation blocks present")
 
-    def test_an_absent_marker_label_returns_none_rather_than_raising(self):
+    def test_too_few_labels_returns_none_rather_than_raising(self):
         self.assertIsNone(bp.read_vicon_c3d(
             bp.vicon_path(self.SUBJECT, self.SESSION, self.TRIAL), ['NOSUCHMARKER']))
+
+    def test_three_of_four_labels_still_reconstructs(self):
+        """One absent label used to cost the whole cluster, and it need not: three
+        non-collinear markers determine a rigid pose exactly. Subject 02's export has no RTIP
+        at all, which alone cost every one of its 13 right-side trials both right-thigh
+        plates -- 26 of the dataset's 36 absences, from a marker that was never needed."""
+        full = bp.VICON_CLUSTERS[('left', 'lateral_shank')]
+        markers = bp.read_vicon_c3d(
+            bp.vicon_path(self.SUBJECT, self.SESSION, self.TRIAL),
+            list(full) + ['NOSUCHMARKER'])
+        self.assertIsNotNone(markers)
+        positions, _, used = markers
+        self.assertEqual(used, list(full))
+        self.assertEqual(positions.shape[1], 4)
+
+    def test_two_labels_is_refused_because_the_pose_is_underdetermined(self):
+        """Two points leave a free rotation about the line through them. Returning a pose
+        there would be inventing one axis of it."""
+        full = bp.VICON_CLUSTERS[('left', 'lateral_shank')]
+        self.assertIsNone(bp.read_vicon_c3d(
+            bp.vicon_path(self.SUBJECT, self.SESSION, self.TRIAL), list(full[:2])))
+        self.assertIsNotNone(bp.read_vicon_c3d(
+            bp.vicon_path(self.SUBJECT, self.SESSION, self.TRIAL), list(full[:3])))
+
+    def test_the_three_marker_fit_records_that_it_used_three(self):
+        """A three-marker residual is exact by construction and means less than a four-marker
+        one -- 0.238 mm against 0.465 on the same plate -- so the count travels with it."""
+        from src.toolchest.building.report import BuildReport
+        report = BuildReport()
+        bp.load_trial('02', 'Test1/A/RSDrop1', report=report)
+        frame = report.to_frame()
+        rows = frame[(frame.step == 'S2_reconstruction')
+                     & (frame.metric == 'n_markers_used')]
+        counts = dict(zip(rows.entity, rows.value_num))
+        self.assertEqual(counts['RSDrop1/lateral_thigh'], 3.0)
+        self.assertEqual(counts['RSDrop1/lateral_shank'], 4.0)
 
     def test_the_camera_offset_is_per_subject(self):
         """Stable within a session but ranging over an hour between them, so one global
@@ -426,3 +463,43 @@ class TestViconReconstructionIsRecorded(unittest.TestCase):
         frame = report.to_frame()
         entities = set(frame[frame.step == 'S2_reconstruction'].entity)
         self.assertFalse(any('biplane' in e for e in entities), entities)
+
+
+@require_data
+class TestDeadMarkerChannels(unittest.TestCase):
+    """A marker can be present as a LABEL and absent as DATA, and that is not the same check.
+
+    Subject 18's RrunStance1 exports RTSA and then fills it in 0.1% of frames. All four labels
+    are in the file, so the label check passed, but no frame has all four present -- and the
+    template `fit_plate_to_template` estimates needs one, so it raised, `_vicon_world` returned
+    None, and the whole sensor went with it, taking the biplane plate too. Two sensor-trials
+    lost to a channel that was never populated.
+    """
+
+    def test_a_dead_channel_is_dropped_and_the_cluster_survives(self):
+        markers = bp.read_vicon_c3d(bp.vicon_path('18', 'Test1', 'RrunStance1'),
+                                    bp.VICON_CLUSTERS[('right', 'lateral_thigh')])
+        self.assertIsNotNone(markers)
+        _, _, used = markers
+        self.assertEqual(len(used), 3, 'the 0.1%-present marker should have been dropped')
+        self.assertNotIn('RTSA', used)
+
+    def test_the_trial_now_produces_all_four_plates(self):
+        plates = bp.load_trial('18', 'Test1/C/RrunStance1')
+        self.assertEqual(len(plates), 4)
+        self.assertIn('lateral_thigh_right__vicon', plates)
+        # The biplane plate went with the Vicon one, so recovering one recovers both.
+        self.assertIn('lateral_thigh_right__biplane', plates)
+
+    def test_an_intermittent_marker_is_kept(self):
+        """The threshold catches a DEAD channel, not a patchy one -- a marker present a
+        quarter of the time still constrains the frames it appears in."""
+        self.assertLessEqual(bp.MIN_MARKER_PRESENCE, 0.25)
+        self.assertGreater(bp.MIN_MARKER_PRESENCE, 0.0)
+
+    def test_a_healthy_cluster_keeps_all_four(self):
+        """The control: the filter must not quietly thin a cluster that is fine."""
+        markers = bp.read_vicon_c3d(bp.vicon_path('01', 'Test1', 'LSDrop1'),
+                                    bp.VICON_CLUSTERS[('left', 'lateral_shank')])
+        _, _, used = markers
+        self.assertEqual(len(used), 4)
