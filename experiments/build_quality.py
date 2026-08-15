@@ -46,7 +46,7 @@ import pandas as pd
 import paths
 from experiments.experiment_utils import (TRIAL_DATASET, build_report_path,
                                           cached_trial_status)
-from experiments.experiment_utils import RESIDUAL_WARN_DEG_S
+from experiments.experiment_utils import RESIDUAL_WARN_FRACTION
 from src.toolchest.building.report import STEPS
 from src.toolchest.building.sources import get_source
 
@@ -174,18 +174,26 @@ def plate_diagnostics(dataset: str) -> pd.DataFrame:
     `n_suspect_plates` -- a count of how many crossed 25 deg/s. The distribution behind that
     threshold, and therefore any justification for it, was invisible.
 
-    Two of these are calibration checks nobody was looking at. `acc_norm_median` should sit
-    near 9.81 for any plate that spends time near-static, and a systematic departure is a
-    scale error that propagates into every acceleration comparison. `mag_norm_median` bears
-    directly on the heading-dependent ||mag|| artifact.
+    Two of these are calibration checks nobody was looking at. `acc_norm_static_median` should
+    sit near 9.81 on any plate that ever holds still, and a systematic departure is a scale
+    error that propagates into every acceleration comparison. `mag_norm_median` bears directly
+    on the heading-dependent ||mag|| artifact.
+
+    EVERY ROW CARRIES ITS TRIAL'S CACHE STATUS, because a manifest is read whether or not its
+    artifact is current and a stale one is in whatever format the build that wrote it used.
+    Mixing them silently is not hypothetical: 238 rows here come from 18 stale static-pose
+    manifests with no `residual_fraction` at all, so pooling a fresh-only numerator over a
+    fresh-plus-stale denominator understated the suspect rate. Callers filter on `fresh`.
     """
     rows = []
     for subject, trial in get_source(dataset).enumerate_trials():
         manifest = paths.read_manifest(
             paths.cached_trial_path(dataset, subject, trial)) or {}
+        status, _ = cached_trial_status(subject, trial, dataset=dataset)
         plates = (manifest.get('diagnostics') or {}).get('plates') or {}
         for plate, stats in plates.items():
-            row = {'dataset': dataset, 'subject': subject, 'trial': trial, 'plate': plate}
+            row = {'dataset': dataset, 'subject': subject, 'trial': trial, 'plate': plate,
+                   'status': status, 'fresh': status == 'fresh'}
             for key, value in stats.items():
                 if isinstance(value, (int, float)):
                     row[key] = value
@@ -639,20 +647,50 @@ def run(dataset: str, only_tables: Optional[List[str]] = None) -> Dict[str, pd.D
 
     if not diagnostics.empty:
         _header(6, "Per-plate diagnostics",
-                "the distribution behind RESIDUAL_WARN_DEG_S, and two calibration checks")
-        for column, target in (('gyro_residual_lowpass_rms_deg_s', None),
-                               ('acc_norm_median', 9.81), ('mag_norm_median', 1.0)):
-            if column not in diagnostics:
+                "the distribution behind RESIDUAL_WARN_FRACTION, and the calibration checks")
+        # FRESH ONLY. A stale manifest is in whatever format the build that wrote it used, so
+        # pooling it here mixes populations and, worse, divides a numerator that only fresh
+        # rows can contribute to by a denominator that includes rows which cannot.
+        stale = diagnostics[~diagnostics.get('fresh', True)] if 'fresh' in diagnostics \
+            else diagnostics.iloc[:0]
+        current = diagnostics[diagnostics['fresh']] if 'fresh' in diagnostics else diagnostics
+        if len(stale):
+            # Counted on the PAIR: every one of these is named t0_static_pose_001, so counting
+            # distinct trial names reports 18 stale trials as 1.
+            n_stale = len(stale.groupby(['subject', 'trial']))
+            print(f"  ({len(stale)} plates from {n_stale} stale trials excluded "
+                  f"— their manifests predate these metrics)")
+        for column, target in (('residual_fraction', None),
+                               ('gyro_residual_lowpass_rms_deg_s', None),
+                               ('acc_norm_static_median', 9.81), ('acc_scale_error', 0.0),
+                               ('mag_norm_median', 1.0)):
+            if column not in current:
                 continue
-            values = diagnostics[column].dropna()
+            values = current[column].dropna()
+            if values.empty:
+                continue
             print(f"  {column:34s} n={len(values):5d} "
                   f"q50 {values.quantile(0.5):7.2f}  q95 {values.quantile(0.95):7.2f}  "
                   f"max {values.max():8.2f}" + (f"   (expect ~{target})" if target else ""))
-        if 'gyro_residual_lowpass_rms_deg_s' in diagnostics:
-            over = diagnostics['gyro_residual_lowpass_rms_deg_s'] > RESIDUAL_WARN_DEG_S
-            print(f"\n  {int(over.sum())} of {len(diagnostics)} plates exceed "
-                  f"{RESIDUAL_WARN_DEG_S:.0f} deg/s "
+        if 'acc_norm_static_median' in current:
+            never_still = int(current['acc_norm_static_median'].isna().sum())
+            if never_still:
+                print(f"  {never_still} plates never hold still, so they carry no evidence "
+                      f"about their own accelerometer scale and report none")
+        if 'residual_fraction' in current:
+            scored = current['residual_fraction'].dropna()
+            over = scored > RESIDUAL_WARN_FRACTION
+            print(f"\n  {int(over.sum())} of {len(scored)} plates exceed "
+                  f"{RESIDUAL_WARN_FRACTION:.0%} of their own signal "
                   f"({100 * over.mean():.1f}%)")
+            # The check that the flag is no longer a speed detector. If a future change
+            # reintroduces the dependence this line is where it shows.
+            if 'gyro_signal_lowpass_rms_deg_s' in current:
+                pair = current[['residual_fraction', 'gyro_signal_lowpass_rms_deg_s',
+                                'gyro_residual_lowpass_rms_deg_s']].dropna()
+                print(f"  correlation with plate speed: "
+                      f"normalized r={pair.residual_fraction.corr(pair.gyro_signal_lowpass_rms_deg_s):+.2f}, "
+                      f"absolute r={pair.gyro_residual_lowpass_rms_deg_s.corr(pair.gyro_signal_lowpass_rms_deg_s):+.2f}")
 
     _report_signal_repair(tables)
     _report_decimation_cost(tables)

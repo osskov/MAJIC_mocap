@@ -212,12 +212,28 @@ class TestReportBuild(unittest.TestCase):
         self.assertIn('ValueError', printed_text)
 
     def test_suspect_plates_are_summarised(self):
+        """Keyed on `residual_fraction`, the residual as a share of the plate's own signal.
+        The absolute deg/s figure it replaced was a speed detector: it flagged 94% of
+        treadmill-running plates and 0% of static poses."""
         results = {('01', 'walking'): self._result('built', diagnostics={'plates': {
-            'femur_r_imu': {'gyro_residual_lowpass_rms_deg_s': 40.0}}})}
+            'femur_r_imu': {'residual_fraction': 0.8}}})}
         with mock.patch('builtins.print') as printed:
             build_trials.report_build(results, 'out')
         printed_text = ' '.join(str(c) for c in printed.call_args_list)
         self.assertIn('femur_r_imu', printed_text)
+
+    def test_a_fast_but_well_aligned_plate_is_not_flagged(self):
+        """The regression the normalization exists to prevent. 40 deg/s of residual against a
+        200 deg/s signal is a fifth of the motion and unremarkable; the old absolute rule
+        called it suspect purely because the limb was moving."""
+        results = {('01', 'walking'): self._result('built', diagnostics={'plates': {
+            'fast_but_fine': {'gyro_residual_lowpass_rms_deg_s': 40.0,
+                              'gyro_signal_lowpass_rms_deg_s': 200.0,
+                              'residual_fraction': 0.2}}})}
+        with mock.patch('builtins.print') as printed:
+            build_trials.report_build(results, 'out')
+        self.assertNotIn('fast_but_fine',
+                         ' '.join(str(c) for c in printed.call_args_list))
 
 
 class TestStatusGrid(unittest.TestCase):

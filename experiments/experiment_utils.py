@@ -323,16 +323,41 @@ _CONTENT_MODULES = tuple(sorted(set(_CORE_MODULES).union(
 # Cutoff for the alignment-residual diagnostic below.
 _RESIDUAL_LOWPASS_HZ = 10.0
 
-# Low-passed alignment residual above which a plate is called SUSPECT and recorded as such in
-# the manifest. Chosen off the observed spread -- Subject01/walking's eight plates sit at
-# 9-19 deg/s -- so it flags a plate roughly double the worst normal one.
+# Low-passed alignment residual above which a plate is called SUSPECT, AS A FRACTION OF THAT
+# PLATE'S OWN LOW-PASSED GYRO SIGNAL.
 #
-# It lands in the manifest rather than only in the build log because the two audiences are
-# different people at different times: the build printed this an hour ago to whoever was
-# watching a terminal, while the person who needs it is the one computing joint angles now.
-# Reconstruction failures already get a mechanism that reaches them (`valid`, which
-# propagates into the error statistics); alignment failures had a print.
+# It used to be an absolute 25 deg/s, and that threshold was measuring SPEED rather than
+# quality. Across 3303 plates the absolute residual correlates with the gyro RMS at r = +0.60,
+# and the fraction of plates it flags orders almost perfectly by how fast the activity is:
+#
+#     treadmill running   94.0% flagged        lat_step            13.0% flagged
+#     treadmill walking   83.9%                squat               26.0%
+#     walking             74.9%                static pose          0.0%
+#
+# Nobody believes 94% of running plates are misaligned and no static pose is. Normalizing by
+# the plate's own signal breaks that dependence (r = -0.31) and the ordering disappears.
+#
+# It is wrong in the other direction too. A static pose flags at 0% on the absolute rule while
+# its NORMALIZED residual is 1.006 -- the fitted rotation explains none of the measured motion,
+# because there is no motion to fit it on. That is the plate whose alignment is least
+# trustworthy in the dataset and the old rule called it clean.
+#
+# 0.5 is set off the same distribution: the normalized residual has q50 0.33 and q95 0.74
+# across every non-static plate, so this flags roughly the worst 10-15% within each activity
+# rather than whichever activity was fastest.
+RESIDUAL_WARN_FRACTION = 0.5
+
+# The absolute threshold, kept only so the old figure and the tests that pin it still resolve.
+# Not used for the suspect flag any more. See RESIDUAL_WARN_FRACTION for why.
 RESIDUAL_WARN_DEG_S = 25.0
+
+# Below this the sensor is holding still and gravity is the whole accelerometer signal, so its
+# magnitude is a scale check. Generous: a limb "at rest" in a standing trial still sways, and
+# a tighter gate finds no frames at all on half the dataset.
+STATIC_GYRO_LIMIT_DEG_S = 5.0
+# Fewer than this and the median is dominated by whichever handful of frames qualified.
+STATIC_MIN_FRAMES = 50
+GRAVITY_MS2 = 9.80665
 
 
 def _semantic_source(path: Path) -> bytes:
@@ -480,6 +505,7 @@ def _alignment_residuals(plate: PlateTrial) -> Dict[str, float]:
         return float(np.degrees(np.sqrt((np.linalg.norm(scored, axis=1) ** 2).mean())))
 
     out = {'gyro_residual_raw_rms_deg_s': rms(residual),
+           'gyro_signal_rms_deg_s': rms(measured),
            'n_invalid_frames': int((~valid).sum())}
 
     fs = float(plate.imu_trace.get_sample_frequency())
@@ -488,9 +514,47 @@ def _alignment_residuals(plate: PlateTrial) -> Dict[str, float]:
     # raises rather than returning something approximate.
     if fs > 0 and len(plate) > 30:
         b, a = butter(4, cutoff / (fs / 2.0), btype='low')
-        out['gyro_residual_lowpass_rms_deg_s'] = rms(filtfilt(b, a, residual, axis=0))
+        low_residual = rms(filtfilt(b, a, residual, axis=0))
+        # AGAINST THE SIGNAL IN THE SAME BAND. Dividing a low-passed residual by a broadband
+        # signal would flatter every fast trial, since the denominator picks up energy the
+        # numerator has had removed -- reintroducing by the back door exactly the speed
+        # dependence the fraction exists to remove.
+        low_signal = rms(filtfilt(b, a, measured, axis=0))
+        out['gyro_residual_lowpass_rms_deg_s'] = low_residual
+        out['gyro_signal_lowpass_rms_deg_s'] = low_signal
+        out['residual_fraction'] = (low_residual / low_signal if low_signal > 0
+                                    else float('nan'))
         out['residual_lowpass_hz'] = cutoff
     return out
+
+
+def _static_calibration(plate: PlateTrial) -> Dict[str, float]:
+    """The accelerometer scale check, taken where it actually means something.
+
+    `acc_norm_median` -- the median of |acc| over the WHOLE trial -- was being read against
+    9.81 as a calibration check, and on a dynamic trial that reading is simply wrong. All 159
+    plates more than 1 m/s^2 from gravity are treadmill running, topping out at 16.97, and a
+    running limb genuinely spends more than half its time above 1 g. Nothing is miscalibrated;
+    the statistic was answering a different question from the one being asked of it.
+
+    A scale error only shows up where the sensor is NEARLY STILL, because there gravity is the
+    entire signal. So the frames are selected first, on the gyroscope -- which is independent
+    of the accelerometer being checked, and would not be if the selection used |acc| itself:
+    picking frames where |acc| is near 9.81 and then reporting that |acc| is near 9.81 is
+    circular and would hide the very error it is looking for.
+
+    Returns nothing when the plate never holds still. That is honest -- a treadmill-running
+    plate carries no evidence about its own scale -- and it is why this is separate from
+    `acc_norm_median` rather than replacing it.
+    """
+    gyro = np.degrees(np.linalg.norm(np.asarray(plate.imu_trace.gyro), axis=1))
+    still = (gyro < STATIC_GYRO_LIMIT_DEG_S) & np.asarray(plate.valid)
+    if still.sum() < STATIC_MIN_FRAMES:
+        return {'n_static_frames': int(still.sum())}
+    magnitudes = np.linalg.norm(np.asarray(plate.imu_trace.acc)[still], axis=1)
+    return {'n_static_frames': int(still.sum()),
+            'acc_norm_static_median': float(np.median(magnitudes)),
+            'acc_scale_error': float(np.median(magnitudes) / GRAVITY_MS2 - 1.0)}
 
 
 def trial_diagnostics(plates: Dict[str, PlateTrial]) -> Dict[str, Any]:
@@ -508,6 +572,7 @@ def trial_diagnostics(plates: Dict[str, PlateTrial]) -> Dict[str, Any]:
             'n_frames': len(plate),
             'acc_norm_median': float(np.median(np.linalg.norm(plate.imu_trace.acc, axis=1))),
             'mag_norm_median': float(np.median(np.linalg.norm(plate.imu_trace.mag, axis=1))),
+            **_static_calibration(plate),
             # What shift_world_origin moved this plate's pose by, so the shift is auditable
             # and a re-derivation can add it back. Without it a refit measures the RESIDUAL
             # and pasting that in as the new constant walks it to zero one run at a time.
@@ -526,9 +591,13 @@ def trial_diagnostics(plates: Dict[str, PlateTrial]) -> Dict[str, Any]:
             ~np.logical_and.reduce([p.valid for p in plates.values()]))),
         'plates': per_plate,
         # Derived at write time so load_trial can warn without recomputing anything.
+        # Keyed on the NORMALIZED residual: the absolute one flagged 94% of treadmill-running
+        # plates and 0% of static poses, which is a speed detector wearing a quality label.
+        # A plate with no `residual_fraction` at all (too short to filter) is not called
+        # suspect -- absence of evidence is not evidence, and .get's 0.0 default says clean.
         'suspect': sorted(name for name, stats in per_plate.items()
-                          if stats.get('gyro_residual_lowpass_rms_deg_s', 0.0)
-                          > RESIDUAL_WARN_DEG_S),
+                          if stats.get('residual_fraction', 0.0)
+                          > RESIDUAL_WARN_FRACTION),
     }
 
 
@@ -715,9 +784,10 @@ def load_trial(subject: str, trial: str, strict: bool = False,
     # from a plate whose mocap and IMU disagree by twice the worst normal amount.
     suspect = ((manifest or {}).get('diagnostics') or {}).get('suspect') or []
     if suspect:
-        message = (f"{dataset}/{subject}/{trial}: {len(suspect)} plate(s) exceed "
-                   f"{RESIDUAL_WARN_DEG_S:.0f} deg/s of alignment residual and may have a bad "
-                   f"sync, a bad sensor-to-segment rotation, or corrupt markers underneath: "
+        message = (f"{dataset}/{subject}/{trial}: {len(suspect)} plate(s) have an alignment "
+                   f"residual over {RESIDUAL_WARN_FRACTION:.0%} of their own gyro signal and "
+                   f"may have a bad sync, a bad sensor-to-segment rotation, or corrupt "
+                   f"markers underneath: "
                    f"{', '.join(suspect)}")
         if strict:
             raise SuspectTrial(message)

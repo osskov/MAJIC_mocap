@@ -46,7 +46,7 @@ from experiments.experiment_utils import (
     TRIAL_DATASET, cached_trial_status, run_tracked_grid, save_build_report,
     save_cached_trial,
 )
-from experiments.experiment_utils import RESIDUAL_WARN_DEG_S
+from experiments.experiment_utils import RESIDUAL_WARN_FRACTION
 from src.toolchest.building.report import BuildReport
 from src.toolchest.building.sources import SOURCES, get_source
 
@@ -239,17 +239,24 @@ def report_build(results: Dict[Any, Dict[str, Any]], out: str) -> int:
         if r.get('traceback'):
             print(textwrap.indent(r['traceback'].rstrip(), '    | '))
 
+    # Reported as the fraction AND the deg/s behind it: the fraction is what the flag keys
+    # on, and the absolute number is what tells you whether it is worth chasing. A 90%
+    # fraction on a plate that barely moved is a different problem from 90% on a sprint.
     suspect = [
-        (r['subject'], r['activity'], name, stats['gyro_residual_lowpass_rms_deg_s'])
+        (r['subject'], r['activity'], name, stats['residual_fraction'],
+         stats.get('gyro_residual_lowpass_rms_deg_s', float('nan')))
         for r in built
         for name, stats in r['diagnostics'].get('plates', {}).items()
-        if stats.get('gyro_residual_lowpass_rms_deg_s', 0.0) > RESIDUAL_WARN_DEG_S
+        if stats.get('residual_fraction', 0.0) > RESIDUAL_WARN_FRACTION
     ]
     if suspect:
-        print(f"\nPlates with a low-passed gyro alignment residual over {RESIDUAL_WARN_DEG_S} deg/s —"
+        print(f"\nPlates whose alignment residual exceeds {RESIDUAL_WARN_FRACTION:.0%} of "
+              f"their own gyro signal —"
               f" worth a look before trusting their joint angles:")
-        for subject, activity, name, residual in sorted(suspect, key=lambda t: -t[3]):
-            print(f"  {subject}/{activity}/{name}: {residual:.1f} deg/s")
+        for subject, activity, name, fraction, absolute in sorted(suspect,
+                                                                  key=lambda t: -t[3]):
+            print(f"  {subject}/{activity}/{name}: {fraction:.0%} of signal "
+                  f"({absolute:.1f} deg/s)")
     return len(failed)
 
 

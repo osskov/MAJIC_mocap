@@ -615,3 +615,112 @@ class TestRealTrialRoundTrip(unittest.TestCase):
         plate = self._live('08', 'walking')['calcn_l_imu']
         self.assertEqual(len(plate.valid), len(plate))
         self.assertFalse(plate.valid.all())
+
+
+class TestQualityLabelling(unittest.TestCase):
+    """The suspect flag and the accelerometer check, both of which were mis-specified.
+
+    THE OLD SUSPECT FLAG WAS A SPEED DETECTOR. It compared an absolute residual against
+    25 deg/s, and across 3303 plates that correlates with the plate's gyro RMS at r = +0.60:
+    it flagged 94% of treadmill-running plates and 0% of static poses. Nobody believes running
+    is almost always misaligned and a static pose never is. Normalizing by the plate's own
+    signal drops the correlation to -0.31.
+    """
+
+    @staticmethod
+    def _plate(name='p', residual_scale=0.0, signal_scale=1.0, seconds=20.0, rate=100.0):
+        """A plate whose measured gyro is the mocap-derived one plus a known relative error."""
+        from scipy.spatial.transform import Rotation
+        from src.toolchest.IMUTrace import IMUTrace
+        from src.toolchest.PlateTrial import PlateTrial
+        from src.toolchest.WorldTrace import WorldTrace
+
+        time = np.arange(int(seconds * rate)) / rate
+        angles = signal_scale * np.column_stack([0.5 * np.sin(2 * np.pi * 0.8 * time),
+                                                 0.3 * np.sin(2 * np.pi * 1.3 * time),
+                                                 0.2 * np.sin(2 * np.pi * 0.5 * time)])
+        world = WorldTrace(time, np.zeros((len(time), 3)),
+                           Rotation.from_euler('zyx', angles).as_matrix())
+        implied = world.calculate_imu_trace(skip_lin_acc=True)
+        # A slow additive error, so it survives the low-pass the diagnostic applies.
+        error = residual_scale * np.linalg.norm(implied.gyro, axis=1).mean() * np.column_stack(
+            [np.sin(2 * np.pi * 0.3 * time)] * 3) / np.sqrt(3)
+        imu = IMUTrace(time, implied.gyro + error, implied.acc, implied.mag)
+        return PlateTrial(name, imu, world)
+
+    def test_the_fraction_is_invariant_to_how_fast_the_plate_moved(self):
+        """The whole point. The same RELATIVE error on a slow and a fast plate must score the
+        same, where the absolute residual differs by the speed ratio."""
+        slow = eu._alignment_residuals(self._plate(residual_scale=0.2, signal_scale=0.2))
+        fast = eu._alignment_residuals(self._plate(residual_scale=0.2, signal_scale=2.0))
+        self.assertAlmostEqual(slow['residual_fraction'], fast['residual_fraction'], places=2)
+        # And the absolute figure, which is what the old rule used, does not agree.
+        self.assertGreater(fast['gyro_residual_lowpass_rms_deg_s'],
+                           5 * slow['gyro_residual_lowpass_rms_deg_s'])
+
+    def test_a_clean_plate_scores_near_zero(self):
+        out = eu._alignment_residuals(self._plate(residual_scale=0.0))
+        self.assertLess(out['residual_fraction'], 0.05)
+
+    def test_the_fraction_is_measured_in_the_same_band_as_the_residual(self):
+        """Dividing a low-passed residual by a BROADBAND signal would flatter every fast
+        trial, since the denominator picks up energy the numerator has had removed."""
+        out = eu._alignment_residuals(self._plate(residual_scale=0.3))
+        self.assertIn('gyro_signal_lowpass_rms_deg_s', out)
+        self.assertLessEqual(out['gyro_signal_lowpass_rms_deg_s'],
+                             out['gyro_signal_rms_deg_s'] * 1.01)
+
+    def test_a_fast_plate_with_a_small_relative_error_is_not_suspect(self):
+        """The regression this exists to prevent: 40 deg/s against a 200 deg/s signal is
+        unremarkable, and the old rule called it suspect for being fast."""
+        plates = {'fast': self._plate('fast', residual_scale=0.2, signal_scale=3.0)}
+        self.assertEqual(eu.trial_diagnostics(plates)['suspect'], [])
+
+    def test_a_genuinely_misaligned_plate_is_still_caught(self):
+        plates = {'bad': self._plate('bad', residual_scale=1.2)}
+        self.assertEqual(eu.trial_diagnostics(plates)['suspect'], ['bad'])
+
+
+class TestStaticCalibration(unittest.TestCase):
+    """`acc_norm_median` was being read against 9.81 as a scale check on every trial.
+
+    On a dynamic trial that reading is simply wrong: all 159 plates more than 1 m/s^2 from
+    gravity are treadmill running, topping out at 16.97, and a running limb genuinely spends
+    more than half its time above 1 g. The statistic was answering a different question from
+    the one asked of it.
+    """
+
+    @staticmethod
+    def _plate(scale=1.0, moving=False, n=600):
+        from src.toolchest.IMUTrace import IMUTrace
+        from src.toolchest.PlateTrial import PlateTrial
+        from src.toolchest.WorldTrace import WorldTrace
+
+        time = np.arange(n) / 100.0
+        gyro = np.full((n, 3), np.radians(60.0) if moving else 0.0)
+        acc = np.tile([0.0, 0.0, scale * 9.80665], (n, 1))
+        world = WorldTrace(time, np.zeros((n, 3)), np.tile(np.eye(3), (n, 1, 1)))
+        return PlateTrial('p', IMUTrace(time, gyro, acc, np.zeros((n, 3))), world)
+
+    def test_a_still_plate_reports_its_scale(self):
+        out = eu._static_calibration(self._plate(scale=1.0))
+        self.assertAlmostEqual(out['acc_norm_static_median'], 9.80665, places=4)
+        self.assertAlmostEqual(out['acc_scale_error'], 0.0, places=6)
+
+    def test_a_real_scale_error_is_caught(self):
+        out = eu._static_calibration(self._plate(scale=1.1))
+        self.assertAlmostEqual(out['acc_scale_error'], 0.1, places=4)
+
+    def test_a_moving_plate_reports_no_scale_at_all(self):
+        """Silence rather than a wrong number. A treadmill-running plate carries no evidence
+        about its own scale, and reporting one anyway is what produced 159 phantom faults."""
+        out = eu._static_calibration(self._plate(scale=1.0, moving=True))
+        self.assertNotIn('acc_norm_static_median', out)
+        self.assertEqual(out['n_static_frames'], 0)
+
+    def test_the_still_frames_are_chosen_on_the_gyro_not_the_accelerometer(self):
+        """Selecting frames where |acc| is near 9.81 and then reporting that |acc| is near
+        9.81 is circular, and would hide the very error the check looks for."""
+        plate = self._plate(scale=1.5)
+        out = eu._static_calibration(plate)
+        self.assertAlmostEqual(out['acc_scale_error'], 0.5, places=4)
