@@ -214,6 +214,96 @@ class TestInstrumentedSitesFire(unittest.TestCase):
         # that used to leave the whole row empty.
         self.assertNotIn('acc_power_above_target_nyquist', fractions)
 
+    def test_alignment_reports_the_residual_not_just_the_rotation(self):
+        """`offset_angle_deg` is how far the sensor was MOUNTED from the segment frame -- a
+        fact about the hardware that says nothing about whether the fit worked. Measured on
+        one IMoVE trial it sits at 169.8-179.5 deg for all fifteen plates, a mounting
+        convention with essentially no discriminating power, while the residual over the same
+        plates spans 0.18 to 0.46 and separates shanks from thighs."""
+        from src.toolchest.building.assembly import assemble_plate_trials
+
+        report = BuildReport()
+        assemble_plate_trials(*self._pair(), True, report=report)
+        frame = report.to_frame()
+        metrics = set(frame[frame.step == 'S7_alignment'].metric)
+        for name in ('gyro_residual_before_deg_s', 'gyro_residual_after_deg_s',
+                     'residual_fraction_of_signal', 'residual_reduction'):
+            self.assertIn(name, metrics)
+
+
+class TestAlignmentResidual(unittest.TestCase):
+    """The quantity that says whether the sensor-to-segment fit worked."""
+
+    @staticmethod
+    def _rotation(degrees=30.0):
+        from scipy.spatial.transform import Rotation
+        return Rotation.from_euler('z', degrees, degrees=True).as_matrix()
+
+    def _signals(self, scale=1.0, n=500):
+        time = np.arange(n) / 100.0
+        synthetic = scale * np.column_stack([np.sin(2 * np.pi * 1.1 * time),
+                                             np.cos(2 * np.pi * 0.7 * time),
+                                             np.sin(2 * np.pi * 1.9 * time)])
+        return synthetic, synthetic @ self._rotation()
+
+    def test_a_perfect_rotation_leaves_nothing(self):
+        from src.toolchest.building.assembly import _alignment_residual
+        synthetic, measured = self._signals()
+        out = _alignment_residual(synthetic, measured, self._rotation(),
+                                  np.ones(len(synthetic), dtype=bool))
+        self.assertAlmostEqual(out['residual_fraction_of_signal'], 0.0, places=10)
+        self.assertAlmostEqual(out['residual_reduction'], 1.0, places=10)
+
+    def test_the_fraction_is_scale_free(self):
+        """THE REASON IT IS NORMALIZED. An absolute residual in deg/s scales with how fast
+        the segment moved, so a static pose scores near-perfect for barely moving and a sprint
+        scores badly for the same error in relative terms. Dividing by the measured signal's
+        own RMS is what makes a static pose and a sprint comparable."""
+        from src.toolchest.building.assembly import _alignment_residual
+        identity = np.eye(3)
+        fractions, absolutes = [], []
+        for scale in (1.0, 50.0):
+            synthetic, measured = self._signals(scale=scale)
+            out = _alignment_residual(synthetic, measured, identity,
+                                      np.ones(len(synthetic), dtype=bool))
+            fractions.append(out['residual_fraction_of_signal'])
+            absolutes.append(out['gyro_residual_after_deg_s'])
+        self.assertAlmostEqual(fractions[0], fractions[1], places=9)
+        # The absolute residual moved by the full factor of 50, which is the problem.
+        self.assertAlmostEqual(absolutes[1] / absolutes[0], 50.0, places=6)
+
+    def test_a_rotation_that_explains_nothing_reads_near_one(self):
+        from src.toolchest.building.assembly import _alignment_residual
+        synthetic, _ = self._signals()
+        unrelated = np.roll(synthetic, 137, axis=0)
+        out = _alignment_residual(synthetic, unrelated, np.eye(3),
+                                  np.ones(len(synthetic), dtype=bool))
+        self.assertGreater(out['residual_fraction_of_signal'], 0.5)
+
+    def test_invalid_frames_are_excluded(self):
+        """Scored on the same frames the fit used. An interpolated frame does not stop
+        moving, it moves wrongly, so including it would score the fit against a signal the
+        fit was never shown."""
+        from src.toolchest.building.assembly import _alignment_residual
+        synthetic, measured = self._signals()
+        corrupted = measured.copy()
+        corrupted[:100] = 1e4
+
+        valid = np.ones(len(synthetic), dtype=bool)
+        valid[:100] = False
+        out = _alignment_residual(synthetic, corrupted, self._rotation(), valid)
+        self.assertAlmostEqual(out['residual_fraction_of_signal'], 0.0, places=10)
+
+    def test_no_valid_frames_reports_nothing_rather_than_nan(self):
+        from src.toolchest.building.assembly import _alignment_residual
+        synthetic, measured = self._signals()
+        self.assertEqual(_alignment_residual(synthetic, measured, np.eye(3),
+                                             np.zeros(len(synthetic), dtype=bool)), {})
+
+
+class TestCollectingIsInert(TestInstrumentedSitesFire):
+    """Inherits the synthetic-pair helper from the class above."""
+
     def test_collecting_does_not_change_the_result(self):
         """The instrumentation observes; it must not participate."""
         from src.toolchest.building.assembly import assemble_plate_trials

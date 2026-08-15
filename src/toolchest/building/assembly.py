@@ -98,7 +98,9 @@ def align_world_to_imu(plate: 'PlateTrial',
                    offset_axis=(axis / norm if norm > 1e-12 else np.zeros(3)),
                    angle_to_nearest_plate_axis_deg=_angle_to_nearest_axis(axis, norm),
                    n_frames_used=int(valid.sum()),
-                   valid_fraction=float(valid.mean()))
+                   valid_fraction=float(valid.mean()),
+                   **_alignment_residual(synthetic_imu_trace.gyro, plate.imu_trace.gyro,
+                                         R_wt_it, valid))
 
     # 3. Apply this static rotation to all orientations in the world trace.
     #    new_R_world = old_R_world @ R_wt_it
@@ -294,6 +296,48 @@ def shift_world_origin(plate: PlateTrial, offset_m: np.ndarray) -> PlateTrial:
     # that in as the new constant would drive it to zero one run at a time.
     shifted.sensor_offset = np.asarray(plate.sensor_offset) + offset_m
     return shifted
+
+
+def _alignment_residual(synthetic_gyro: np.ndarray, measured_gyro: np.ndarray,
+                        rotation: np.ndarray, valid: np.ndarray) -> Dict[str, float]:
+    """How well the fitted rotation actually reconciles the two gyro signals.
+
+    THE ROTATION ITSELF SAYS NOTHING ABOUT FIT QUALITY. `offset_angle_deg` is how far the
+    sensor was mounted from the segment frame, which is a fact about the mounting, and its
+    spread across a trial's plates is mostly genuine mounting variety. Neither answers the
+    question the alignment step raises, which is whether the one constant rotation the model
+    allows can reconcile the marker-derived angular velocity with the measured one at all.
+    This does: it is the residual of the fit, before and after.
+
+    `residual_fraction_of_signal` IS THE ONE TO READ. An absolute residual in deg/s scales
+    with how fast the segment moved, so a static pose scores near-perfect for having barely
+    moved and a sprint scores badly for the same error in relative terms; dividing by the
+    measured signal's own RMS removes that. 0 means the rotation reconciles the two signals
+    exactly, 1 means it explains none of the measured motion.
+
+    `residual_reduction` is the complementary check on whether the fit did anything: a
+    rotation that barely improves on doing nothing is either a sensor already aligned with
+    its segment or a fit that failed to find anything.
+
+    Scored on valid frames only, matching the fit.
+    """
+    if not np.any(valid):
+        return {}
+    synthetic, measured = synthetic_gyro[valid], measured_gyro[valid]
+
+    def rms(vectors: np.ndarray) -> float:
+        return float(np.degrees(np.sqrt((np.linalg.norm(vectors, axis=1) ** 2).mean())))
+
+    before = rms(synthetic - measured)
+    after = rms(synthetic @ rotation - measured)
+    signal = rms(measured)
+    return {
+        'gyro_residual_before_deg_s': before,
+        'gyro_residual_after_deg_s': after,
+        'gyro_signal_rms_deg_s': signal,
+        'residual_fraction_of_signal': after / signal if signal > 0 else float('nan'),
+        'residual_reduction': 1.0 - after / before if before > 0 else float('nan'),
+    }
 
 
 def _to_common_grid(imu_trace: IMUTrace, world_trace: WorldTrace, target_rate: float,

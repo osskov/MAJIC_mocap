@@ -271,18 +271,37 @@ class TestEveryFigureIsCaptioned(unittest.TestCase):
         import plotting.build_quality as module
         rendered = re.findall(r"'([a-z_]+\.png)', plots_dir=", Path(module.__file__).read_text())
         self.assertTrue(rendered, 'found no figures to check')
+        captions = module.captions_for('imove')
         for filename in rendered:
-            self.assertIn(filename, module.CAPTIONS, f'{filename} has no caption')
-            self.assertGreater(len(module.CAPTIONS[filename]), 200,
+            self.assertIn(filename, captions, f'{filename} has no caption')
+            self.assertGreater(len(captions[filename]), 200,
                                f'{filename} caption is too short to be detailed')
 
     def test_a_caption_says_what_the_figure_does_not_show(self):
         """The limitation is the part a reader cannot recover from the axes, and the part most
         likely to be over-read if it is missing."""
-        from plotting.build_quality import CAPTIONS
-        for filename, caption in CAPTIONS.items():
+        from plotting.build_quality import captions_for
+        for filename, caption in captions_for('imove').items():
             self.assertIn('NOT SHOWN', caption,
                           f'{filename} does not state what it leaves out')
+
+    def test_no_caption_borrows_another_datasets_specifics(self):
+        """A caption that illustrates a point with IMoVE's long walks or treadmill trials is
+        simply FALSE on the Al Borno report, which has neither -- and it was printed there
+        anyway until the examples became dataset-scoped."""
+        from plotting.build_quality import captions_for
+        for filename, caption in captions_for('alborno').items():
+            lowered = caption.lower()
+            for term in ('imove', 'long-walk', 'longwalk', 'treadmill', 'high, mid'):
+                self.assertNotIn(term, lowered, f'{filename} leaks {term!r} into alborno')
+
+    def test_an_unknown_dataset_keeps_the_principle_and_drops_the_example(self):
+        from plotting.build_quality import captions_for
+        captions = captions_for('a_dataset_this_module_has_never_seen')
+        self.assertEqual(set(captions), set(captions_for('imove')))
+        for caption in captions.values():
+            self.assertIn('NOT SHOWN', caption)
+            self.assertNotIn('{', caption, 'an unfilled slot reached the caption')
 
     def test_saving_without_one_warns_rather_than_passing_quietly(self):
         import matplotlib

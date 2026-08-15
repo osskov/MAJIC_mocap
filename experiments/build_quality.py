@@ -432,10 +432,17 @@ def health_score(index: pd.DataFrame, tables: Dict[str, pd.DataFrame]) -> pd.Dat
             'origin_spread_s' in tables['S6_timeline']:
         frames.append(tables['S6_timeline'].groupby(['subject', 'trial'])['origin_spread_s']
                       .max().rename('origin_spread_s'))
+    # The residual after the rotation, NOT the spread of the rotations themselves. The spread
+    # was the first thing here and it was the wrong quantity: sensors are genuinely mounted at
+    # different angles on different segments, so most of that spread is a fact about the
+    # hardware rather than about how well the alignment worked. The residual is the fit's own
+    # error, and dividing it by the measured signal's RMS makes it comparable between a static
+    # pose and a sprint -- an absolute deg/s residual is not.
     if 'S7_alignment' in tables and not tables['S7_alignment'].empty and \
-            'offset_angle_deg' in tables['S7_alignment']:
-        frames.append(tables['S7_alignment'].groupby(['subject', 'trial'])['offset_angle_deg']
-                      .std().rename('alignment_angle_spread_deg'))
+            'residual_fraction_of_signal' in tables['S7_alignment']:
+        frames.append(tables['S7_alignment']
+                      .groupby(['subject', 'trial'])['residual_fraction_of_signal']
+                      .max().rename('worst_alignment_residual_fraction'))
 
     if not frames:
         return pd.DataFrame()

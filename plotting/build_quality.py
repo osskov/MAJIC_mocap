@@ -29,7 +29,7 @@ treatments, which is not a claim worth making. The blocking IS applied to the po
 import argparse
 import re
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -52,30 +52,34 @@ RESIDUAL_WARN_DEG_S = 25.0
 # in the markdown report cannot drift apart. Each says what is plotted, how to read it, and
 # what it does NOT show -- a figure travels into a slide or a message without the code or the
 # report section that explains it, and arrives having to stand on its own.
-CAPTIONS = {
+#
+# DATASET-SPECIFIC EXAMPLES ARE SUBSTITUTED, NOT HARDCODED. A caption that illustrates a point
+# with IMoVE's long-walk sessions is simply false on the Al Borno report, which has no long
+# walks, no treadmill trials and no High/Mid/Low placements. Each template therefore carries
+# named slots that EXAMPLES fills per dataset, and fills with nothing for a dataset this
+# module has never seen -- so the principle always survives and only the illustration varies.
+_CAPTION_TEMPLATES = {
     'data_state.png':
         'Triage view of the whole dataset: every session (rows) against every activity '
         '(columns). LEFT: how many sensors each trial produced as a fraction of what that '
         'session can produce, with the raw count in the cell and the session expectation in '
-        'the row label. The denominator is per session on purpose — the long-walk sessions '
-        'carry 7 sensors rather than 15, and scoring them against the dataset-wide roster '
-        'would show complete sessions as half broken. MIDDLE: the composite health score — '
-        'the equally-weighted mean of five build diagnostics, each rescaled to [0, 1] across '
-        'this dataset: the worst segment\'s marker-fit residual (mm), the largest fraction of '
-        'frames with untrustworthy ground truth, how much the trial\'s plates disagreed about '
-        'the IMU-to-mocap lag (s), how far apart the plates think the trial starts (s), and '
-        'the spread in fitted sensor-to-segment angle across plates (deg). Because the '
+        'the row label. The denominator is per session rather than dataset-wide, so a session '
+        'that carries fewer sensors by design is not shown as half broken.{session_sizes} '
+        'MIDDLE: the composite health score — the equally-weighted mean of five build '
+        'diagnostics, each rescaled to [0, 1] across this dataset: the worst segment\'s '
+        'marker-fit residual (mm), the largest fraction of frames with untrustworthy ground '
+        'truth, how much the trial\'s plates disagreed about the IMU-to-mocap lag (s), how '
+        'far apart the plates think the trial starts (s), and the worst plate\'s leftover '
+        'sensor-to-segment alignment error as a fraction of its own gyro signal. Because the '
         'rescaling is within-dataset, the darkest cell is the worst trial HERE and not a bad '
         'trial in absolute terms; a dataset with no problems would still have a darkest cell. '
         'See health.png for the components plotted separately. RIGHT: each session\'s mean '
-        'health, the fastest way to see which sessions are more and less suspect. '
-        'Hatched = the trial did not build. Grey = '
-        'it built but scored nothing, which is every static-pose trial, having no motion for '
-        'the sync and alignment components to measure. White = no such trial in that '
-        'session. Blocks of missing coverage are protocol, not fault: the treadmill '
-        'activities instrument the right leg only. NOT SHOWN: anything about accuracy — a '
-        'fully covered, low-health trial can still carry a systematic error, since every '
-        'component here is internal consistency rather than agreement with a reference.',
+        'health, the fastest way to see which sessions are more and less suspect. Hatched = '
+        'the trial did not build. Grey = it built but scored nothing, which is every trial '
+        'with no motion for the sync and alignment components to measure. White = no such '
+        'trial in that session.{coverage_blocks} NOT SHOWN: anything about accuracy — a fully '
+        'covered, low-health trial can still carry a systematic error, since every component '
+        'here is internal consistency rather than agreement with a reference.',
     'reconstruction.png':
         'Whether the marker-derived ground truth can be trusted, before any comparison with '
         'an IMU. A segment\'s pose is recovered by fitting a rigid template to its markers, '
@@ -110,32 +114,37 @@ CAPTIONS = {
         'cross-correlation to find a peak. Symlog x, so agreement at the microsecond level '
         'and disagreement at the second level are both readable. RIGHT: `plate first-valid − '
         'trial origin`, seconds between the trial\'s shared t = 0 and the first frame on '
-        'which that plate has trustworthy ground truth; log counts on y. Zero is the '
-        'expected value and the bar at zero holds most plates. A plate that starts late '
-        'spends that long on a held pose while sharing the other plates\' clock, which is '
-        'the s16 defect as a routine measurement. NOT SHOWN: clock DRIFT within a trial. '
-        'Every lag here is one constant per plate, and the ~20 ppm relative drift measured '
-        'over a long-walk record — about 11 ms over 540 s — is in none of these numbers.',
+        'which that plate has trustworthy ground truth; log counts on y. Zero is the expected '
+        'value and the bar at zero holds most plates. A plate that starts late spends that '
+        'long on a held pose while sharing the other plates\' clock. NOT SHOWN: clock DRIFT '
+        'within a trial. Every lag here is one constant per plate, and the ~20 ppm relative '
+        'drift measured on this hardware — about 11 ms over 540 s — is in none of these '
+        'numbers.',
     'alignment.png':
-        'The sensor-to-segment rotation, which the build solves for every plate and never '
-        'reported until now. A sensor is mounted on its segment in an unknown orientation, so '
-        'the build fits the single rotation that best carries the marker-derived angular '
-        'velocity onto the measured gyroscope; both panels describe that fitted rotation, one '
-        'point per plate. LEFT: `sensor-to-segment offset` in DEGREES, the total angle of '
-        'that rotation, against `valid frames the rotation was fitted on`, the number of '
-        'frames where both signals were trustworthy (log x). This is the conditioning caveat '
-        'a residual threshold cannot express: a plate with few valid frames yields a small '
-        'residual and a meaningless rotation, and the residual alone cannot tell that apart '
-        'from a well-aligned plate. Read the left edge with suspicion regardless of where the '
-        'point sits vertically. RIGHT: `angle from rotation axis to nearest coordinate axis` '
-        'in degrees — treating the fitted rotation as an axis and an angle, how far that axis '
-        'lies from the closest of the plate\'s own x, y, z. Zero means the sensor was rotated '
-        'about one of the plate\'s own axes, which is what clipping a sensor on in one of a '
-        'few fixed orientations produces. A pile-up near zero therefore means the rotations '
-        'are a mounting convention; a flat spread means the fit found something that is not. '
-        'NOT SHOWN: whether the rotation is CORRECT. Nothing here compares it to an '
-        'independent measurement of how the sensor was actually mounted, because no such '
-        'measurement exists in either dataset.',
+        'How well the sensor-to-segment alignment worked. A sensor is mounted on its segment '
+        'in an unknown orientation, so the build fits the single constant rotation that best '
+        'carries the marker-derived angular velocity onto the measured gyroscope. One point '
+        'per plate. LEFT: `residual / measured gyro RMS`, the RMS of what the rotation FAILED '
+        'to reconcile divided by the RMS of the measured gyro itself — 0 means the two '
+        'signals agree exactly after rotating, and the line at 1 is where the rotation '
+        'explains none of the measured motion. Normalized on purpose: an absolute residual in '
+        'deg/s scales with how fast the segment moved, so a static pose would score '
+        'near-perfect for barely moving and a sprint badly for the same relative error. '
+        'Plotted against `valid frames the rotation was fitted on` (log x), which is the '
+        'conditioning caveat — read the left edge with suspicion regardless of height, since '
+        'a rotation fitted on few frames can be meaningless and still score well. MIDDLE: '
+        'residual in deg/s BEFORE the rotation against AFTER, both log; the dashed diagonal '
+        'is no improvement. This is what the fit actually bought, and a point on the diagonal '
+        'is either a sensor already aligned with its segment or a fit that found nothing. '
+        'RIGHT: `angle from rotation axis to nearest coordinate axis` in degrees — treating '
+        'the fitted rotation as an axis and an angle, how far that axis lies from the closest '
+        'of the plate\'s own x, y, z. A pile-up near zero means the rotations are a mounting '
+        'convention, sensors clipped on in one of a few fixed orientations; a flat spread '
+        'means they are not. NOT SHOWN: whether the rotation is CORRECT. A low residual means '
+        'one constant rotation reconciles the two signals, which is consistent with the right '
+        'rotation but does not establish it, and nothing here compares it to an independent '
+        'measurement of how the sensor was actually mounted because no such measurement '
+        'exists in either dataset.',
     'replicate_structure.png':
         'The measured intraclass correlations behind the blocking, published rather than '
         'asserted because the blocking changes every n in the report. The INTRACLASS '
@@ -145,14 +154,11 @@ CAPTIONS = {
         'replicate, and 1 means they are the same measurement recorded more than once. Each '
         'curve is the empirical CDF (y = fraction of metrics at or below x) of ICC across '
         'metrics for one candidate grouping — placement, segment, session and so on. The '
-        f'dashed line at {ICC_DEPENDENT} is the threshold past which a grouping\'s members '
-        'are pooled into one observation instead of counted separately. The case this exists '
-        'to catch: IMoVE mounts three sensors (High, Mid, Low) on one segment and all three '
-        'share a single marker reconstruction, so a reconstruction metric counted per sensor '
-        'would treble-count one measurement and inflate every n threefold. A curve sitting '
-        'far to the right of the line is exactly that. NOT SHOWN: any significance test. '
-        'These ICCs set the blocking; they are not themselves a comparison between '
-        'treatments.',
+        'dashed line at {icc_threshold} is the threshold past which a grouping\'s members '
+        'are pooled into one observation instead of counted separately, because counting '
+        'them apart would inflate every n by the number of members.{replicate_case} NOT '
+        'SHOWN: any significance test. These ICCs set the blocking; they are not themselves '
+        'a comparison between treatments.',
     'health.png':
         'The worst twenty trials by composite health, with every component that went into '
         'the score shown beside it — never the score alone. WHAT EACH PANEL PLOTS, left to '
@@ -167,17 +173,61 @@ CAPTIONS = {
         'how much the plates disagreed about it, and a large value means the estimator failed '
         'rather than that the clocks differ. `origin_spread_s`, seconds between the earliest '
         'and latest plate\'s first valid frame, i.e. how far apart the plates think the trial '
-        'starts. `alignment_angle_spread_deg`, the standard deviation in degrees of the '
-        'fitted sensor-to-segment offset angle across the trial\'s plates — sensors mounted '
-        'the same way should agree, so spread is either genuine mounting variety or a fit '
-        'that failed on some plates. The equal weighting is a placeholder rather than a '
-        'claim: until the components are regressed against downstream joint-angle error '
-        'there is no evidence for any other weighting. Read the component bars, not the '
-        'composite — a trial can rank high on one component and be fine in every other '
-        'respect — and note this is never used as a gate on the data. NOT SHOWN: absolute '
-        'quality. Top of this figure means worst in this dataset, which in a clean dataset '
-        'still means acceptable.',
+        'starts. `worst_alignment_residual_fraction`, the largest over the trial\'s plates of '
+        'the sensor-to-segment fit\'s leftover error divided by the measured gyro\'s own RMS '
+        '— 0 means the fitted rotation reconciles the marker-derived and measured angular '
+        'velocity exactly, 1 means it explains none of the motion; normalized rather than '
+        'absolute so a static pose and a sprint are comparable. The equal weighting is a '
+        'placeholder rather than a claim: until the components are regressed against '
+        'downstream joint-angle error there is no evidence for any other weighting. Read the '
+        'component bars, not the composite — a trial can rank high on one component and be '
+        'fine in every other respect — and note this is never used as a gate on the data. '
+        'NOT SHOWN: absolute quality. Top of this figure means worst in this dataset, which '
+        'in a clean dataset still means acceptable.',
 }
+
+# Filled into the slots above. A dataset absent here gets empty strings, so its captions keep
+# the principle and drop the illustration rather than borrowing another dataset's.
+EXAMPLES = {
+    'imove': {
+        'session_sizes': ' Here the five long-walk sessions carry 7 sensors against the '
+                         'other 21 sessions\' 15.',
+        'coverage_blocks': ' Blocks of missing coverage are protocol, not fault: the '
+                           'treadmill activities instrument the right leg only, and the '
+                           'long-walk sessions have no High or Low placements.',
+        'replicate_case': ' The case this exists to catch here: three sensors (High, Mid, '
+                          'Low) are mounted on one segment and all three share a single '
+                          'marker reconstruction, so a reconstruction metric counted per '
+                          'sensor would treble-count one measurement.',
+        'mid_trial_gaps': ' The long-walk sessions are expected to lead: one inertial record '
+                          'spans three mocap takes there, so the gaps between takes are real '
+                          'absences of ground truth rather than faults.',
+    },
+    'alborno': {
+        'session_sizes': ' Here every session carries the same 8 sensors, bar Subject05, '
+                         'which is missing one.',
+        'coverage_blocks': '',
+        'replicate_case': ' Every sensor here has its own segment and its own '
+                          'reconstruction, so no grouping is expected to be dependent.',
+        'mid_trial_gaps': '',
+    },
+}
+
+
+def _dominant_trial(sections: pd.DataFrame) -> Tuple[str, float]:
+    """The trial name holding the largest share of these runs, and that share."""
+    counts = sections.trial.value_counts()
+    return str(counts.index[0]), float(counts.iloc[0] / counts.sum())
+
+
+def captions_for(dataset: str) -> Dict[str, str]:
+    """The captions with this dataset's examples substituted in."""
+    slots = {'session_sizes': '', 'coverage_blocks': '', 'replicate_case': '',
+             'icc_threshold': ICC_DEPENDENT}
+    slots.update(EXAMPLES.get(dataset, {}))
+    return {name: template.format(**slots)
+            for name, template in _CAPTION_TEMPLATES.items()}
+
 
 
 def _dataset_dir(dataset: str) -> Path:
@@ -369,7 +419,7 @@ def plot_data_state(tables: Dict[str, pd.DataFrame], dataset: str, save: bool,
               f"grey = built, unscored ({int(unscored.sum())}) · white = not in that session")
     finalize_and_save_plot(figure, f'What loaded, and what looks suspect — {dataset}',
                            'data_state.png', plots_dir=_plots_dir(dataset),
-                           caption=CAPTIONS['data_state.png'], epilog=epilog, save=save, show=show)
+                           caption=captions_for(dataset)['data_state.png'], epilog=epilog, save=save, show=show)
 
 
 # ------------------------------------------------------------------ is the truth trustworthy?
@@ -423,7 +473,7 @@ def plot_reconstruction(tables: Dict[str, pd.DataFrame], dataset: str, save: boo
 
     finalize_and_save_plot(fig, f'Ground-truth quality — {dataset}',
                            'reconstruction.png', plots_dir=_plots_dir(dataset),
-                           caption=CAPTIONS['reconstruction.png'],
+                           caption=captions_for(dataset)['reconstruction.png'],
                            epilog=_coverage(tables), save=save, show=show)
 
 
@@ -471,48 +521,75 @@ def plot_sync_and_timeline(tables: Dict[str, pd.DataFrame], dataset: str, save: 
 
     finalize_and_save_plot(fig, f'Synchronization and timeline — {dataset}',
                            'sync_timeline.png', plots_dir=_plots_dir(dataset),
-                           caption=CAPTIONS['sync_timeline.png'],
+                           caption=captions_for(dataset)['sync_timeline.png'],
                            epilog=_coverage(tables), save=save, show=show)
 
 
 def plot_alignment(tables: Dict[str, pd.DataFrame], dataset: str, save: bool,
                    show: bool) -> None:
-    """The sensor-to-segment rotation, which the build solves and has never reported.
+    """How well the fitted rotation reconciles the two gyro signals -- not what it was.
 
-    The left panel is the conditioning caveat that RESIDUAL_WARN_DEG_S cannot express: a plate
-    with few valid frames yields a small residual and a meaningless rotation, and the absolute
-    residual alone cannot tell that apart from a well-aligned plate.
-
-    The right panel asks whether the rotations are a mounting convention or a fit that found
-    something else -- an offset near a coordinate axis is a sensor clipped in the wrong way
-    round, an arbitrary direction is not.
+    THE ANGLE IS NOT THE QUALITY. This figure used to lead with `offset_angle_deg`, which is
+    how far the sensor was mounted from the segment frame: a fact about the hardware that says
+    nothing about whether the fit worked. What answers that is the fit's own residual, and
+    normalized by the measured signal so a static pose and a sprint are comparable.
     """
     alignment = tables.get('alignment')
-    if alignment is None or alignment.empty or 'offset_angle_deg' not in alignment:
+    if alignment is None or alignment.empty:
         return
+    has_residual = 'residual_fraction_of_signal' in alignment
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5))
 
-    if 'n_frames_used' in alignment:
-        axes[0].scatter(alignment['n_frames_used'], alignment['offset_angle_deg'],
+    if has_residual and 'n_frames_used' in alignment:
+        axes[0].scatter(alignment['n_frames_used'],
+                        alignment['residual_fraction_of_signal'],
                         s=10, alpha=0.4, color='#4477aa')
         axes[0].set_xscale('log')
+        axes[0].set_yscale('log')
+        axes[0].axhline(1.0, color='crimson', linestyle='--', linewidth=1)
+        axes[0].text(alignment['n_frames_used'].min(), 1.05,
+                     ' explains nothing', color='crimson', fontsize=8)
         axes[0].set_xlabel('valid frames the rotation was fitted on (log)')
-        axes[0].set_ylabel('sensor-to-segment offset (deg)')
-        axes[0].set_title('Alignment vs how much data supported it')
+        axes[0].set_ylabel('residual / measured gyro RMS (log)')
+        axes[0].set_title('Alignment quality vs how much data supported it')
         axes[0].grid(alpha=0.3)
 
+    if has_residual and 'gyro_residual_before_deg_s' in alignment:
+        before = alignment['gyro_residual_before_deg_s']
+        after = alignment['gyro_residual_after_deg_s']
+        axes[1].scatter(before, after, s=10, alpha=0.4, color='#228833')
+        span = [min(before.min(), after.min()), max(before.max(), after.max())]
+        axes[1].plot(span, span, color='grey', linestyle='--', linewidth=1)
+        axes[1].text(span[1], span[1], ' no improvement', color='grey', fontsize=8,
+                     ha='right', va='bottom')
+        axes[1].set_xscale('log')
+        axes[1].set_yscale('log')
+        axes[1].set_xlabel('residual before the rotation (deg/s, log)')
+        axes[1].set_ylabel('residual after (deg/s, log)')
+        axes[1].set_title('What the rotation bought')
+        axes[1].grid(alpha=0.3)
+
     if 'angle_to_nearest_plate_axis_deg' in alignment:
-        axes[1].hist(alignment['angle_to_nearest_plate_axis_deg'].dropna(), bins=40,
+        axes[2].hist(alignment['angle_to_nearest_plate_axis_deg'].dropna(), bins=40,
                      color='#ee6677', edgecolor='white')
-        axes[1].set_xlabel('angle from rotation axis to nearest coordinate axis (deg)')
-        axes[1].set_ylabel('plates')
-        axes[1].set_title('Mounting convention, or an arbitrary fit?')
-        axes[1].grid(alpha=0.3, axis='y')
+        axes[2].set_xlabel('angle from rotation axis to nearest coordinate axis (deg)')
+        axes[2].set_ylabel('plates')
+        axes[2].set_title('Mounting convention, or an arbitrary fit?')
+        axes[2].grid(alpha=0.3, axis='y')
+
+    if not has_residual:
+        # Rather than an empty pair of panels: the metric is written at build time, so a tree
+        # built before it existed simply has no rows and the figure cannot invent them.
+        for axis in axes[:2]:
+            axis.text(0.5, 0.5, 'no residual recorded —\nrebuild to collect it',
+                      ha='center', va='center', fontsize=11, color='#888888')
+            axis.set_xticks([])
+            axis.set_yticks([])
 
     finalize_and_save_plot(fig, f'Sensor-to-segment alignment — {dataset}',
                            'alignment.png', plots_dir=_plots_dir(dataset),
-                           caption=CAPTIONS['alignment.png'],
+                           caption=captions_for(dataset)['alignment.png'],
                            epilog=_coverage(tables), save=save, show=show)
 
 
@@ -545,7 +622,7 @@ def plot_replicate_structure(tables: Dict[str, pd.DataFrame], dataset: str, save
 
     finalize_and_save_plot(fig, f'Replicate structure — {dataset}',
                            'replicate_structure.png', plots_dir=_plots_dir(dataset),
-                           caption=CAPTIONS['replicate_structure.png'],
+                           caption=captions_for(dataset)['replicate_structure.png'],
                            epilog=_coverage(tables), save=save, show=show)
 
 
@@ -589,7 +666,7 @@ def plot_health(tables: Dict[str, pd.DataFrame], dataset: str, save: bool,
 
     finalize_and_save_plot(fig, f'Worst trials, with components — {dataset}',
                            'health.png', plots_dir=_plots_dir(dataset),
-                           caption=CAPTIONS['health.png'],
+                           caption=captions_for(dataset)['health.png'],
                            epilog=_coverage(tables), save=save, show=show)
 
 
@@ -611,7 +688,7 @@ def _embedded_figure(dataset: str, filename: str, heading: str) -> list:
         relative = Path('../..') / figure.relative_to(paths.REPO_ROOT)
     return [f'## {heading}', '',
             f'![{heading}]({relative.as_posix()})', '',
-            f'**Figure — {filename}.** {CAPTIONS.get(filename, "")}', '']
+            f'**Figure — {filename}.** {captions_for(dataset).get(filename, "")}', '']
 
 
 def write_report(tables: Dict[str, pd.DataFrame], dataset: str) -> Path:
@@ -669,10 +746,10 @@ def write_report(tables: Dict[str, pd.DataFrame], dataset: str) -> Path:
     if not coverage.empty:
         lines += ['## What is included, and what is not', '',
                   'The build FAILS SOFT on a segment it cannot track, which is deliberate — '
-                  'IMoVE’s treadmill trials drop whole marker groups, and a reader has to be '
-                  'able to distinguish "not tracked here" from "this trial failed". The cost '
-                  'is that a trial builds successfully with fewer plates than expected and '
-                  'nothing says so. This is where it says so.', '',
+                  'some protocols drop whole marker groups, and a reader has to be able to '
+                  'distinguish "not tracked here" from "this trial failed". The cost is that '
+                  'a trial builds successfully with fewer plates than expected and nothing '
+                  'says so. This is where it says so.', '',
                   'Every row below is a sensor that the rest of the dataset has and this trial '
                   'does not, so `expected` is empirical rather than a hardcoded roster.', '']
         counts = coverage.status.value_counts()
@@ -781,10 +858,13 @@ def write_report(tables: Dict[str, pd.DataFrame], dataset: str) -> Path:
 
         middle = sections[(sections.position == 'middle') & (~sections.short)]
         if not middle.empty:
+            # Which trials dominate is derived rather than asserted. The claim used to be
+            # that the long-walk sessions do, which is true of IMoVE and meaningless on a
+            # dataset that has none -- and it was printed either way.
+            worst_trial, worst_share = _dominant_trial(middle)
+            note = EXAMPLES.get(dataset, {}).get('mid_trial_gaps', '')
             lines += [f'### Longest mid-trial gaps ({len(middle)} runs)', '',
-                      'The long-walk sessions dominate here by design: one inertial record '
-                      'spans three mocap takes, so the gaps between takes are real absences of '
-                      'ground truth rather than faults.', '',
+                      f'`{worst_trial}` accounts for {worst_share:.0%} of them.{note}', '',
                       '| subject | trial | plate | frames | at index | of |',
                       '| --- | --- | --- | --- | --- | --- |']
             for row in middle.nlargest(15, 'length').itertuples():
