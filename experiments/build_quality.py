@@ -174,10 +174,17 @@ def plate_diagnostics(dataset: str) -> pd.DataFrame:
     `n_suspect_plates` -- a count of how many crossed 25 deg/s. The distribution behind that
     threshold, and therefore any justification for it, was invisible.
 
-    Two of these are calibration checks nobody was looking at. `acc_norm_static_median` should
-    sit near 9.81 on any plate that ever holds still, and a systematic departure is a scale
-    error that propagates into every acceleration comparison. `mag_norm_median` bears directly
-    on the heading-dependent ||mag|| artifact.
+    `acc_norm_static_median` is the calibration check nobody was looking at: it should sit near
+    9.81 on any plate that ever holds still, and a systematic departure is a scale error that
+    propagates into every acceleration comparison.
+
+    THE MAGNETOMETER NORM IS DELIBERATELY NOT HERE. It used to be, and it was not a usable
+    flag: ||mag|| is exported in units normalized to each sensor's own calibration field, so
+    the 0.89 it read says more about where the sensors were calibrated than about the data.
+    It groups by SENSOR (ICC 0.43) rather than by session (0.09) or by height above the lab
+    floor (0.01), which is the opposite of what a local field anomaly would do. The magnetic
+    field is analysed properly in experiments/global_assumptions.py; a per-plate median here
+    only invited reading a calibration constant as a data defect.
 
     EVERY ROW CARRIES ITS TRIAL'S CACHE STATUS, because a manifest is read whether or not its
     artifact is current and a stale one is in whatever format the build that wrote it used.
@@ -662,8 +669,8 @@ def run(dataset: str, only_tables: Optional[List[str]] = None) -> Dict[str, pd.D
                   f"— their manifests predate these metrics)")
         for column, target in (('residual_fraction', None),
                                ('gyro_residual_lowpass_rms_deg_s', None),
-                               ('acc_norm_static_median', 9.81), ('acc_scale_error', 0.0),
-                               ('mag_norm_median', 1.0)):
+                               ('acc_norm_static_median', 9.81),
+                               ('acc_scale_error', 0.0)):
             if column not in current:
                 continue
             values = current[column].dropna()

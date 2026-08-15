@@ -571,7 +571,6 @@ def trial_diagnostics(plates: Dict[str, PlateTrial]) -> Dict[str, Any]:
         per_plate[name] = {
             'n_frames': len(plate),
             'acc_norm_median': float(np.median(np.linalg.norm(plate.imu_trace.acc, axis=1))),
-            'mag_norm_median': float(np.median(np.linalg.norm(plate.imu_trace.mag, axis=1))),
             **_static_calibration(plate),
             # What shift_world_origin moved this plate's pose by, so the shift is auditable
             # and a re-derivation can add it back. Without it a refit measures the RESIDUAL
