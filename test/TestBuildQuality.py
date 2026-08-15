@@ -339,3 +339,52 @@ class TestEveryFigureIsCaptioned(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestUnsyncableTrialsAreExcluded(unittest.TestCase):
+    """The static poses are not enumerated, so nothing builds, loads or scores them.
+
+    A held pose has no motion, and every step of the correspondence between IMU and mocap
+    depends on there being some. The lag is found by cross-correlating the measured gyro
+    against the marker-derived one, and on all 26 static poses that either fails outright --
+    19 of them, with per-plate estimates scattered over 1.2-4.1 s -- or returns a number
+    from noise. The 7 that returned one are the worse case: 96 of their 97 plates carry an
+    alignment residual above half their own signal, median 0.88, meaning the fitted rotation
+    explains about a tenth of the motion. A confident wrong answer beats an honest failure
+    only in the build log.
+
+    Excluded at enumeration rather than left to fail, because a trial that is not enumerated
+    is not built, not counted in coverage and not scored -- which is the honest state for data
+    whose ground-truth correspondence cannot be established. Nothing is deleted.
+    """
+
+    def test_no_static_pose_is_enumerated(self):
+        from src.toolchest.building.sources import get_source
+        trials = list(get_source('imove').enumerate_trials())
+        self.assertTrue(trials, 'the source enumerated nothing at all')
+        self.assertEqual([t for _, t in trials if 'static' in t], [])
+
+    def test_the_exclusion_names_what_it_drops(self):
+        """A bare filter expression would leave the next reader guessing which trials vanished
+        and why they are not in any table."""
+        from src.toolchest.building.sources import UNSYNCABLE_TRIALS
+        self.assertIn('t0_static_pose_001', UNSYNCABLE_TRIALS)
+
+    def test_everything_else_still_enumerates(self):
+        """The guard against an over-broad match taking real trials with it."""
+        from src.toolchest.building.sources import get_source
+        trials = list(get_source('imove').enumerate_trials())
+        names = {t for _, t in trials}
+        for expected in ('t1_walking_001', 't6_drop_jump_001', 't12_longwalk_001',
+                         't3_treadmill_running_001'):
+            self.assertIn(expected, names)
+
+    def test_the_raw_recordings_are_untouched(self):
+        """Excluded from the pipeline, not removed from the dataset. A static pose is still
+        the natural place to measure a sensor noise floor, and anything doing that reads the
+        raw files and needs no mocap correspondence."""
+        from src.toolchest.building.sources import IMOVE_ROOT
+        if not IMOVE_ROOT.is_dir():
+            self.skipTest('no IMoVE source data')
+        found = list(IMOVE_ROOT.glob('s*/imu_data/t0_static_pose_001-000_*.txt'))
+        self.assertTrue(found, 'the source recordings should still be on disk')

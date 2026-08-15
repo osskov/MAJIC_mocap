@@ -93,6 +93,31 @@ def _imove_dir(session: str, trial: str) -> Path:
     return IMOVE_ROOT / session
 
 
+# Inertial records this dataset has but this pipeline does not carry, with the reason.
+#
+# THE STATIC POSES CANNOT BE SYNCED, and that is not a bug to work around. Every trial's
+# IMU-to-mocap lag is found by cross-correlating the measured gyroscope against the angular
+# velocity implied by the markers, and a held pose has neither: all 19 fail with per-plate lag
+# estimates scattered over 1.2-4.1 s, because there is no motion for a correlation peak to
+# form on. Their alignment is unverifiable for the same reason -- the fitted sensor-to-segment
+# rotation comes out with a residual of 1.006 times the signal, meaning it explains none of it.
+#
+# So they are excluded HERE rather than left to fail 19 times per build. A trial that is not
+# enumerated is not built, not loaded, not counted in coverage and not scored, which is the
+# honest state for data whose ground-truth correspondence cannot be established.
+#
+# This is a pipeline decision, not a claim that the recordings are worthless: a static pose is
+# still the natural place to measure a sensor noise floor or a bias, and anything doing that
+# reads the raw files directly and needs no mocap correspondence at all.
+#
+# NOTHING IS DELETED. The source recordings are untouched, and the 18 parquets an earlier build
+# left in results/trials/imove stay where they are -- excluded from enumeration, so no build
+# writes them, no table counts them and no loader reaches them, but still on disk if the
+# exclusion is ever revisited. They are stale against the current digest as well, so even a
+# direct load_trial by name raises rather than returning them.
+UNSYNCABLE_TRIALS = ('t0_static_pose_001',)
+
+
 def _imove_trials() -> List[Tuple[str, str]]:
     """Every (session, inertial record) that has both IMU files and a mocap take.
 
@@ -102,7 +127,8 @@ def _imove_trials() -> List[Tuple[str, str]]:
     mocap instead would claim three trials where there is one recording.
 
     Skips inertial records with no mocap at all -- the long-walk sessions also carry
-    t2_treadmill_walking and t7_cmjdl IMU files that were never mocapped.
+    t2_treadmill_walking and t7_cmjdl IMU files that were never mocapped -- and the static
+    poses, which have no motion to sync on. See UNSYNCABLE_TRIALS.
     """
     found = []
     for session_dir in sorted(p for p in IMOVE_ROOT.glob('s*') if p.is_dir()):
@@ -111,6 +137,8 @@ def _imove_trials() -> List[Tuple[str, str]]:
             continue
         records = sorted({p.name.split('-000_')[0] for p in imu_dir.glob('*-000_*.txt')})
         for trial in records:
+            if trial in UNSYNCABLE_TRIALS:
+                continue
             if imove_mocap.mocap_takes_for(session_dir, trial):
                 found.append((session_dir.name, trial))
     return found
