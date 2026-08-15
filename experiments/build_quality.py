@@ -520,7 +520,10 @@ def _report_decimation_cost(tables: Dict[str, pd.DataFrame]) -> None:
         return
     _header(8, "Decimation cost", "what the trial rate discarded, and where")
     if 'target_rate_hz' in table:
-        rates = table.target_rate_hz.dropna()
+        # Rounded before counting. The rate is derived from a median sample interval, so a
+        # 40 Hz trial can land on 39.99999999999999 and print as a second, identical-looking
+        # "40.0" row -- which reads as two populations where there is one.
+        rates = table.target_rate_hz.dropna().round(6)
         if not rates.empty:
             print("  trials by target rate:")
             print(rates.value_counts().sort_index().to_string())

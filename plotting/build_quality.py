@@ -550,9 +550,9 @@ def plot_alignment(tables: Dict[str, pd.DataFrame], dataset: str, save: bool,
         axes[0].axhline(1.0, color='crimson', linestyle='--', linewidth=1)
         axes[0].text(alignment['n_frames_used'].min(), 1.05,
                      ' explains nothing', color='crimson', fontsize=8)
-        axes[0].set_xlabel('valid frames the rotation was fitted on (log)')
-        axes[0].set_ylabel('residual / measured gyro RMS (log)')
-        axes[0].set_title('Alignment quality vs how much data supported it')
+        axes[0].set_xlabel('valid frames the rotation was fitted on (log)', fontsize=9)
+        axes[0].set_ylabel('residual / measured gyro RMS (log)', fontsize=9)
+        axes[0].set_title('Alignment quality vs how much data supported it', fontsize=11)
         axes[0].grid(alpha=0.3)
 
     if has_residual and 'gyro_residual_before_deg_s' in alignment:
@@ -565,17 +565,18 @@ def plot_alignment(tables: Dict[str, pd.DataFrame], dataset: str, save: bool,
                      ha='right', va='bottom')
         axes[1].set_xscale('log')
         axes[1].set_yscale('log')
-        axes[1].set_xlabel('residual before the rotation (deg/s, log)')
-        axes[1].set_ylabel('residual after (deg/s, log)')
-        axes[1].set_title('What the rotation bought')
+        axes[1].set_xlabel('residual before the rotation (deg/s, log)', fontsize=9)
+        axes[1].set_ylabel('residual after (deg/s, log)', fontsize=9)
+        axes[1].set_title('What the rotation bought', fontsize=11)
         axes[1].grid(alpha=0.3)
 
     if 'angle_to_nearest_plate_axis_deg' in alignment:
         axes[2].hist(alignment['angle_to_nearest_plate_axis_deg'].dropna(), bins=40,
                      color='#ee6677', edgecolor='white')
-        axes[2].set_xlabel('angle from rotation axis to nearest coordinate axis (deg)')
-        axes[2].set_ylabel('plates')
-        axes[2].set_title('Mounting convention, or an arbitrary fit?')
+        axes[2].set_xlabel('angle from rotation axis to nearest coordinate axis (deg)',
+                       fontsize=9)
+        axes[2].set_ylabel('plates', fontsize=9)
+        axes[2].set_title('Mounting convention, or an arbitrary fit?', fontsize=11)
         axes[2].grid(alpha=0.3, axis='y')
 
     if not has_residual:
