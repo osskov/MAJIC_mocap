@@ -402,7 +402,12 @@ def joint_lag(pairs: List[Tuple[IMUTrace, WorldTrace]], expected_lag_s: float,
     if not curves:
         return float('nan'), float('nan'), []
 
-    individual = [float(lags[int(np.argmax(correlation))]) for lags, correlation in curves]
+    # Each sensor's own best lag INSIDE THE BRACKET, which is what the previous per-sensor
+    # method would have used. Taken unbracketed it reads 4.4 s of disagreement on a trial
+    # whose bracket is only 0.5 s wide -- true of the global peaks, but not a statement about
+    # anything this function does or the old one did.
+    individual = [_peak_within(lags, correlation, expected_lag_s, bracket_s)[0]
+                  for lags, correlation in curves]
     if len(curves) == 1:
         lags, correlation = curves[0]
         return _peak_within(lags, correlation, expected_lag_s, bracket_s) + (individual,)
@@ -658,6 +663,29 @@ def load_trial(subject: str, key: str, report=None) -> Dict[str, PlateTrial]:
     sources = {sensor: (bone, site, _on_grid(imu, grid, rate), vicon)
                for sensor, (bone, site, imu, vicon) in sources.items()}
 
+    # ONE BIPLANE LAG FOR THE TRIAL, for the same reason there is one Vicon lag. The offset
+    # being estimated is the fluoroscopy system's PRE-TRIGGER BUFFER -- a property of the
+    # hardware, measured at 2.98 +/- 0.06 s -- so the femur and the tibia cannot have
+    # different ones. Estimated per bone they routinely do: only 119 of 378 trials had the two
+    # agreeing to 0.01 s, the p95 disagreement was 0.44 s against a bracket of only 0.5, and
+    # the pair that disagreed worst are exactly the plates still failing the window check.
+    #
+    # Matched in VICON'S OWN time base, both traces starting near zero. Correlating the
+    # absolute-epoch Vicon trace against the relative biplane one put the true lag 1.6e9
+    # outside the bracket, so the search silently returned nothing and the constant was used
+    # unchecked -- the sort of quiet fallback the peak-to-sidelobe figure exists to expose.
+    biplane_worlds = {sensor: _biplane_world(subject, session, block, trial, bone)
+                      for sensor, (bone, _, _, _) in sources.items()}
+    biplane_pairs = [(_as_imu(sources[sensor][3]), world)
+                     for sensor, world in biplane_worlds.items() if world is not None]
+    if biplane_pairs:
+        biplane_lag, biplane_ratio, biplane_individual = joint_lag(
+            biplane_pairs, BIPLANE_PRETRIGGER_S, bracket_s=BIPLANE_PRETRIGGER_BRACKET_S)
+    else:
+        biplane_lag, biplane_ratio, biplane_individual = float('nan'), float('nan'), []
+    if not np.isfinite(biplane_lag):
+        biplane_lag, biplane_ratio = BIPLANE_PRETRIGGER_S, float('nan')
+
     plates: Dict[str, PlateTrial] = {}
     for sensor, (bone, site, imu, vicon) in sources.items():
         plates[f'{sensor}__vicon'] = _as_plate(
@@ -665,19 +693,9 @@ def load_trial(subject: str, key: str, report=None) -> Dict[str, PlateTrial]:
             WorldTrace(vicon.timestamps + vicon_start, vicon.positions, vicon.rotations,
                        valid=vicon.valid), origin)
 
-        biplane = _biplane_world(subject, session, block, trial, bone)
+        biplane = biplane_worlds.get(sensor)
         if biplane is None:
             continue
-        # Matched in VICON'S OWN time base, both traces starting near zero. Correlating the
-        # absolute-epoch Vicon trace against the relative biplane one put the true lag 1.6e9
-        # outside the bracket, so the search silently returned nothing and the constant was
-        # used unchecked -- which is exactly the sort of quiet fallback the peak-to-sidelobe
-        # figure exists to expose.
-        biplane_lag, biplane_ratio = bracketed_lag(
-            _as_imu(vicon), biplane, BIPLANE_PRETRIGGER_S,
-            bracket_s=BIPLANE_PRETRIGGER_BRACKET_S)
-        if not np.isfinite(biplane_lag):
-            biplane_lag, biplane_ratio = BIPLANE_PRETRIGGER_S, float('nan')
 
         plates[f'{sensor}__biplane'] = _as_plate(
             f'{sensor}__biplane', imu,
@@ -690,6 +708,8 @@ def load_trial(subject: str, key: str, report=None) -> Dict[str, PlateTrial]:
                        vicon_lag_spread_s=float(np.ptp(lags)) if len(lags) > 1 else 0.0,
                        vicon_peak_to_sidelobe=float(np.median(ratios)) if ratios else np.nan,
                        biplane_lag_s=biplane_lag,
+                       biplane_lag_spread_s=(float(np.ptp(biplane_individual))
+                                             if len(biplane_individual) > 1 else 0.0),
                        biplane_peak_to_sidelobe=biplane_ratio,
                        biplane_sync_weak=bool(not np.isfinite(biplane_ratio)
                                               or biplane_ratio < MIN_PEAK_TO_SIDELOBE))
