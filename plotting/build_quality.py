@@ -48,6 +48,138 @@ FOOT_TOLERANCE_MM = 25.0
 RESIDUAL_WARN_DEG_S = 25.0
 
 
+# One caption per figure, keyed by filename, so the text rendered onto the PNG and the text
+# in the markdown report cannot drift apart. Each says what is plotted, how to read it, and
+# what it does NOT show -- a figure travels into a slide or a message without the code or the
+# report section that explains it, and arrives having to stand on its own.
+CAPTIONS = {
+    'data_state.png':
+        'Triage view of the whole dataset: every session (rows) against every activity '
+        '(columns). LEFT: how many sensors each trial produced as a fraction of what that '
+        'session can produce, with the raw count in the cell and the session expectation in '
+        'the row label. The denominator is per session on purpose — the long-walk sessions '
+        'carry 7 sensors rather than 15, and scoring them against the dataset-wide roster '
+        'would show complete sessions as half broken. MIDDLE: the composite health score — '
+        'the equally-weighted mean of five build diagnostics, each rescaled to [0, 1] across '
+        'this dataset: the worst segment\'s marker-fit residual (mm), the largest fraction of '
+        'frames with untrustworthy ground truth, how much the trial\'s plates disagreed about '
+        'the IMU-to-mocap lag (s), how far apart the plates think the trial starts (s), and '
+        'the spread in fitted sensor-to-segment angle across plates (deg). Because the '
+        'rescaling is within-dataset, the darkest cell is the worst trial HERE and not a bad '
+        'trial in absolute terms; a dataset with no problems would still have a darkest cell. '
+        'See health.png for the components plotted separately. RIGHT: each session\'s mean '
+        'health, the fastest way to see which sessions are more and less suspect. '
+        'Hatched = the trial did not build. Grey = '
+        'it built but scored nothing, which is every static-pose trial, having no motion for '
+        'the sync and alignment components to measure. White = no such trial in that '
+        'session. Blocks of missing coverage are protocol, not fault: the treadmill '
+        'activities instrument the right leg only. NOT SHOWN: anything about accuracy — a '
+        'fully covered, low-health trial can still carry a systematic error, since every '
+        'component here is internal consistency rather than agreement with a reference.',
+    'reconstruction.png':
+        'Whether the marker-derived ground truth can be trusted, before any comparison with '
+        'an IMU. A segment\'s pose is recovered by fitting a rigid template to its markers, '
+        'and both panels measure how well that fit went. LEFT: empirical CDF (y = fraction of '
+        'segment-trials at or below x) of `median fit residual`, the median over frames of '
+        'the root-mean-square distance in MILLIMETRES between where each marker was seen and '
+        'where the rigid template puts it. Small means the segment really did move as one '
+        'rigid body; large means the markers moved relative to each other, so the derived '
+        'pose is not trustworthy. Log x. The dashed lines are the tolerances the build itself '
+        'applied — 10 mm for a marker cluster, 25 mm for a foot — so a residual is read '
+        'against the threshold that governed it rather than an eyeballed scale. Foot segments '
+        'are drawn separately because they deform: their tolerance is looser by design and '
+        'pooling them with clusters would make the distribution meaningless. RIGHT: the '
+        'twenty segments with the lowest `valid fraction`, the proportion of frames whose '
+        'residual came in under tolerance, i.e. the share of the trial where that segment\'s '
+        'pose is usable at all. Whiskers at p5–p95. A low valid fraction and a low residual '
+        'together mean the fit succeeded on the few frames it had, which is weaker evidence '
+        'than a low residual alone suggests. NOT SHOWN: WHERE in a trial the invalid frames '
+        'sit — an edge gap is coverage and a mid-trial gap corrupts a joint angle, and that '
+        'distinction is in the invalid_sections table.',
+    'sync_timeline.png':
+        'Whether the build put a trial\'s plates on one clock. The IMU and the mocap are '
+        'recorded on separate clocks, and the offset between them — the LAG — is estimated '
+        'per plate by cross-correlating the measured gyroscope against the angular velocity '
+        'differentiated from the marker-derived pose. Both panels show quantities the build '
+        'otherwise reduces to a single number per trial, which is what hid them. LEFT: the '
+        'twenty-five worst trials by sync disagreement. Each point is one plate\'s '
+        '`|per-plate lag − trial median|` in SECONDS: how far that plate\'s lag estimate fell '
+        'from the median of the trial\'s plates. All the plates were recorded in one session '
+        'on one clock, so the true value is zero for every point — anything visible is the '
+        'estimator failing, usually because the trial has too little motion for the '
+        'cross-correlation to find a peak. Symlog x, so agreement at the microsecond level '
+        'and disagreement at the second level are both readable. RIGHT: `plate first-valid − '
+        'trial origin`, seconds between the trial\'s shared t = 0 and the first frame on '
+        'which that plate has trustworthy ground truth; log counts on y. Zero is the '
+        'expected value and the bar at zero holds most plates. A plate that starts late '
+        'spends that long on a held pose while sharing the other plates\' clock, which is '
+        'the s16 defect as a routine measurement. NOT SHOWN: clock DRIFT within a trial. '
+        'Every lag here is one constant per plate, and the ~20 ppm relative drift measured '
+        'over a long-walk record — about 11 ms over 540 s — is in none of these numbers.',
+    'alignment.png':
+        'The sensor-to-segment rotation, which the build solves for every plate and never '
+        'reported until now. A sensor is mounted on its segment in an unknown orientation, so '
+        'the build fits the single rotation that best carries the marker-derived angular '
+        'velocity onto the measured gyroscope; both panels describe that fitted rotation, one '
+        'point per plate. LEFT: `sensor-to-segment offset` in DEGREES, the total angle of '
+        'that rotation, against `valid frames the rotation was fitted on`, the number of '
+        'frames where both signals were trustworthy (log x). This is the conditioning caveat '
+        'a residual threshold cannot express: a plate with few valid frames yields a small '
+        'residual and a meaningless rotation, and the residual alone cannot tell that apart '
+        'from a well-aligned plate. Read the left edge with suspicion regardless of where the '
+        'point sits vertically. RIGHT: `angle from rotation axis to nearest coordinate axis` '
+        'in degrees — treating the fitted rotation as an axis and an angle, how far that axis '
+        'lies from the closest of the plate\'s own x, y, z. Zero means the sensor was rotated '
+        'about one of the plate\'s own axes, which is what clipping a sensor on in one of a '
+        'few fixed orientations produces. A pile-up near zero therefore means the rotations '
+        'are a mounting convention; a flat spread means the fit found something that is not. '
+        'NOT SHOWN: whether the rotation is CORRECT. Nothing here compares it to an '
+        'independent measurement of how the sensor was actually mounted, because no such '
+        'measurement exists in either dataset.',
+    'replicate_structure.png':
+        'The measured intraclass correlations behind the blocking, published rather than '
+        'asserted because the blocking changes every n in the report. The INTRACLASS '
+        'CORRELATION of a metric within a grouping is the share of that metric\'s total '
+        'variance explained by which group a measurement belongs to: 0 means members of a '
+        'group are as unlike each other as any two measurements, so each is a genuine '
+        'replicate, and 1 means they are the same measurement recorded more than once. Each '
+        'curve is the empirical CDF (y = fraction of metrics at or below x) of ICC across '
+        'metrics for one candidate grouping — placement, segment, session and so on. The '
+        f'dashed line at {ICC_DEPENDENT} is the threshold past which a grouping\'s members '
+        'are pooled into one observation instead of counted separately. The case this exists '
+        'to catch: IMoVE mounts three sensors (High, Mid, Low) on one segment and all three '
+        'share a single marker reconstruction, so a reconstruction metric counted per sensor '
+        'would treble-count one measurement and inflate every n threefold. A curve sitting '
+        'far to the right of the line is exactly that. NOT SHOWN: any significance test. '
+        'These ICCs set the blocking; they are not themselves a comparison between '
+        'treatments.',
+    'health.png':
+        'The worst twenty trials by composite health, with every component that went into '
+        'the score shown beside it — never the score alone. WHAT EACH PANEL PLOTS, left to '
+        'right: `composite`, the equally-weighted mean of the five components after each is '
+        'rescaled to [0, 1] across this dataset, so it is unitless and relative. '
+        '`worst_residual_mm`, the largest median rigid-body fit residual among the trial\'s '
+        'segments, in millimetres — how far the markers sat from the rigid shape the segment '
+        'is assumed to be, for the worst segment in that trial. `worst_invalid_fraction`, the '
+        'largest fraction of frames marked untrustworthy on any one segment, 0 to 1. '
+        '`sync_mad_s`, the median absolute deviation in SECONDS of the per-plate IMU-to-mocap '
+        'lag estimates within the trial — one recording session has one true lag, so this is '
+        'how much the plates disagreed about it, and a large value means the estimator failed '
+        'rather than that the clocks differ. `origin_spread_s`, seconds between the earliest '
+        'and latest plate\'s first valid frame, i.e. how far apart the plates think the trial '
+        'starts. `alignment_angle_spread_deg`, the standard deviation in degrees of the '
+        'fitted sensor-to-segment offset angle across the trial\'s plates — sensors mounted '
+        'the same way should agree, so spread is either genuine mounting variety or a fit '
+        'that failed on some plates. The equal weighting is a placeholder rather than a '
+        'claim: until the components are regressed against downstream joint-angle error '
+        'there is no evidence for any other weighting. Read the component bars, not the '
+        'composite — a trial can rank high on one component and be fine in every other '
+        'respect — and note this is never used as a gate on the data. NOT SHOWN: absolute '
+        'quality. Top of this figure means worst in this dataset, which in a clean dataset '
+        'still means acceptable.',
+}
+
+
 def _dataset_dir(dataset: str) -> Path:
     return paths.experiment_dir(EXPERIMENT_NAME) / dataset
 
@@ -237,7 +369,7 @@ def plot_data_state(tables: Dict[str, pd.DataFrame], dataset: str, save: bool,
               f"grey = built, unscored ({int(unscored.sum())}) · white = not in that session")
     finalize_and_save_plot(figure, f'What loaded, and what looks suspect — {dataset}',
                            'data_state.png', plots_dir=_plots_dir(dataset),
-                           epilog=epilog, save=save, show=show)
+                           caption=CAPTIONS['data_state.png'], epilog=epilog, save=save, show=show)
 
 
 # ------------------------------------------------------------------ is the truth trustworthy?
@@ -291,6 +423,7 @@ def plot_reconstruction(tables: Dict[str, pd.DataFrame], dataset: str, save: boo
 
     finalize_and_save_plot(fig, f'Ground-truth quality — {dataset}',
                            'reconstruction.png', plots_dir=_plots_dir(dataset),
+                           caption=CAPTIONS['reconstruction.png'],
                            epilog=_coverage(tables), save=save, show=show)
 
 
@@ -338,6 +471,7 @@ def plot_sync_and_timeline(tables: Dict[str, pd.DataFrame], dataset: str, save: 
 
     finalize_and_save_plot(fig, f'Synchronization and timeline — {dataset}',
                            'sync_timeline.png', plots_dir=_plots_dir(dataset),
+                           caption=CAPTIONS['sync_timeline.png'],
                            epilog=_coverage(tables), save=save, show=show)
 
 
@@ -378,6 +512,7 @@ def plot_alignment(tables: Dict[str, pd.DataFrame], dataset: str, save: bool,
 
     finalize_and_save_plot(fig, f'Sensor-to-segment alignment — {dataset}',
                            'alignment.png', plots_dir=_plots_dir(dataset),
+                           caption=CAPTIONS['alignment.png'],
                            epilog=_coverage(tables), save=save, show=show)
 
 
@@ -410,6 +545,7 @@ def plot_replicate_structure(tables: Dict[str, pd.DataFrame], dataset: str, save
 
     finalize_and_save_plot(fig, f'Replicate structure — {dataset}',
                            'replicate_structure.png', plots_dir=_plots_dir(dataset),
+                           caption=CAPTIONS['replicate_structure.png'],
                            epilog=_coverage(tables), save=save, show=show)
 
 
@@ -453,17 +589,41 @@ def plot_health(tables: Dict[str, pd.DataFrame], dataset: str, save: bool,
 
     finalize_and_save_plot(fig, f'Worst trials, with components — {dataset}',
                            'health.png', plots_dir=_plots_dir(dataset),
+                           caption=CAPTIONS['health.png'],
                            epilog=_coverage(tables), save=save, show=show)
 
 
 # ------------------------------------------------------------------------------ the deliverable
 
+def _embedded_figure(dataset: str, filename: str, heading: str) -> list:
+    """One figure and its caption as markdown lines, or nothing if it has not been rendered.
+
+    The caption comes from CAPTIONS, the same string the PNG carries, so the two cannot drift.
+    An absent figure is skipped silently rather than left as a broken image link: --report-only
+    is a supported way to run this, and it does not render anything.
+    """
+    figure = _plots_dir(dataset) / filename
+    if not figure.exists():
+        return []
+    try:
+        relative = figure.relative_to(paths.REPO_ROOT / 'results' / 'reports')
+    except ValueError:
+        relative = Path('../..') / figure.relative_to(paths.REPO_ROOT)
+    return [f'## {heading}', '',
+            f'![{heading}]({relative.as_posix()})', '',
+            f'**Figure — {filename}.** {CAPTIONS.get(filename, "")}', '']
+
+
 def write_report(tables: Dict[str, pd.DataFrame], dataset: str) -> Path:
     """The markdown report.
 
-    Markdown rather than HTML because it diffs in git: a diff of this file after a pipeline
-    change is exactly the review you want, and is the reason it is committed while the parquets
-    are not.
+    Markdown rather than HTML because it is diffable: comparing this file before and after a
+    pipeline change is exactly the review you want.
+
+    It is NOT in version control, though — `results/` is gitignored, as is `plots/`, so both
+    this file and the figures it embeds are build products. An earlier version of this
+    docstring claimed the opposite. Keeping a copy across a pipeline change therefore means
+    copying it somewhere else first.
     """
     index = tables.get('index', pd.DataFrame())
     summary = tables.get('summary', pd.DataFrame())
@@ -488,22 +648,11 @@ def write_report(tables: Dict[str, pd.DataFrame], dataset: str) -> Path:
                 f'before the instrumentation existed is still valid and simply has no '
                 f'tier-1 data. Rebuild to fill them in.', '']
 
-    # The only figure the report embeds. It is the one that answers "what state is this
-    # dataset in" without reading anything else, so it belongs above the tables rather than
-    # in a gallery at the end; the rest are for questions you already know to ask.
-    figure = _plots_dir(dataset) / 'data_state.png'
-    if figure.exists():
-        try:
-            relative = figure.relative_to(paths.REPO_ROOT / 'results' / 'reports')
-        except ValueError:
-            relative = Path('../..') / figure.relative_to(paths.REPO_ROOT)
-        lines += ['## At a glance', '',
-                  f'![What loaded, and what looks suspect]({relative.as_posix()})', '',
-                  'Left: how much of each session every trial produced, against what that '
-                  'session can produce — the long-walk sessions carry 7 sensors by design, '
-                  'not 15, so scoring them against the dataset-wide roster would show them '
-                  'as half broken. Right: the triage composite, which is normalized within '
-                  'this dataset and is therefore a ranking rather than a verdict.', '']
+    # data_state goes here, above the tables, because it answers "what state is this dataset
+    # in" without reading anything else. The rest are gathered at the end: they answer
+    # questions you already know to ask, and interleaving them with the tables would put a
+    # figure between a claim and the numbers behind it.
+    lines += _embedded_figure(dataset, 'data_state.png', 'At a glance')
 
     if not health.empty and 'health' in health:
         ranked = health.dropna(subset=['health']).head(3)
@@ -567,19 +716,23 @@ def write_report(tables: Dict[str, pd.DataFrame], dataset: str) -> Path:
                 systematic.sort(key=lambda row: (row[3] == 'neither', row[0], row[1]))
                 lines += ['### Sensors missing from EVERY session of an activity',
                           '',
-                          'Not dropouts. A sensor absent from all sessions of one activity is '
-                          'a property of how that activity was recorded, and any claim that '
-                          'uses those segments has no ground truth in those trials at all.',
+                          'Not dropouts, and not faults. A sensor absent from all sessions of '
+                          'one activity is a property of the PROTOCOL, and the reason to '
+                          'tabulate it is that the artifact cannot distinguish it from a '
+                          'fault: either way the plate is simply not there.',
                           '',
-                          'The `no_mocap` rows are the ones to read. IMoVE\'s two treadmill '
-                          'activities lose the ENTIRE LEFT LEG — foot, shank and thigh, all '
-                          'three placements — in all 21 sessions that ran them. Checked '
-                          'against the Motive exports directly, every left-leg marker in a '
-                          'treadmill take has **0.00%** occupancy across the whole take, '
-                          'against 99.99% for the same markers in the same session\'s '
-                          'overground walking. Exactly zero rather than intermittent means '
-                          'the left side was never reconstructed for those takes, not that '
-                          'it was occluded now and then.',
+                          'Both entries here are by design. IMoVE\'s treadmill activities '
+                          'instrument the RIGHT LEG ONLY, so the left foot, shank and thigh '
+                          'are absent from all 21 sessions that ran them — every left-leg '
+                          'marker in a treadmill take reads 0.00% occupancy for the whole '
+                          'take, against 99.99% for the same markers in the same session\'s '
+                          'overground walking. The long-walk sessions carry 7 sensors rather '
+                          'than 15, so they have no High or Low placements at all.',
+                          '',
+                          'Neither is a problem to fix. What matters downstream is that a '
+                          'left-leg or a High/Low claim cannot be made from these trials, '
+                          'and that any per-sensor rate computed over the whole dataset has '
+                          'a denominator that varies by activity.',
                           '', '| activity | sensor | sessions | reason |',
                           '| --- | --- | --- | --- |']
                 for trial_name, sensor, sessions, reason in systematic:
@@ -674,6 +827,22 @@ def write_report(tables: Dict[str, pd.DataFrame], dataset: str) -> Path:
               'Also absent: raw-parse statistics (including the PacketCounter gap check), '
               'spectra and coherence, serialization fidelity, and the predictive-value '
               'ranking against downstream joint-angle error.', '']
+
+    # The rest of the figures, each with the caption its PNG carries. Gathered rather than
+    # interleaved so a figure never lands between a claim and the table behind it.
+    gallery = [('reconstruction.png', 'Figure — ground-truth quality'),
+               ('sync_timeline.png', 'Figure — synchronization and timeline'),
+               ('alignment.png', 'Figure — sensor-to-segment alignment'),
+               ('replicate_structure.png', 'Figure — replicate structure'),
+               ('health.png', 'Figure — worst trials and their components')]
+    embedded = [line for filename, heading in gallery
+                for line in _embedded_figure(dataset, filename, heading)]
+    if embedded:
+        lines += ['## Figures', '',
+                  'Every figure below is also written to '
+                  f'`plots/{PLOTS_SUBDIR}/{dataset}/` with its caption rendered onto the '
+                  'image, so it stays readable when it travels without this report.', '']
+        lines += embedded
 
     path = paths.ensure_parent(paths.REPO_ROOT / 'results' / 'reports' /
                                f'build_quality_{dataset}.md')

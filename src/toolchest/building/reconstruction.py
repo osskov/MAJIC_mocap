@@ -743,11 +743,11 @@ def fit_plate_to_template(
         'fault_counts_per_marker': [int(((dropped == i) & valid).sum()) for i in range(n_markers)],
         # The standard mocap QA number, and the one the aggregate above cannot express. A
         # plate whose four markers are each present 75% of the time is a tracking problem;
-        # one where a single marker is present 0% of the time is a different problem
-        # entirely, and only this distinguishes them. IMoVE's treadmill takes are the case
-        # that matters: every left-leg marker sits at exactly 0.00% for the whole take in all
-        # 21 sessions, so those trials have no left-leg ground truth at all -- and the plate
-        # simply never appears in the artifact, which reads as ordinary absence.
+        # one where a single marker is present 0% of the time is a protocol fact, and only
+        # this distinguishes them. IMoVE's treadmill takes are the latter: they instrument
+        # the right leg only, so every left-leg marker reads exactly 0.00% for the whole
+        # take. Worth recording precisely because the artifact cannot tell that apart from a
+        # tracking failure -- either way the plate is simply not there.
         'presence_fraction_per_marker': [float(present[:, i].mean()) for i in range(n_markers)],
         'min_marker_presence_fraction': float(present.mean(axis=0).min()),
         'residual_median_mm': float(np.median(residual[np.isfinite(residual)]) * 1000)

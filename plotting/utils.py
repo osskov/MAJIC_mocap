@@ -7,6 +7,8 @@ module only knows how to draw a distribution/heatmap comparison and run the
 significance testing behind it, with zero knowledge of what's being compared.
 """
 import re
+import textwrap
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -392,15 +394,71 @@ def _emit_significance_report(report: pd.DataFrame, figure_name: str, plots_dir:
         print(f"Saved significance report to {path}")
 
 
+# Characters per line in a rendered caption, at CAPTION_FONTSIZE. Wrapping is done here
+# rather than left to the caller because a caption written as one long string must not
+# decide the figure's width -- `bbox_inches='tight'` would expand the canvas to fit the
+# text and leave the axes crushed into a corner, which is exactly what a one-line epilog
+# did to the two-column Al Borno grid.
+CAPTION_WIDTH_PER_INCH = 15.5
+CAPTION_FONTSIZE = 9.5
+# Most of the figure a caption may claim. See the clamp in finalize_and_save_plot.
+CAPTION_MAX_BAND = 0.4
+
+
+class MissingCaptionWarning(UserWarning):
+    """Raised as a warning when a figure is saved with no caption. Its own class so a caller
+    that genuinely wants an uncaptioned figure can silence exactly this and nothing else."""
+
+
 def finalize_and_save_plot(
     fig: plt.Figure, title: str, filename: str, plots_dir: Path = paths.PLOTS_DIR,
-    epilog: Optional[str] = None, save: bool = True, show: bool = True
+    epilog: Optional[str] = None, save: bool = True, show: bool = True,
+    caption: Optional[str] = None
 ) -> None:
+    """Title, optional caption and epilog, then save.
+
+    EVERY FIGURE SHOULD PASS A CAPTION. A figure travels: it goes into a slide, a message, a
+    paper draft, and it arrives without the code or the report section that explains it. The
+    caption is what makes it readable on its own -- what is plotted, what the axes mean, what
+    the reader is supposed to conclude, and what the figure does NOT show. `epilog` is a
+    different thing and both can be used: it is the one-line provenance stamp (how many
+    trials, which legend marks mean what), not an explanation.
+
+    Absent, a warning names the file. Not an exception, because a figure that renders without
+    a caption is still worth having and failing the run would throw away the plot as well as
+    the caption -- but the warning is deliberately loud enough to be fixed.
+    """
     fig.suptitle(title, fontsize=18, y=1.02, fontweight='bold')
+
+    # Caption at the bottom, epilog stacked on the line above it. Both are measured in figure
+    # fractions off the actual font size and figure height rather than guessed: a fixed y put
+    # the epilog straight through the middle of a five-line caption on the 13x5 panels.
+    line_height = (CAPTION_FONTSIZE * 1.35) / (fig.get_figheight() * 72.0)
+    caption_height = 0.0
+
+    if caption:
+        width = int(fig.get_figwidth() * CAPTION_WIDTH_PER_INCH)
+        wrapped = textwrap.fill(' '.join(caption.split()), width=max(width, 60))
+        fig.text(0.01, 0.005, wrapped, ha='left', va='bottom', fontsize=CAPTION_FONTSIZE,
+                 transform=fig.transFigure)
+        caption_height = (wrapped.count('\n') + 1) * line_height
+    else:
+        warnings.warn(
+            f"{filename} was saved without a caption. A figure travels without the code that "
+            f"made it; pass caption= describing what is plotted and what to conclude.",
+            MissingCaptionWarning, stacklevel=2)
+
+    reserved = caption_height + 0.01 if caption else 0.0
     if epilog:
-        fig.text(0.99, 0.01, epilog, ha='right', va='bottom', fontsize=10,
-                  fontstyle='italic', transform=fig.transFigure)
-    fig.tight_layout(rect=[0, 0.03 if epilog else 0, 1, 0.97])
+        fig.text(0.99, reserved + 0.005, epilog, ha='right', va='bottom',
+                 fontsize=10, fontstyle='italic', transform=fig.transFigure)
+        reserved += 1.6 * line_height
+    # Clamped, because a rect that leaves no room for the axes makes tight_layout give up
+    # entirely and warn -- which would lose the layout for the whole figure, not just the
+    # caption. Past this point the text runs into the axes, which is the better failure: it
+    # is visible, and it means the caption wants shortening.
+    fig.tight_layout(rect=[0, min(max(reserved, 0.03 if epilog else 0.0), CAPTION_MAX_BAND),
+                           1, 0.97])
 
     if save:
         path = paths.ensure_parent(plots_dir / filename)
@@ -419,7 +477,8 @@ def plot_metric_distribution(
     labels: Optional[Dict[str, str]] = None, plot_type: str = 'strip', facet_by: Optional[str] = None,
     facet_order: Optional[List[str]] = None, palette: str = DEFAULT_PALETTE, save: bool = True, show: bool = True,
     block_cols: Optional[List[str]] = None, alpha: float = 0.05,
-    ylabel: Optional[str] = None, title: Optional[str] = None, filename: Optional[str] = None
+    ylabel: Optional[str] = None, title: Optional[str] = None, filename: Optional[str] = None,
+    caption: Optional[str] = None
 ) -> None:
     """One figure comparing `group_order` for `metric`, optionally faceted (e.g.
     one panel per joint).
@@ -469,7 +528,7 @@ def plot_metric_distribution(
     out_name = filename or f"distribution_{metric}{('_by_' + facet_by) if facet_by else ''}_{plot_type}.png"
     finalize_and_save_plot(
         fig, title if title is not None else f"{metric}{facet_suffix} ({plot_kind})", out_name, plots_dir,
-        epilog=_significance_epilog(results, alpha), save=save, show=show
+        epilog=_significance_epilog(results, alpha), save=save, show=show, caption=caption
     )
     _emit_significance_report(significance_report(results, metric), out_name, plots_dir, save=save)
 
@@ -478,7 +537,8 @@ def plot_metric_heatmap(
     df: pd.DataFrame, metric: str, group_col: str, group_order: List[str], plots_dir: Path,
     labels: Optional[Dict[str, str]] = None, joint_order: List[str] = DEFAULT_JOINT_ORDER,
     higher_is_better: bool = False, save: bool = True, show: bool = True,
-    block_cols: Optional[List[str]] = None, alpha: float = 0.05
+    block_cols: Optional[List[str]] = None, alpha: float = 0.05,
+    caption: Optional[str] = None
 ) -> None:
     """Heatmap of mean `metric` by joint (rows) x `group_col` (columns), annotated
     with a significance marker vs. the best value in each row.
@@ -532,6 +592,6 @@ def plot_metric_heatmap(
         fig, f"Mean {metric} by Joint and {group_col}", out_name, plots_dir,
         epilog=(f"* Differs from best in row (Wilcoxon signed-rank, Holm-corrected across the "
                 f"whole heatmap, p < {alpha:g}, {n_text} subjects)"),
-        save=save, show=show
+        save=save, show=show, caption=caption
     )
     _emit_significance_report(significance_report(results, metric), out_name, plots_dir, save=save)

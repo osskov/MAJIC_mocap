@@ -64,6 +64,44 @@ MIN_SITTING_SEC = WINDOW_SEC
 
 COLOR_OFF, COLOR_ON = sns.color_palette('Set2', 2)
 
+# One caption per figure. A figure travels into a slide or a draft without the code that made
+# it, so each says what is plotted, how to read it, and what it does NOT support.
+CAPTIONS = {
+    'dumbbell':
+        'Whether Mag-Off joint-angle error is genuine accumulating DRIFT rather than bounded '
+        'noise, and whether it is specific to low-observability conditions. Each row is a '
+        f'joint; each dumbbell joins the mean R^2 of a through-the-origin linear fit over '
+        f'{int(WINDOW_SEC)}s windows of quiet sitting to the same quantity over everything '
+        'that is not quiet sitting, for Mag-Off and Mag-On separately. HIGH R^2 MEANS THE '
+        'ERROR GROWS LINEARLY IN TIME, which is drift; low R^2 means it wanders without a '
+        'trend, which is noise. Windows are equal length in both arms because R^2 depends on '
+        'the length of the window it is computed over, and raw not-sitting stretches run '
+        'minutes against sitting bouts of about 15 s. Sitting is detected from the pelvis '
+        'alone, so the split is independent of o^J and of the joint being scored. NOT SHOWN: '
+        'the SIZE of the error. R^2 measures how linear the drift is, not how large, so a '
+        'joint can sit high here and still be accurate.',
+    'segment_examples':
+        'The individual windows behind the pooled R^2, so the summary can be checked against '
+        'what it is summarizing. Three panels: the best-, median- and worst-fitting quiet-'
+        f'sitting windows of {int(WINDOW_SEC)}s, RANKED ACROSS ALL SUBJECTS — so the three '
+        'may come from three different people and three different joints, and the panel '
+        'titles name which. Each shows joint-angle drift against time for Mag-Off and Mag-On '
+        'with their linear fits. The worst panel is the important one: it is what a low R^2 '
+        'actually looks like, and whether it is noise or a non-linear trend the linear fit '
+        'cannot represent. NOT SHOWN: anything typical. These are order statistics chosen for '
+        'being extreme, and the median panel is the only one that represents the population.',
+    'heatmap':
+        'The magnitude the R^2 figures deliberately leave out. Rows are joints, columns are '
+        'the four condition-by-magnetometer combinations, and the cell value is the MEDIAN '
+        'LINEAR DRIFT RATE in deg/s while the colour is the mean R^2 on a red-blue diverging '
+        'scale. Read the two together: a large rate with a high R^2 is real sustained drift, '
+        'a large rate with a low R^2 is a fit through noise and the rate is not meaningful. '
+        'R^2 can be negative here because the fit is through the origin, so the scale is '
+        'diverging rather than sequential. NOT SHOWN: within-condition spread. Each cell is a '
+        'median over every window pooled across every subject, so a cell can be moderate '
+        'while individual subjects sit at both extremes.',
+}
+
 
 def subjects_with_data(activity: str):
     return [s for s in SUBJECTS if paths.joint_angles_path(s, activity, "mag_off").exists()]
@@ -197,6 +235,7 @@ def plot_dumbbell_r2(results, subject_label, activity, joint_order=JOINT_ORDER,
         fig, f"Segment-and-reset $R^2$: sitting vs not sitting "
              f"({int(WINDOW_SEC)}s windows, {subject_label}, {activity})",
         filename, PLOTS_DIR, save=save, show=show,
+        caption=CAPTIONS['dumbbell'],
     )
 
 
@@ -272,6 +311,7 @@ def plot_segment_examples(all_results, subject_label, activity, save=True, show=
         fig, f"Best-, median-, and worst-fitting {int(WINDOW_SEC)}s sitting windows "
              f"of {n_windows} ({subject_label}, {activity})",
         "segment_examples.png", PLOTS_DIR, save=save, show=show,
+        caption=CAPTIONS['segment_examples'],
     )
 
 
@@ -310,6 +350,7 @@ def plot_heatmap_r2(results, subject_label, activity, joint_order=JOINT_ORDER,
         fig, f"Median linear drift rate (deg/s), colored by $R^2$ "
              f"({int(WINDOW_SEC)}s windows, {subject_label}, {activity})",
         filename, PLOTS_DIR, save=save, show=show,
+        caption=CAPTIONS['heatmap'],
     )
 
 

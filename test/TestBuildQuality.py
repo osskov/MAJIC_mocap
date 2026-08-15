@@ -10,7 +10,9 @@ the report, and the specific trap is real: IMoVE's three placements on a segment
 WorldTrace, so a reconstruction metric is bit-identical across them and counting them as three
 replicates inflates n threefold on exactly the numbers the report leads with.
 """
+import re
 import unittest
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -256,6 +258,64 @@ class TestDataStateFigure(unittest.TestCase):
         absent. A figure that raises on that makes the whole run fail for one missing file."""
         plot_data_state({}, 'x', save=False, show=False)
         plot_data_state({'index': pd.DataFrame()}, 'x', save=False, show=False)
+
+
+class TestEveryFigureIsCaptioned(unittest.TestCase):
+    """A figure travels. It ends up in a slide, a message or a paper draft without the code
+    that made it and without the report section that explains it, so the caption is the only
+    thing that makes it readable on arrival."""
+
+    def test_every_figure_in_this_module_has_a_caption(self):
+        """Keyed by filename rather than by function, so a new figure whose caption was
+        forgotten fails here rather than shipping bare."""
+        import plotting.build_quality as module
+        rendered = re.findall(r"'([a-z_]+\.png)', plots_dir=", Path(module.__file__).read_text())
+        self.assertTrue(rendered, 'found no figures to check')
+        for filename in rendered:
+            self.assertIn(filename, module.CAPTIONS, f'{filename} has no caption')
+            self.assertGreater(len(module.CAPTIONS[filename]), 200,
+                               f'{filename} caption is too short to be detailed')
+
+    def test_a_caption_says_what_the_figure_does_not_show(self):
+        """The limitation is the part a reader cannot recover from the axes, and the part most
+        likely to be over-read if it is missing."""
+        from plotting.build_quality import CAPTIONS
+        for filename, caption in CAPTIONS.items():
+            self.assertIn('NOT SHOWN', caption,
+                          f'{filename} does not state what it leaves out')
+
+    def test_saving_without_one_warns_rather_than_passing_quietly(self):
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        from plotting.utils import MissingCaptionWarning, finalize_and_save_plot
+
+        figure = plt.figure()
+        with self.assertWarns(MissingCaptionWarning):
+            finalize_and_save_plot(figure, 'title', 'x.png', save=False, show=False)
+
+    def test_a_caption_does_not_overlap_the_epilog(self):
+        """They used to collide: the epilog sat at a fixed y and ran straight through the
+        middle of a five-line caption on the 13x5 panels. Both are now measured off the font
+        size and figure height, so the epilog's baseline must clear the caption's top."""
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        from plotting.utils import CAPTION_FONTSIZE, finalize_and_save_plot
+
+        figure = plt.figure(figsize=(13, 5))
+        finalize_and_save_plot(figure, 'title', 'x.png', save=False, show=False,
+                               caption='word ' * 250, epilog='n = 262 trials')
+
+        texts = [t for t in figure.texts if t.get_text() != 'title']
+        caption = max(texts, key=lambda t: len(t.get_text()))
+        epilog = min(texts, key=lambda t: len(t.get_text()))
+        caption_top = (caption.get_position()[1]
+                       + (caption.get_text().count('\n') + 1)
+                       * (CAPTION_FONTSIZE * 1.35) / (5.0 * 72.0))
+        self.assertGreaterEqual(epilog.get_position()[1], caption_top,
+                                'the epilog sits inside the caption block')
+        plt.close(figure)
 
 
 if __name__ == '__main__':
