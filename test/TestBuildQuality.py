@@ -19,6 +19,7 @@ from experiments.build_quality import (BLOCKING, ICC_DEPENDENT, SHORT_INVALID_RU
                                        health_score, icc_report,
                                        intraclass_correlation, pooled_summary, step_table,
                                        warn_if_placements_split)
+from plotting.build_quality import _natural_key, _session_expectation, plot_data_state
 
 
 class TestIntraclassCorrelation(unittest.TestCase):
@@ -184,6 +185,77 @@ class TestIccReportShape(unittest.TestCase):
         self.assertFalse(placement.empty)
         self.assertTrue(bool(placement.dependent.iloc[0]),
                         'a metric identical across placements must be flagged dependent')
+
+
+class TestDataStateFigure(unittest.TestCase):
+    """The triage figure. Two things in it are easy to get wrong and silent when wrong.
+
+    SCALING COVERAGE AGAINST THE WRONG DENOMINATOR. IMoVE's five long-walk sessions carry 7
+    sensors where the other 21 carry 15. Scored against the dataset-wide roster they read 47%
+    and the figure says half the dataset is broken when nothing is.
+
+    CONFLATING TWO KINDS OF BLANK. A cell with no colour can mean "no such trial in this
+    session" or "the trial built but scored nothing", and those call for opposite reactions.
+    """
+
+    @staticmethod
+    def _tables(long_walk_sensors=7, wide_sensors=15):
+        rows = []
+        for subject, n_sensors, trials in (('s2', wide_sensors, ('t1', 't2')),
+                                           ('s5l', long_walk_sensors, ('t1',))):
+            for trial in trials:
+                for i in range(wide_sensors):
+                    present = i < n_sensors
+                    rows.append({'dataset': 'x', 'subject': subject, 'trial': trial,
+                                 'sensor': f'S{i}', 'present': present,
+                                 'status': 'present' if present else 'neither'})
+        coverage = pd.DataFrame(rows)
+        index = pd.DataFrame([
+            {'dataset': 'x', 'subject': 's2', 'trial': 't1', 'status': 'fresh',
+             'has_build_report': True, 'n_suspect_plates': 0},
+            {'dataset': 'x', 'subject': 's2', 'trial': 't2', 'status': 'fresh',
+             'has_build_report': True, 'n_suspect_plates': 0},
+            {'dataset': 'x', 'subject': 's5l', 'trial': 't1', 'status': 'fresh',
+             'has_build_report': True, 'n_suspect_plates': 0}])
+        health = index.assign(health=[0.1, np.nan, 0.5])
+        return {'coverage': coverage, 'index': index, 'health': health}
+
+    def test_a_short_session_is_scored_against_itself(self):
+        expectation = _session_expectation(self._tables()['coverage'])
+        self.assertEqual(int(expectation['s2']), 15)
+        self.assertEqual(int(expectation['s5l']), 7)
+
+    def test_a_session_short_everywhere_is_not_hidden_by_its_own_maximum(self):
+        """The known cost of per-session normalization: a session broken in every trial looks
+        whole, because its own maximum drops with it. The figure keeps the count on the row
+        label for exactly this reason, so the number is still visible even when the colour
+        is not."""
+        expectation = _session_expectation(self._tables(long_walk_sensors=2)['coverage'])
+        self.assertEqual(int(expectation['s5l']), 2)
+
+    def test_natural_order_puts_s2_before_s13(self):
+        """Lexical order gives s10, s11, s13, s2 — which reads as a shuffled dataset."""
+        self.assertEqual(sorted(['s13', 's2', 's10', 's5l'], key=_natural_key),
+                         ['s2', 's5l', 's10', 's13'])
+
+    def test_it_renders_without_a_display_and_writes_a_file(self):
+        import matplotlib
+        matplotlib.use('Agg')
+        import tempfile
+        from unittest import mock
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch('plotting.build_quality._plots_dir',
+                            return_value=Path(tmpdir)):
+                plot_data_state(self._tables(), 'x', save=True, show=False)
+            self.assertTrue((Path(tmpdir) / 'data_state.png').exists())
+
+    def test_missing_tables_are_not_fatal(self):
+        """--only-tables exists so a targeted rerun is cheap, which means any table can be
+        absent. A figure that raises on that makes the whole run fail for one missing file."""
+        plot_data_state({}, 'x', save=False, show=False)
+        plot_data_state({'index': pd.DataFrame()}, 'x', save=False, show=False)
 
 
 if __name__ == '__main__':

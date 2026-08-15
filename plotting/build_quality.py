@@ -27,6 +27,7 @@ treatments, which is not a claim worth making. The blocking IS applied to the po
     python -m plotting.build_quality --dataset imove --report-only
 """
 import argparse
+import re
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -73,6 +74,170 @@ def _coverage(tables: Dict[str, pd.DataFrame]) -> str:
     reported = int(index.has_build_report.sum()) if 'has_build_report' in index else 0
     return (f"{reported} of {len(index)} trials instrumented, {built} fresh · "
             f"{index.subject.nunique()} sessions")
+
+
+# ----------------------------------------------------------------------- what state is it in?
+
+def _natural_key(name: str):
+    """Split digits from text so 's2' sorts before 's13' and 't2' before 't10'."""
+    return [int(part) if part.isdigit() else part
+            for part in re.split(r'(\d+)', str(name))]
+
+
+def _session_expectation(coverage: pd.DataFrame) -> pd.Series:
+    """How many sensors each SESSION can produce, taken from the session itself.
+
+    NOT the dataset-wide union, which is the trap this exists to avoid. IMoVE's five long-walk
+    sessions carry 7 sensors at 100 Hz where the other 21 carry 15 at 40 Hz, so scoring every
+    trial against 15 would paint s4l, s5l, s6l, s13l and s23l as 47% broken when they are
+    complete. The per-session maximum is empirical and stays right for a dataset this module
+    has never seen.
+
+    The cost is that a session broken in EVERY trial looks whole, because its own maximum
+    drops with it. `n_expected` is annotated on the figure for exactly that reason: a row
+    reading 7 in a dataset whose others read 15 is a question, not a reassurance.
+    """
+    present = coverage[coverage.present].groupby(['subject', 'trial']).size()
+    return present.groupby('subject').max()
+
+
+def plot_data_state(tables: Dict[str, pd.DataFrame], dataset: str, save: bool,
+                    show: bool) -> None:
+    """The triage figure: what loaded, how completely, and which sessions look worst.
+
+    Everything else in this file answers a question you already knew to ask. This one is for
+    walking up to the dataset cold and seeing its shape -- which is otherwise spread across
+    four tables and 262 rows.
+
+    Two grids on one subject axis, so a row can be read straight across:
+
+      COVERAGE   how much of the session each trial actually produced. A trial can build
+                 successfully with 8 plates instead of 15 -- the build fails soft on an
+                 untracked segment, deliberately -- and that is invisible in a status column.
+      HEALTH     the composite from `health_score`, which is a TRIAGE RANKING and not a
+                 verdict. Normalized within the dataset, so the darkest cell is the worst
+                 trial here rather than a bad trial in absolute terms. A dataset with no
+                 problems at all would still have a darkest cell.
+
+    The two disagree usefully. A trial can be fully covered and still rank badly, which points
+    at sync or alignment rather than at missing sensors; the reverse points at coverage.
+    """
+    index, coverage = tables.get('index'), tables.get('coverage')
+    if index is None or index.empty or coverage is None or coverage.empty:
+        return
+    health = tables.get('health')
+
+    subjects = sorted(index.subject.unique(), key=_natural_key)
+    trials = sorted(index.trial.unique(), key=_natural_key)
+    rows, columns = {s: i for i, s in enumerate(subjects)}, \
+                    {t: i for i, t in enumerate(trials)}
+    shape = (len(subjects), len(trials))
+
+    expected = _session_expectation(coverage)
+    n_present = coverage[coverage.present].groupby(['subject', 'trial']).size()
+
+    # NaN means "no such trial in this session", which must not read as zero coverage: Al
+    # Borno's 05, 08 and 10 have walking only, and IMoVE's sessions do not all run every
+    # protocol. Left uncoloured rather than dark.
+    fraction = np.full(shape, np.nan)
+    counts = np.full(shape, np.nan)
+    unbuilt = np.zeros(shape, dtype=bool)
+    for row in index.itertuples():
+        r, c = rows[row.subject], columns[row.trial]
+        if row.status in ('missing', 'failed', 'absent'):
+            unbuilt[r, c] = row.status != 'absent'
+            continue
+        count = float(n_present.get((row.subject, row.trial), 0))
+        counts[r, c] = count
+        fraction[r, c] = count / max(float(expected.get(row.subject, 1)), 1.0)
+
+    score = np.full(shape, np.nan)
+    if health is not None and not health.empty and 'health' in health:
+        for row in health.dropna(subset=['health']).itertuples():
+            score[rows[row.subject], columns[row.trial]] = row.health
+
+    # Floored, because Al Borno has two trials against IMoVE's thirteen. Sized from the grid
+    # alone the figure came out narrower than its own caption, and `bbox_inches='tight'` then
+    # expanded the canvas to fit the text and left the panels crushed against one edge. The
+    # marginal's share is tied to the grid width for the same reason.
+    marginal = max(3.0, 0.4 * len(trials))
+    figure, axes = plt.subplots(
+        1, 3, figsize=(max(9.0, 3.0 + 0.68 * len(trials)), 2.5 + 0.22 * len(subjects)),
+        gridspec_kw={'width_ratios': [len(trials), len(trials), marginal]}, sharey=True)
+
+    # The composite is a mean of normalized components, so it never approaches 1 even for the
+    # worst trial -- on IMoVE the maximum is around 0.5. Scaling the colour to 1 would render
+    # the whole panel in the palest third of the map and hide every difference in it. Scaled
+    # to the observed maximum instead, which is also what "worst here" already meant.
+    worst = float(np.nanmax(score)) if np.isfinite(score).any() else 1.0
+    labels = [t.replace('_001', '') for t in trials]
+    for axis, values, cmap, top, title, bar_label in (
+            (axes[0], fraction, 'YlGn', 1.0,
+             'Coverage — produced / expected', 'fraction of the session'),
+            (axes[1], score, 'YlOrRd', worst,
+             'Health — triage only', f'composite (max {worst:.2f})')):
+        image = axis.imshow(np.ma.masked_invalid(values), cmap=cmap, vmin=0.0, vmax=top,
+                            aspect='auto', interpolation='nearest')
+        axis.set_xticks(range(len(trials)))
+        axis.set_xticklabels(labels, rotation=90, fontsize=7)
+        axis.set_yticks(range(len(subjects)))
+        # The sensor count rides on the tick label. A session reading 7 where its neighbours
+        # read 15 is the one thing the per-session normalization can hide, so it is never off
+        # the figure.
+        axis.set_yticklabels([f'{s} ({int(expected.get(s, 0))})' for s in subjects],
+                             fontsize=7)
+        axis.set_title(title, fontsize=10)
+        axis.set_xticks(np.arange(-0.5, len(trials)), minor=True)
+        axis.set_yticks(np.arange(-0.5, len(subjects)), minor=True)
+        axis.grid(which='minor', color='white', linewidth=0.8)
+        axis.tick_params(which='minor', length=0)
+        figure.colorbar(image, ax=axis, fraction=0.025, pad=0.01).set_label(
+            bar_label, fontsize=7)
+
+    # A trial that did not build is a different KIND of thing from one that built badly, so it
+    # gets a mark rather than a place on the same scale. Hatching survives greyscale printing
+    # and colour-vision deficiency, which a red cell does not.
+    for r, c in zip(*np.nonzero(unbuilt)):
+        for axis in axes[:2]:
+            axis.add_patch(plt.Rectangle((c - 0.5, r - 0.5), 1, 1, facecolor='#f2f2f2',
+                                         edgecolor='#cc3311', hatch='///', linewidth=0.8))
+
+    # A BLANK IN THE HEALTH PANEL WOULD OTHERWISE BE AMBIGUOUS. Left alone it reads as "not in
+    # that session", but a trial can also build cleanly and still score nothing, when none of
+    # the components the composite is made of were recorded for it -- s13l's static pose is
+    # one. Filled grey so the two cannot be confused: white means there is no such trial, grey
+    # means there is one and it has not been scored.
+    unscored = np.isnan(score) & ~np.isnan(counts)
+    for r, c in zip(*np.nonzero(unscored)):
+        axes[1].add_patch(plt.Rectangle((c - 0.5, r - 0.5), 1, 1, facecolor='#dddddd',
+                                        edgecolor='white', linewidth=0.8))
+
+    # The raw count, because the fraction alone cannot distinguish 7/7 from 15/15 -- and that
+    # distinction is the whole reason _session_expectation is per session.
+    for (r, c), count in np.ndenumerate(counts):
+        if np.isnan(count):
+            continue
+        axes[0].text(c, r, f'{int(count)}', ha='center', va='center', fontsize=5.5,
+                     color='#333333' if fraction[r, c] > 0.5 else '#777777')
+
+    # Which sessions are more and less suspect, which is hard to read off a grid by eye.
+    with np.errstate(invalid='ignore'):
+        per_subject = np.nanmean(score, axis=1)
+    axes[2].barh(np.arange(len(subjects)), np.nan_to_num(per_subject), color='#bb5566',
+                 height=0.72)
+    axes[2].set_title('Session mean', fontsize=10)
+    axes[2].set_xlabel('mean health', fontsize=8)
+    axes[2].grid(alpha=0.3, axis='x')
+    axes[2].tick_params(labelsize=7)
+    axes[0].invert_yaxis()
+
+    axes[0].set_xlabel('cell = sensors produced · row label = what the session expects',
+                       fontsize=7)
+    epilog = (f"{_coverage(tables)} · hatched = did not build ({int(unbuilt.sum())}) · "
+              f"grey = built, unscored ({int(unscored.sum())}) · white = not in that session")
+    finalize_and_save_plot(figure, f'What loaded, and what looks suspect — {dataset}',
+                           'data_state.png', plots_dir=_plots_dir(dataset),
+                           epilog=epilog, save=save, show=show)
 
 
 # ------------------------------------------------------------------ is the truth trustworthy?
@@ -323,6 +488,23 @@ def write_report(tables: Dict[str, pd.DataFrame], dataset: str) -> Path:
                 f'before the instrumentation existed is still valid and simply has no '
                 f'tier-1 data. Rebuild to fill them in.', '']
 
+    # The only figure the report embeds. It is the one that answers "what state is this
+    # dataset in" without reading anything else, so it belongs above the tables rather than
+    # in a gallery at the end; the rest are for questions you already know to ask.
+    figure = _plots_dir(dataset) / 'data_state.png'
+    if figure.exists():
+        try:
+            relative = figure.relative_to(paths.REPO_ROOT / 'results' / 'reports')
+        except ValueError:
+            relative = Path('../..') / figure.relative_to(paths.REPO_ROOT)
+        lines += ['## At a glance', '',
+                  f'![What loaded, and what looks suspect]({relative.as_posix()})', '',
+                  'Left: how much of each session every trial produced, against what that '
+                  'session can produce — the long-walk sessions carry 7 sensors by design, '
+                  'not 15, so scoring them against the dataset-wide roster would show them '
+                  'as half broken. Right: the triage composite, which is normalized within '
+                  'this dataset and is therefore a ranking rather than a verdict.', '']
+
     if not health.empty and 'health' in health:
         ranked = health.dropna(subset=['health']).head(3)
         if not ranked.empty:
@@ -365,6 +547,44 @@ def write_report(tables: Dict[str, pd.DataFrame], dataset: str) -> Path:
                       '| sensor | absent in N trials |', '| --- | --- |']
             lines += [f'| `{name}` | {n} |' for name, n in by_sensor.head(12).items()]
             lines.append('')
+
+            # A gap that repeats across every session is a protocol fact, not 42 separate
+            # dropouts, and the per-trial list below buries it: at 25 rows it cannot even
+            # show them all. Named here as one line each so the pattern is the finding.
+            systematic = []
+            for trial_name, group in coverage.groupby('trial'):
+                sessions = group.subject.nunique()
+                if sessions < 2:
+                    continue
+                never = (group.groupby('sensor')['present'].sum() == 0)
+                for sensor in sorted(never[never].index):
+                    reasons = group[group.sensor == sensor].status.value_counts()
+                    systematic.append((trial_name, sensor, sessions, reasons.idxmax()))
+            if systematic:
+                # `neither` first would bury the finding: on the long walks it just means the
+                # 7-sensor sessions have no High or Low placements, which is by design and
+                # already explained in the status table above.
+                systematic.sort(key=lambda row: (row[3] == 'neither', row[0], row[1]))
+                lines += ['### Sensors missing from EVERY session of an activity',
+                          '',
+                          'Not dropouts. A sensor absent from all sessions of one activity is '
+                          'a property of how that activity was recorded, and any claim that '
+                          'uses those segments has no ground truth in those trials at all.',
+                          '',
+                          'The `no_mocap` rows are the ones to read. IMoVE\'s two treadmill '
+                          'activities lose the ENTIRE LEFT LEG — foot, shank and thigh, all '
+                          'three placements — in all 21 sessions that ran them. Checked '
+                          'against the Motive exports directly, every left-leg marker in a '
+                          'treadmill take has **0.00%** occupancy across the whole take, '
+                          'against 99.99% for the same markers in the same session\'s '
+                          'overground walking. Exactly zero rather than intermittent means '
+                          'the left side was never reconstructed for those takes, not that '
+                          'it was occluded now and then.',
+                          '', '| activity | sensor | sessions | reason |',
+                          '| --- | --- | --- | --- |']
+                for trial_name, sensor, sessions, reason in systematic:
+                    lines.append(f'| {trial_name} | `{sensor}` | {sessions} | `{reason}` |')
+                lines.append('')
 
             per_trial = (coverage.groupby(['subject', 'trial'])['present']
                          .agg(present='sum', expected='size').reset_index()
@@ -462,7 +682,7 @@ def write_report(tables: Dict[str, pd.DataFrame], dataset: str) -> Path:
     return path
 
 
-FIGURES = (plot_reconstruction, plot_sync_and_timeline, plot_alignment,
+FIGURES = (plot_data_state, plot_reconstruction, plot_sync_and_timeline, plot_alignment,
            plot_replicate_structure, plot_health)
 
 
