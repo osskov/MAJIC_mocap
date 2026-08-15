@@ -322,8 +322,12 @@ class TestWindowLandedCheck(unittest.TestCase):
         self.assertEqual(fired, [])
         self.assertNotIn('motion_ratio', set(frame.metric))
 
-    def test_the_threshold_sits_in_the_measured_gap(self):
-        """Set from data, not picked: correctly-synced plates measured 1.00-2.75 across 104
-        plates and the broken trial's four read 5.88-23.70."""
-        self.assertGreater(bp.MAX_SYNC_MOTION_RATIO, 2.75)
-        self.assertLess(bp.MAX_SYNC_MOTION_RATIO, 5.88)
+    def test_the_threshold_clears_the_bulk_of_honest_plates(self):
+        """Set from data, not picked. Across all 1462 plates the ratio runs q50 1.27 and
+        q95 2.46, with 88 plates in (2, 3] that are drop landings where soft tissue alone
+        moves the ratio -- so the threshold has to clear 3 or it sweeps those in. The
+        subject-12-only reading that put a clean empty gap at 2.75-5.88 was too confident:
+        cohort-wide there are 8 plates in (3, 4] and 7 in (4, 6]."""
+        self.assertGreater(bp.MAX_SYNC_MOTION_RATIO, 3.0)
+        # And loose enough to leave the 29 plates above 10 as the unambiguous catch.
+        self.assertLess(bp.MAX_SYNC_MOTION_RATIO, 10.0)

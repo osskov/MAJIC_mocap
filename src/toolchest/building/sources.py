@@ -15,7 +15,7 @@ Adding a dataset means adding an entry here and a reader beside it. Nothing else
 """
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import paths
 
@@ -37,12 +37,21 @@ class TrialSource:
     everything the loader reads and nothing it does not — an over-broad glob invalidates the
     cache whenever an unrelated file moves, and a missing one lets a real change slip
     through. Loader changes are caught separately, by the toolchest digest.
+
+    `extra_inputs` COVERS WHAT source_dir CANNOT REACH, and exists because one dataset does not
+    keep a trial's inputs in one directory. A biplane trial reads four separate trees --
+    Kinematics for the bone poses, Vicon for the markers, IMUs for the BioStamps, and a
+    trigger workbook at the root -- and `source_dir` can name only one of them. Without this
+    the key hashed the Kinematics CSVs alone, so editing the markers, the inertial export or
+    the trigger times left every artifact validating as fresh. Returns absolute paths; a
+    source whose inputs really do live in one place leaves it None.
     """
     name: str
     enumerate_trials: Callable[[], List[Tuple[str, str]]]
     source_dir: Callable[[str, str], Path]
     source_globs: Tuple[str, ...]
     load: Callable[[str, str], Dict[str, PlateTrial]]
+    extra_inputs: Optional[Callable[[str, str], List[Path]]] = None
 
 
 # ==============================================================================
@@ -180,20 +189,59 @@ def _biplane_dir(subject: str, key: str) -> Path:
     return biplane.BIPLANE_ROOT / 'Kinematics' / biplane.STUDY / subject / session / block / trial
 
 
+# The biplane half's equivalent of UNSYNCABLE_TRIALS, for the same reason and matched on the
+# task rather than the whole name -- these are called Lstatic1, Rstatic2 and so on.
+#
+# Measured on the one static trial already built, the fitted sensor-to-segment rotation comes
+# out with a residual of 2.87 times the signal on the shank and 2.00 on the thigh. Above 1.0
+# means the rotation is worse than doing nothing, so there is no alignment to speak of: a held
+# pose gives the gyro correlation nothing to lock onto, exactly as on the mocap half.
+BIPLANE_UNSYNCABLE_TASKS = ('static',)
+
+
 def _biplane_trials() -> List[Tuple[str, str]]:
     """(subject, 'session/block/trial') for every capture that has a trigger time.
 
     Gated on the trigger, because without one there is no way onto the IMU clock and the
-    trial cannot be assembled however complete its files are.
+    trial cannot be assembled however complete its files are. Static holds are skipped as
+    well -- see BIPLANE_UNSYNCABLE_TASKS.
     """
     triggers = biplane.trigger_times()
     found = []
     for subject in sorted({s for s in triggers.subject.unique()}):
         named = set(triggers[triggers.subject == subject].trial)
         for session, block, trial in biplane.biplane_trials(subject):
+            if biplane.trial_task(trial) in BIPLANE_UNSYNCABLE_TASKS:
+                continue
             if trial in named:
                 found.append((subject, f'{session}/{block}/{trial}'))
     return found
+
+
+def _biplane_inputs(subject: str, key: str) -> List[Path]:
+    """Everything outside the Kinematics directory that a biplane trial reads.
+
+    Four trees, and `source_dir` names only the first. The Vicon markers set the trial's
+    clock, the BioStamp exports are the measurement, and the trigger workbook is what puts
+    them on the same timeline -- so a change to any of them changes the artifact, and until
+    this existed none of them was in the cache key.
+
+    Narrowed to what this trial reads, matching load_trial: the two sites on the imaged knee,
+    and within each only accel.csv and gyro.csv. A whole-directory glob would pull in
+    `accel-errors.csv`, which nothing parses, and all four sites, so a change to the right leg
+    would invalidate every left-leg trial.
+    """
+    session, block, trial = key.split('/')
+    found = [biplane.vicon_path(subject, session, trial),
+             biplane.BIPLANE_ROOT / 'TriggerTimes.xlsx']
+
+    side = biplane.trial_side(trial)
+    if side is not None:
+        imu_root = biplane.BIPLANE_ROOT / 'IMUs' / biplane.STUDY / subject
+        for site in biplane.BONE_TO_SITE.values():
+            found += [imu_root / f'{site}_{side}' / name
+                      for name in ('accel.csv', 'gyro.csv')]
+    return [p for p in found if p.exists()]
 
 
 IMOVE_BIPLANE = TrialSource(
@@ -202,6 +250,7 @@ IMOVE_BIPLANE = TrialSource(
     source_dir=_biplane_dir,
     source_globs=('HomoTransMatrices_*.csv',),
     load=lambda subject, key, report=None: biplane.load_trial(subject, key, report=report),
+    extra_inputs=_biplane_inputs,
 )
 
 

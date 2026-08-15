@@ -18,7 +18,7 @@ import re
 import time
 import multiprocessing
 from functools import lru_cache
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
@@ -430,7 +430,8 @@ def _toolchest_digest(dataset: str = None) -> str:
 # case is covered from the other side: if the loader ever starts reading a new file,
 # that is a change to IMUTrace.py or PlateTrial.py, and the toolchest digest invalidates
 # everything on its own.
-def _source_inventory(folder: Path, globs: Tuple[str, ...]) -> List[Dict[str, Any]]:
+def _source_inventory(folder: Path, globs: Tuple[str, ...],
+                      extra: Sequence[Path] = ()) -> List[Dict[str, Any]]:
     """Names and byte counts of the files a trial load reads, sorted.
 
     `globs` come from the dataset's TrialSource, because which files matter is a property
@@ -441,10 +442,23 @@ def _source_inventory(folder: Path, globs: Tuple[str, ...]) -> List[Dict[str, An
     realistic failure is a file being replaced or a re-download landing a different trial,
     both of which change the size. Hashing 76 MB of .trc on every cache check would buy
     protection against an edit the repo's own rules forbid.
+
+    `extra` carries inputs that do not live under `folder` at all -- see
+    TrialSource.extra_inputs. Named relative to the data root rather than to `folder`, since
+    the whole point is that they are somewhere else, and relative_to would raise.
     """
     found = {p for glob in globs for p in folder.glob(glob)}
-    return [{'name': str(p.relative_to(folder)), 'bytes': p.stat().st_size}
+    rows = [{'name': str(p.relative_to(folder)), 'bytes': p.stat().st_size}
             for p in sorted(found) if p.is_file() and not p.name.startswith('.')]
+    for path in sorted(set(extra)):
+        if not path.is_file() or path.name.startswith('.'):
+            continue
+        try:
+            name = str(path.relative_to(paths.DATA_DIR))
+        except ValueError:
+            name = str(path)
+        rows.append({'name': name, 'bytes': path.stat().st_size})
+    return rows
 
 
 def _content_key(frame, plates: Dict[str, PlateTrial]) -> Dict[str, int]:
@@ -469,7 +483,9 @@ def trial_cache_key(subject: str, trial: str, dataset: str = TRIAL_DATASET,
     return {
         'schema_version': trial_io.SCHEMA_VERSION,
         'toolchest_digest': _toolchest_digest(dataset),
-        'sources': _source_inventory(source.source_dir(subject, trial), source.source_globs),
+        'sources': _source_inventory(
+            source.source_dir(subject, trial), source.source_globs,
+            extra=source.extra_inputs(subject, trial) if source.extra_inputs else ()),
         **(content or {}),
     }
 
@@ -584,6 +600,17 @@ def trial_diagnostics(plates: Dict[str, PlateTrial]) -> Dict[str, Any]:
         'duration_s': float(any_plate.imu_trace.timestamps[-1] - any_plate.imu_trace.timestamps[0]),
         'sample_rate_hz': float(any_plate.imu_trace.get_sample_frequency()),
         'world_frame_gravity': measure_world_frame_gravity(plates).tolist(),
+        # WHETHER THERE IS A MAGNETOMETER AT ALL. An MC10 BioStamp has an accelerometer and a
+        # gyroscope and nothing else, so the biplane reader fills `mag` with zeros.
+        #
+        # This is recorded rather than enforced, and the reason is worth stating: a zero
+        # magnetometer does NOT produce a fabricated heading. The filter normalizes each vector
+        # measurement to unit length and passes a zero vector through untouched, which is the
+        # documented mag_off path -- so the sensor's residual and its Jacobian block both drop
+        # out of the update. Running mag_on against these trials silently yields mag_off
+        # behaviour instead. The risk is therefore MISLABELLING a result, not computing a wrong
+        # one, and the fix for that is a queryable fact rather than a refusal layer.
+        'has_magnetometer': bool(np.any(any_plate.imu_trace.mag)),
         # Frames invalid on ANY plate: a joint angle needs two plates, so one bad plate
         # takes the whole frame out of every joint it participates in.
         'n_invalid_frames_any_plate': int(sum(

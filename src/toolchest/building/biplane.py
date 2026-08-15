@@ -255,6 +255,16 @@ def trial_side(trial: str) -> Optional[str]:
     return {'L': 'left', 'R': 'right'}[match.group('side')]
 
 
+def trial_task(trial: str) -> Optional[str]:
+    """The activity from the trial name -- 'SDrop', 'runStance', 'static' -- or None.
+
+    Case is left alone. The names mix conventions (`LSDrop2` against `RrunStance1`), so
+    normalizing here would only move the problem to whoever compares against a literal.
+    """
+    match = _TRIAL_PATTERN.match(trial)
+    return None if match is None else match.group('task')
+
+
 # ---------------------------------------------------------------------------------- Vicon
 
 # The 4-marker clusters, one per segment per side. Names decode as
@@ -376,12 +386,25 @@ MIN_PEAK_TO_SIDELOBE = 1.5
 # The window-landed check. See `_check_windows_landed`: the IMU and the reference, over the
 # same frames, must at least agree about how much the limb was moving.
 #
-# Set from the measured gap rather than picked. Over the 26 built trials of subject 12, 104
-# plates in total, the ratio is bimodal: everything that synced correctly lands in 1.00-2.75
-# (the top of that range being Rstatic1, where both signals are near zero and the ratio is
-# mostly noise, and the drop landings at 2.1-2.3), while the four plates of LSHop3 -- the one
-# trial whose window is demonstrably misplaced -- read 5.88-23.70. 4.0 sits in the middle of
-# the empty gap.
+# Set from the measured distribution. On subject 12 alone the ratio looked cleanly bimodal --
+# 1.00-2.75 for everything that synced and 5.88-23.70 for the one trial that did not -- and
+# 4.0 sat in an empty gap.
+#
+# ACROSS ALL 15 SUBJECTS THE GAP IS NOT EMPTY, so that reading was too confident. Over 1462
+# plates the ratio runs q50 1.27, q95 2.46, and the tail is
+#
+#     (2, 3]    88 plates        (4, 6]      7 plates
+#     (3, 4]     8 plates        (6, 10]     3 plates
+#                                (10, 124]  29 plates
+#
+# The mass above 10 is unambiguous and the bulk below 3 is clearly fine; 4.0 now separates 8
+# unflagged plates from 7 flagged ones rather than nothing from nothing. It stays where it is
+# because the alternative is worse in both directions -- tightening to 3 sweeps in the 88
+# plates at 2-3, which are drop landings where soft tissue alone moves the ratio, and loosening
+# to 10 gives up the 10 plates that are genuinely misplaced. The 15 in 3-10 are judgement, and
+# `motion_ratio` is recorded per plate so that judgement can be revisited on the numbers.
+#
+# It fires on 39 of 1462 plates, 2.7%, concentrated in 14 trials across 8 subjects.
 #
 # DELIBERATELY NOT TIGHTER. Soft-tissue artifact, differentiation noise on a 1 s window and
 # the sensor-to-segment rotation itself all move this ratio, and none of them is a sync
