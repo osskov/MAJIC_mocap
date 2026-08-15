@@ -88,6 +88,59 @@ class TestWorkerDecisions(unittest.TestCase):
         self.assertIn('explode', result['traceback'])
 
 
+class TestFailedTrialsKeepTheirReport(unittest.TestCase):
+    """A build that raises still writes whatever the readers measured before it did.
+
+    The report used to be written only on the way past a successful save, so the trials whose
+    diagnostics matter most -- the ones that did not finish -- left nothing behind but a status
+    string, and the only way to see how far the build got was to run it again under a
+    debugger. The last step with rows in the sidecar now says where it stopped.
+    """
+
+    def _run_failing(self, load, save_report):
+        source = _StubSource(load)
+        with mock.patch.dict(sources.SOURCES, {'_stub': source}), \
+             mock.patch.object(build_trials, 'cached_trial_status',
+                               return_value=('missing', None)), \
+             mock.patch.object(build_trials, 'save_build_report',
+                               side_effect=save_report):
+            return build_trials.build_trial_worker(
+                ('01', 'walking'), ['build'], {}, dataset='_stub')
+
+    def test_the_partial_report_is_written(self):
+        def explode(subject, trial, report=None):
+            report.add('S1_parse', 'file', 'thigh_r.txt', missing_samples=207)
+            report.add('S2_reconstruction', 'segment', 'thigh_r', residual_median_mm=0.4)
+            raise ValueError('marker reconstruction gave up')
+
+        written = {}
+
+        def capture(report, subject, trial, dataset=None):
+            written['frame'] = report.to_frame()
+
+        result = self._run_failing(explode, capture)
+
+        self.assertEqual(result['action'], 'failed')
+        self.assertIn('frame', written)
+        # Both steps the reader got through, so the furthest one names where it stopped.
+        self.assertEqual(set(written['frame'].step), {'S1_parse', 'S2_reconstruction'})
+
+    def test_a_failing_sidecar_write_does_not_mask_the_build_failure(self):
+        """The traceback is the thing worth surfacing. A diagnostic that replaces it with its
+        own is strictly worse than no diagnostic."""
+        def explode(subject, trial, report=None):
+            raise ValueError('the real problem')
+
+        def broken_write(report, subject, trial, dataset=None):
+            raise OSError('read-only filesystem')
+
+        result = self._run_failing(explode, broken_write)
+
+        self.assertEqual(result['action'], 'failed')
+        self.assertIn('the real problem', result['error'])
+        self.assertNotIn('read-only filesystem', result['error'])
+
+
 class TestSelectionGuards(unittest.TestCase):
     """--subjects and --trials are validated against what is actually on disk."""
 

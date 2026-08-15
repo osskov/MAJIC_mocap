@@ -538,6 +538,36 @@ def build_report_path(dataset: str, subject: str, trial: str) -> Path:
     return path.with_suffix('.build.parquet')
 
 
+def save_build_report(report, subject: str, trial: str,
+                      dataset: str = TRIAL_DATASET) -> Optional[Path]:
+    """Writes one trial's BuildReport sidecar. Returns the path, or None if there was none.
+
+    Split out of `save_cached_trial` so THE FAILURE PATH CAN CALL IT TOO. The report used to
+    be written only on the way past a successful save, which meant a trial that raised
+    produced no diagnostics at all -- and a build that raises is precisely the one whose
+    diagnostics you want. Whatever the readers measured before the exception is still valid
+    and is now kept.
+
+    Written atomically but NOT part of the cache key: it describes the artifact rather than
+    determining it, so adding a metric must not invalidate 281 trials. A missing or outdated
+    sidecar therefore means "tier-1 unavailable for this trial", which build_quality reports
+    rather than treating as staleness.
+    """
+    if report is None:
+        return None
+    frame = report.to_frame()
+    if frame.empty:
+        return None
+    report_path = ensure_parent(build_report_path(dataset, subject, trial))
+    staging = report_path.with_suffix(report_path.suffix + '.tmp')
+    try:
+        frame.to_parquet(staging, engine='pyarrow', index=False)
+        os.replace(staging, report_path)
+    finally:
+        staging.unlink(missing_ok=True)
+    return report_path
+
+
 def save_cached_trial(plates: Dict[str, PlateTrial], subject: str, trial: str,
                       dataset: str = TRIAL_DATASET, report=None) -> Path:
     """Writes a trial's PlateTrials plus the manifest that validates them on load.
@@ -559,19 +589,7 @@ def save_cached_trial(plates: Dict[str, PlateTrial], subject: str, trial: str,
     finally:
         staging.unlink(missing_ok=True)
 
-    # The build report, if one was collected. Written the same atomic way, but NOT part of
-    # the cache key: it describes the artifact rather than determining it, so adding a metric
-    # must not invalidate 281 trials. A missing or outdated sidecar therefore means
-    # "tier-1 unavailable for this trial", which build_quality reports rather than treating
-    # as staleness.
-    if report is not None:
-        report_path = build_report_path(dataset, subject, trial)
-        report_staging = report_path.with_suffix(report_path.suffix + '.tmp')
-        try:
-            report.to_frame().to_parquet(report_staging, engine='pyarrow', index=False)
-            os.replace(report_staging, report_path)
-        finally:
-            report_staging.unlink(missing_ok=True)
+    save_build_report(report, subject, trial, dataset=dataset)
 
     write_manifest(
         path,

@@ -16,8 +16,20 @@ from ..IMUTrace import IMUTrace
 
 
 # MTw2 datasheet full-scale ranges. A sample beyond these did not happen: it is a corrupt
-# export. 36 of them are in this dataset, always exactly two accelerometer and two gyroscope
-# samples in a file, peaking at 1.15e5 m/s^2 between neighbours reading 6.2 and 12.9.
+# export.
+#
+# Measured across both datasets: 36 samples in 18 IMoVE files, all ACCELEROMETER -- no
+# gyroscope sample anywhere exceeds full scale, and Al Borno is clean throughout. The
+# signature is the same every time: two ADJACENT rows holding near-exact negatives of each
+# other. s16/t2_treadmill_walking reads
+#
+#     row 3937  [   9.86,      0.66,      1.15]
+#     row 3938  [ 109094.73, -29145.45, -66244.38]
+#     row 3939  [-109218.09,  29214.16,  66102.56]
+#     row 3940  [   9.38,      2.24,      1.54]
+#
+# which is a sign flip in the export, not a measurement -- an eleven-thousand-g impulse
+# would have destroyed the sensor. Reconstructing those two rows recovers 9.88 and 9.54.
 ACC_RANGE_MS2 = 160.0
 GYRO_RANGE_DEG_S = 2000.0
 
@@ -102,8 +114,9 @@ def read_xsens_txt(file_path: Union[str, Path],
     if has_counter:
         elapsed, gaps, missing, largest = _elapsed_from_counter(df['PacketCounter'], freq)
     else:
-        elapsed, gaps, missing, largest = None, 0, 0, 0
-    timestamps = np.arange(len(df), dtype=np.float64) / freq
+        elapsed = np.arange(len(df), dtype=np.float64) / freq
+        gaps, missing, largest = 0, 0, 0
+    timestamps = elapsed
 
     # A row carrying a non-finite value cannot anchor an interpolant, and some exports have
     # them: s4l's long walk has rows of NaN that made the spline refuse outright. Dropped from
@@ -111,15 +124,44 @@ def read_xsens_txt(file_path: Union[str, Path],
     # timeline that is known to be wrong.
     finite = np.isfinite(acc).all(axis=1) & np.isfinite(gyro).all(axis=1) \
         & np.isfinite(mag).all(axis=1)
-    if missing and finite.sum() > 3:
+
+    # A SAMPLE BEYOND THE SENSOR'S FULL SCALE IS NOT A MEASUREMENT, so it is dropped from the
+    # fit alongside the NaNs and reconstructed from its neighbours rather than kept.
+    #
+    # Counting these was not enough. An impulse of 1.15e5 m/s^2 rings through a Butterworth
+    # for hundreds of samples, and `_lag_seconds` correlates on gyro MAGNITUDE, where one
+    # such sample dominates the entire trace. A diagnostic that records the spike and then
+    # hands it downstream anyway buys nothing.
+    #
+    # Whole ROWS are dropped, not individual channels, because the corruption signature is a
+    # burst rather than a channel fault, and a spline fitted per channel on different support
+    # would leave the axes mutually inconsistent for that instant.
+    in_range = ((np.abs(np.nan_to_num(acc)) <= ACC_RANGE_MS2).all(axis=1)
+                & (np.abs(np.nan_to_num(gyro)) <= GYRO_RANGE_DEG_S).all(axis=1))
+    n_out_of_range_acc = int((np.abs(acc) > ACC_RANGE_MS2).any(axis=1).sum())
+    n_out_of_range_gyro = int((np.abs(gyro) > GYRO_RANGE_DEG_S).any(axis=1).sum())
+    raw_acc_abs_max = float(np.abs(acc[finite]).max()) if finite.any() else np.nan
+    raw_gyro_abs_max = float(np.abs(gyro[finite]).max()) if finite.any() else np.nan
+
+    usable = finite & in_range
+    if (missing or not usable.all()) and usable.sum() > 3:
         uniform = np.arange(elapsed[-1] * freq + 1, dtype=np.float64) / freq
-        acc, gyro, mag = (CubicSpline(elapsed[finite], values[finite], axis=0)(uniform)
+        # extrapolate=False rather than the default. A corrupt or non-finite row at either
+        # END of the record leaves the grid running past the fit's support, and a cubic
+        # extrapolated even a few samples is unbounded -- the same failure that produced
+        # 1.3e10 m positions when the resampler extrapolated Al Borno's padding. The edges
+        # are held at the nearest real sample instead, which is wrong by at most one
+        # sample's motion and cannot diverge.
+        acc, gyro, mag = (_spline_onto(elapsed[usable], values[usable], uniform)
                           for values in (acc, gyro, mag))
         timestamps = uniform
+    else:
+        # Too few usable rows to fit anything. The counter's own elapsed time is not uniform
+        # when packets were lost, and every resampler and finite-difference downstream
+        # assumes it is, so the index grid is the only safe thing to hand back.
+        timestamps = np.arange(len(acc), dtype=np.float64) / freq
 
     if report is not None:
-        out_of_range_acc = int((np.abs(acc) > ACC_RANGE_MS2).any(axis=1).sum())
-        out_of_range_gyro = int((np.abs(gyro) > GYRO_RANGE_DEG_S).any(axis=1).sum())
         report.add('S1_parse', 'file', file_path.name,
                    n_samples=len(timestamps), rate_hz=freq,
                    rate_source='header' if sample_rate_hz is None else 'caller',
@@ -129,12 +171,29 @@ def read_xsens_txt(file_path: Union[str, Path],
                    largest_gap_samples=largest,
                    timeline_error_s=missing / freq,
                    n_non_finite_rows=int((~finite).sum()),
-                   n_out_of_range_acc=out_of_range_acc,
-                   n_out_of_range_gyro=out_of_range_gyro,
+                   n_out_of_range_acc=n_out_of_range_acc,
+                   n_out_of_range_gyro=n_out_of_range_gyro,
+                   n_rows_dropped=int((~usable).sum()),
+                   # Post-repair, so this is what actually reached the parquet; the raw_*
+                   # pair beside it is what the export claimed.
                    acc_abs_max=float(np.abs(acc).max()),
-                   gyro_abs_max=float(np.abs(gyro).max()))
+                   gyro_abs_max=float(np.abs(gyro).max()),
+                   raw_acc_abs_max=raw_acc_abs_max,
+                   raw_gyro_abs_max=raw_gyro_abs_max)
 
     return IMUTrace(timestamps=timestamps, gyro=gyro, acc=acc, mag=mag)
+
+
+def _spline_onto(source_times: np.ndarray, values: np.ndarray,
+                 target_times: np.ndarray) -> np.ndarray:
+    """Cubic spline through `values`, evaluated on `target_times`, edges held constant."""
+    resampled = CubicSpline(source_times, values, axis=0,
+                            extrapolate=False)(target_times)
+    before = target_times < source_times[0]
+    after = target_times > source_times[-1]
+    resampled[before] = values[0]
+    resampled[after] = values[-1]
+    return resampled
 
 
 def _elapsed_from_counter(counter, freq: float):

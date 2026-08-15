@@ -62,19 +62,26 @@ QUANTILES = [0.05, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
 # reconstruction, so blocking reconstruction metrics on the sensor would trebly count one
 # measurement, while alignment genuinely differs per sensor.
 BLOCKING = {
+    # One export file is one observation: packet loss and out-of-range samples are properties
+    # of a radio link and an export, not of the segment underneath the sensor.
+    'S1_parse': ('dataset', 'subject', 'trial', 'entity'),
     'S2_reconstruction': ('dataset', 'subject', 'trial', 'entity'),
     'S3_pairing': ('dataset', 'subject', 'trial'),
     'S4_sync': ('dataset', 'subject', 'trial'),
+    # Blocked on the entity, unlike reconstruction: the discarded-power fraction is a property
+    # of what the sensor measured, so a segment's three placements are three real replicates.
+    'S5_resampling': ('dataset', 'subject', 'trial', 'entity'),
     'S6_timeline': ('dataset', 'subject', 'trial'),
     'S7_alignment': ('dataset', 'subject', 'trial', 'entity'),
+    'S8_lever_arm': ('dataset', 'subject', 'trial', 'entity'),
 }
 
 # An ICC at or above this means the grouping's members are not independent replicates.
 ICC_DEPENDENT = 0.95
 
-TRIAL_TABLES = ('index', 'report_rows', 'reconstruction', 'sync', 'timeline', 'alignment',
-                'icc_report', 'health', 'coverage', 'invalid_sections',
-                'plate_diagnostics')
+TRIAL_TABLES = ('index', 'report_rows', 'parse', 'reconstruction', 'sync', 'resampling',
+                'timeline', 'alignment', 'lever_arm', 'icc_report', 'health', 'coverage',
+                'invalid_sections', 'plate_diagnostics')
 
 # A run of invalid frames shorter than this is a blink, not a gap. Reported separately so a
 # trial with one dropped frame is not filed beside one missing a whole limb.
@@ -131,9 +138,12 @@ def load_build_reports(dataset: str) -> Tuple[pd.DataFrame, List[Tuple[str, str]
 def build_index(dataset: str) -> pd.DataFrame:
     """One row per enumerated trial: cache status and the manifest's headline scalars.
 
-    This is the triage table. It is the only one that covers trials which FAILED to build,
-    because those have no parquet and no report -- and a failure taxonomy is most of the value
-    of looking at 281 trials at once.
+    This is the triage table. It is the only one that covers trials which FAILED to build --
+    and a failure taxonomy is most of the value of looking at 281 trials at once.
+
+    A failed trial has no parquet, but since `build_trials` started writing the sidecar from
+    the failure path it may still have a PARTIAL report. `last_step_reported` is filled in by
+    `run` from the concatenated reports, and for a failure it names how far the build got.
     """
     rows = []
     for subject, trial in get_source(dataset).enumerate_trials():
@@ -452,6 +462,77 @@ def _header(number: int, title: str, subtitle: str = "") -> None:
         print(subtitle)
 
 
+def _report_signal_repair(tables: Dict[str, pd.DataFrame]) -> None:
+    """What the parser had to throw away and reconstruct, per file.
+
+    Two separate faults share this path. A dropped radio packet leaves a HOLE, which the
+    counter locates and the spline fills at the right instant. A sample beyond the sensor's
+    full scale is a corrupt export, which is dropped and reconstructed from its neighbours --
+    36 of those are in this dataset, peaking at 1.15e5 m/s^2. Both are repairs, and a repaired
+    sample is interpolation rather than measurement, so the count belongs in a table.
+    """
+    table = tables.get('S1_parse')
+    if table is None or table.empty:
+        return
+    _header(7, "Signal repair", "packets lost, samples out of range, and rows reconstructed")
+    for column, label in (('missing_samples', 'packets lost'),
+                          ('n_out_of_range_acc', 'acc samples beyond full scale'),
+                          ('n_out_of_range_gyro', 'gyro samples beyond full scale'),
+                          ('n_non_finite_rows', 'non-finite rows'),
+                          ('n_rows_dropped', 'rows dropped and reconstructed')):
+        if column not in table:
+            continue
+        values = table[column].fillna(0)
+        affected = int((values > 0).sum())
+        print(f"  {label:34s} {int(values.sum()):8d} in {affected:4d} of "
+              f"{len(values):4d} files")
+    if 'raw_acc_abs_max' in table and 'acc_abs_max' in table:
+        worst = table.nlargest(5, 'raw_acc_abs_max')[
+            ['entity', 'raw_acc_abs_max', 'acc_abs_max']]
+        if float(worst.raw_acc_abs_max.max()) > 0:
+            print("\n  Largest raw accelerations, against what survived the bound check:")
+            for row in worst.itertuples():
+                print(f"    {row.entity[:48]:48s} {row.raw_acc_abs_max:12.1f} -> "
+                      f"{row.acc_abs_max:8.2f} m/s^2")
+
+
+def _report_decimation_cost(tables: Dict[str, pd.DataFrame]) -> None:
+    """How much signal the trial rate threw away.
+
+    Every trial runs at the SLOWEST rate any of its streams was recorded at, which for the
+    17-sensor IMoVE sessions is 40 Hz and therefore a 20 Hz Nyquist. That is the right choice
+    -- comparing two signals in different bands is worse -- but the cost was never quantified.
+
+    Measured, it is close to zero: the IMU is never the decimated stream in either dataset,
+    and the mocap loses 5e-9 to 2e-5 of its power because Motive's output is already smoothed
+    well below 20 Hz. The band limit that matters is the 40 Hz RECORDING rate, not this step.
+    `imu_rate_hz` in this table is what says which trials have it.
+    """
+    table = tables.get('S5_resampling')
+    if table is None or table.empty:
+        return
+    _header(8, "Decimation cost", "what the trial rate discarded, and where")
+    if 'target_rate_hz' in table:
+        rates = table.target_rate_hz.dropna()
+        if not rates.empty:
+            print("  trials by target rate:")
+            print(rates.value_counts().sort_index().to_string())
+    for column in ('acc_power_above_target_nyquist', 'gyro_power_above_target_nyquist',
+                   'mocap_position_power_above_target_nyquist'):
+        if column not in table:
+            continue
+        values = table[column].dropna()
+        if values.empty:
+            continue
+        print(f"\n  {column:42s} n={len(values):5d} "
+              f"q50 {100 * values.quantile(0.5):6.3f}%  "
+              f"q95 {100 * values.quantile(0.95):6.3f}%  "
+              f"max {100 * values.max():6.3f}%")
+        worst = table.nlargest(5, column)[['entity', column]]
+        for row in worst.itertuples():
+            print(f"    {row.entity[:40]:40s} {100 * getattr(row, column):6.3f}% discarded")
+
+
 def run(dataset: str, only_tables: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:
     """Build every table, print the console report, and return the tables."""
     wanted = set(only_tables) if only_tables else set(TRIAL_TABLES)
@@ -470,6 +551,18 @@ def run(dataset: str, only_tables: Optional[List[str]] = None) -> Dict[str, pd.D
         print("\nNo build reports at all. Rebuild with experiments/build_trials.py to collect "
               "them, then re-run.")
         return {'index': index}
+
+    # How far each build got. For a trial with a parquet this is just the last step that had
+    # anything to say; for one that FAILED it is the diagnostic -- the sidecar is written from
+    # the failure path, so the last step with rows is where the exception came from.
+    furthest = (reports.groupby(['subject', 'trial'])['step'].max()
+                .rename('last_step_reported').reset_index())
+    index = index.merge(furthest, on=['subject', 'trial'], how='left')
+    failed = index[index.status.isin(('missing', 'failed'))
+                   & index.last_step_reported.notna()]
+    if not failed.empty:
+        print(f"\n{len(failed)} trials with no artifact left a partial report:")
+        print(failed.groupby('last_step_reported').size().to_string())
 
     coverage = coverage_table(dataset, reports)
     diagnostics = plate_diagnostics(dataset)
@@ -550,6 +643,9 @@ def run(dataset: str, only_tables: Optional[List[str]] = None) -> Dict[str, pd.D
             print(f"\n  {int(over.sum())} of {len(diagnostics)} plates exceed "
                   f"{RESIDUAL_WARN_DEG_S:.0f} deg/s "
                   f"({100 * over.mean():.1f}%)")
+
+    _report_signal_repair(tables)
+    _report_decimation_cost(tables)
 
     health = health_score(index, tables)
     _header(5, "Trial health", "a triage ranking, not a gate — components shown beside it")

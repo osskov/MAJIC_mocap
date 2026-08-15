@@ -191,9 +191,20 @@ def assemble_plate_trials(
     if lag is None:
         lag = _shared_lag(paired, report=report, disable_tqdm=disable_tqdm)
 
+    if report is not None:
+        rates = sorted({round(float(rate), 6)
+                        for imu, world in paired.values()
+                        for rate in (imu.get_sample_frequency(),
+                                     world.get_sample_frequency())})
+        report.add('S5_resampling', 'trial', 'trial', target_rate_hz=target_rate,
+                   n_distinct_source_rates=len(rates),
+                   source_rates_hz=rates,
+                   fastest_source_rate_hz=max(rates))
+
     resampled = {}
     for name, (imu, world) in paired.items():
-        resampled[name] = _to_common_grid(imu, world, target_rate, lag)
+        resampled[name] = _to_common_grid(imu, world, target_rate, lag,
+                                          name=name, report=report)
 
     # One origin for the trial, applied to every plate. See _trial_origin: doing this per
     # plate silently puts joint-angle pairs on clocks that differ by a few samples.
@@ -286,7 +297,8 @@ def shift_world_origin(plate: PlateTrial, offset_m: np.ndarray) -> PlateTrial:
 
 
 def _to_common_grid(imu_trace: IMUTrace, world_trace: WorldTrace, target_rate: float,
-                    lag: float) -> Tuple[IMUTrace, WorldTrace]:
+                    lag: float, name: str = '', report: 'BuildReport' = None
+                    ) -> Tuple[IMUTrace, WorldTrace]:
     """Puts one plate's two streams on a single grid at `target_rate`, t = 0 at first overlap.
 
     The IMU defines the timeline, decimated to `target_rate` if it was faster. It is never
@@ -307,7 +319,19 @@ def _to_common_grid(imu_trace: IMUTrace, world_trace: WorldTrace, target_rate: f
     t = 0 has to be one instant for the whole trial, and this function only ever sees one
     plate. `_trial_origin` and `_rezero` do it afterwards, across all of them.
     """
-    if not np.isclose(imu_trace.get_sample_frequency(), target_rate):
+    imu_rate = imu_trace.get_sample_frequency()
+    world_rate = world_trace.get_sample_frequency()
+    if report is not None:
+        report.add('S5_resampling', 'plate', name,
+                   imu_rate_hz=imu_rate, world_rate_hz=world_rate,
+                   target_rate_hz=target_rate,
+                   imu_decimated=not np.isclose(imu_rate, target_rate),
+                   world_decimated=not np.isclose(world_rate, target_rate),
+                   n_imu_samples_in=len(imu_trace),
+                   n_world_samples_in=len(world_trace),
+                   **_power_above(imu_trace, world_trace, target_rate))
+
+    if not np.isclose(imu_rate, target_rate):
         imu_trace = imu_trace.resample(target_rate)
 
     # World clock -> IMU clock. resample_mask marks anything outside the mocap's own span
@@ -323,6 +347,64 @@ def _to_common_grid(imu_trace: IMUTrace, world_trace: WorldTrace, target_rate: f
     # PlateTrial requires the two to agree to 1e-8.
     return imu_trace, WorldTrace(imu_trace.timestamps, sampled.positions,
                                  sampled.rotations, valid=sampled.valid)
+
+
+def _power_above(imu_trace: IMUTrace, world_trace: WorldTrace,
+                 target_rate: float) -> Dict[str, float]:
+    """What fraction of each stream's power sits above the target Nyquist.
+
+    Decimating to the slower stream's rate is the right call -- see the comment at the
+    `target_rate` line -- but "right" is not "free", and the cost was never measured.
+
+    BOTH STREAMS, because which one pays depends on the session. The 17-sensor IMoVE
+    recordings put the IMU at 40 Hz and the mocap at 100, so the target is 40 and it is the
+    MOCAP that gets decimated; the IMU is untouched and simply never captured anything above
+    20 Hz in the first place, which is a property of the recording rather than of this
+    pipeline. The 100 Hz long-walk sessions are the other way round. Measuring only the IMU
+    would have reported nothing at all for the sessions that make up most of the dataset.
+
+    THE MEAN IS REMOVED FIRST. Gravity is a ~9.81 DC term on the accelerometer and a marker's
+    position is offset from the origin by metres; either would otherwise be most of the total
+    and make every fraction look like a rounding error, regardless of how much genuine
+    high-frequency content was thrown away.
+
+    Reported per channel group rather than per axis: the question is how much of the signal
+    is lost, and a per-axis breakdown of that is a plot, not a build metric.
+
+    WHAT IT MEASURES, ON THE DATA IN HAND: the IMU is never the decimated stream. Every trial
+    in both datasets is either all-100 Hz or a 40 Hz IMU against 100 Hz mocap, so the target
+    is the IMU's own rate and only the mocap is ever resampled down. The mocap loses between
+    5e-9 and 2e-5 of its power -- nothing, because Motive's output is already smoothed well
+    below 20 Hz. So the decimation step itself is close to free, and the real band limit is
+    the 40 Hz RECORDING rate, which is a property of the session rather than of this code.
+    The acc/gyro fractions are kept anyway: they are what would catch a future dataset where
+    that stops being true, and their absence is itself the finding.
+    """
+    fractions = {}
+    for label, values, rate in (
+            ('acc', imu_trace.acc, imu_trace.get_sample_frequency()),
+            ('gyro', imu_trace.gyro, imu_trace.get_sample_frequency()),
+            ('mocap_position', world_trace.positions,
+             world_trace.get_sample_frequency())):
+        fraction = _fraction_above(values, rate, target_rate)
+        if fraction is not None:
+            fractions[f'{label}_power_above_target_nyquist'] = fraction
+    return fractions
+
+
+def _fraction_above(values: np.ndarray, rate: float, target_rate: float):
+    """Fraction of `values`' mean-removed power above `target_rate / 2`, or None."""
+    # np.isclose, matching the guard that decides whether to decimate at all. A stream whose
+    # measured rate differs from the target in the twelfth decimal is not decimated, and
+    # reporting a meaningless ~0 fraction for it would put a row in the table for every plate
+    # in every same-rate trial.
+    finite = values[np.isfinite(values).all(axis=1)]
+    if len(finite) < 4 or target_rate >= rate or np.isclose(rate, target_rate):
+        return None
+    power = np.abs(np.fft.rfft(finite - finite.mean(axis=0), axis=0)) ** 2
+    above = np.fft.rfftfreq(len(finite), d=1.0 / rate) > target_rate / 2.0
+    total = power.sum()
+    return float(power[above].sum() / total) if total > 0 else 0.0
 
 
 def _trial_origin(resampled: Dict[str, Tuple[IMUTrace, WorldTrace]],

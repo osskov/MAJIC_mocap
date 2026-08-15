@@ -12,7 +12,9 @@ Two properties matter more than any individual metric.
   the instrumentation existed is still perfectly valid and simply has no tier-1 data. If that
   ever started reading as 'stale', every such trial would silently rebuild.
 """
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -147,6 +149,71 @@ class TestInstrumentedSitesFire(unittest.TestCase):
         unmatched = frame[frame.metric.str.startswith('unmatched_imu')]
         self.assertIn('orphan', set(unmatched.value_str))
 
+    def test_resampling_reports_what_the_trial_rate_discarded(self):
+        """S5 emitted nothing at all until now, so the one step that irreversibly throws
+        signal away was the one step with no record of having done so."""
+        from src.toolchest.building.assembly import assemble_plate_trials
+
+        # 100 Hz IMU against a 40 Hz world trace, so the trial lands at 40 and the IMU is
+        # decimated -- the IMoVE 17-sensor case, where Nyquist becomes 20 Hz.
+        imu_traces, world_traces = self._pair(rate=100.0)
+        slow, _ = self._pair(rate=40.0)
+        world_traces = {name: trace.resample(40.0) for name, trace in world_traces.items()}
+
+        report = BuildReport()
+        assemble_plate_trials(imu_traces, world_traces, True, report=report)
+
+        frame = report.to_frame()
+        rows = frame[frame.step == 'S5_resampling']
+        self.assertFalse(rows.empty, 'S5_resampling emitted nothing')
+
+        metrics = dict(zip(rows[rows.entity == 'plate_a'].metric,
+                           rows[rows.entity == 'plate_a'].value_num))
+        self.assertAlmostEqual(metrics['imu_rate_hz'], 100.0, places=4)
+        self.assertAlmostEqual(metrics['target_rate_hz'], 40.0, places=4)
+        self.assertEqual(metrics['imu_decimated'], 1.0)
+        # The synthetic trace is band-limited well below 20 Hz, so almost nothing is lost --
+        # but the metric must be present and finite, which is the thing that was missing.
+        self.assertIn('acc_power_above_target_nyquist', metrics)
+        self.assertTrue(0.0 <= metrics['gyro_power_above_target_nyquist'] <= 1.0)
+
+    def test_the_discarded_fraction_tracks_content_above_nyquist(self):
+        """A number that is present but always ~0 would be indistinguishable from a stub.
+        A trace with real content above the target Nyquist has to read higher than one
+        without."""
+        from src.toolchest.building.assembly import _fraction_above
+
+        time = np.arange(2000) / 100.0
+        quiet = np.tile((np.sin(2 * np.pi * 2.0 * time))[:, None], (1, 3))
+        fast = np.tile((np.sin(2 * np.pi * 35.0 * time))[:, None], (1, 3))
+
+        self.assertLess(_fraction_above(quiet, 100.0, 40.0), 1e-3)
+        self.assertGreater(_fraction_above(fast, 100.0, 40.0), 0.9)
+
+        # A large DC term must not swamp it: gravity is ~9.81 on the accelerometer and a
+        # marker sits metres from the origin, either of which would otherwise be most of the
+        # total and make every fraction read as a rounding error.
+        self.assertGreater(_fraction_above(fast + 9.81, 100.0, 40.0), 0.9)
+        self.assertGreater(_fraction_above(fast + 1000.0, 100.0, 40.0), 0.9)
+
+        # Nothing to discard when the stream is already at the target.
+        self.assertIsNone(_fraction_above(fast, 40.0, 40.0))
+
+    def test_the_mocap_side_is_measured_too(self):
+        """The 17-sensor IMoVE sessions put the IMU at 40 Hz and the mocap at 100, so the
+        target is 40 and it is the MOCAP that gets decimated. Measuring only the IMU would
+        have reported nothing for the sessions that are most of the dataset."""
+        from src.toolchest.building.assembly import _power_above
+
+        imu_traces, world_traces = self._pair(rate=40.0)
+        fine, fine_world = self._pair(rate=100.0)
+        fractions = _power_above(imu_traces['plate_a'], fine_world['plate_a'], 40.0)
+
+        self.assertIn('mocap_position_power_above_target_nyquist', fractions)
+        # The IMU is already at the target, so it contributes nothing -- which is the case
+        # that used to leave the whole row empty.
+        self.assertNotIn('acc_power_above_target_nyquist', fractions)
+
     def test_collecting_does_not_change_the_result(self):
         """The instrumentation observes; it must not participate."""
         from src.toolchest.building.assembly import assemble_plate_trials
@@ -211,14 +278,109 @@ class TestPacketCounterTiming(unittest.TestCase):
 
 
 class TestOutOfRangeDetection(unittest.TestCase):
+    """A sample beyond the sensor's full scale is dropped and reconstructed, not just counted.
+
+    36 such samples sit in 18 IMoVE files, all accelerometer, always two adjacent rows holding
+    near-exact negatives of each other -- a sign flip in the export rather than a measurement.
+    Counting them was the first pass and it was not enough: a 1.15e5 m/s^2 impulse rings
+    through a Butterworth for hundreds of samples, and `_lag_seconds` correlates on gyro
+    magnitude, where one such sample dominates the whole trace.
+    """
+
     def test_the_datasheet_ranges_are_the_ones_the_hardware_has(self):
-        """36 samples in this dataset exceed them, peaking at 1.15e5 m/s^2 between neighbours
-        reading 6.2 and 12.9 -- a corrupt export, not a measurement. A spike that size rings
-        through a Butterworth for hundreds of samples and dominates any correlation taken on
-        gyro magnitude."""
         from src.toolchest.building.xsens import ACC_RANGE_MS2, GYRO_RANGE_DEG_S
         self.assertAlmostEqual(ACC_RANGE_MS2, 160.0)
         self.assertAlmostEqual(GYRO_RANGE_DEG_S, 2000.0)
         # Comfortably above gravity and a fast limb, so a real sample never trips it.
         self.assertGreater(ACC_RANGE_MS2, 10 * 9.81)
         self.assertGreater(GYRO_RANGE_DEG_S, 1500.0)
+
+    @staticmethod
+    def _write(tmpdir, acc_spike=None, gyro_spike=None, spike_row=40, n=120, freq=40.0):
+        """One synthetic Xsens export, optionally with a corrupt sample at `spike_row`."""
+        import pandas as pd
+        time = np.arange(n) / freq
+        wave = np.column_stack([np.sin(2 * np.pi * 1.3 * time),
+                                np.cos(2 * np.pi * 0.7 * time),
+                                np.sin(2 * np.pi * 2.1 * time)])
+        acc, gyro, mag = 9.81 + wave, 50.0 * wave, 0.5 * wave
+        clean_acc, clean_gyro = acc.copy(), gyro.copy()
+        if acc_spike is not None:
+            acc[spike_row, 0] = acc_spike
+        if gyro_spike is not None:
+            gyro[spike_row, 1] = gyro_spike
+
+        frame = pd.DataFrame({'PacketCounter': np.arange(n)})
+        for prefix, values in (('Acc', acc), ('Gyr', gyro), ('Mag', mag)):
+            for axis, column in zip('XYZ', values.T):
+                frame[f'{prefix}_{axis}'] = column
+
+        path = Path(tmpdir) / 'sensor.txt'
+        with open(path, 'w', encoding='utf-8') as handle:
+            handle.write(f'// Update Rate: {freq}Hz\n')
+            frame.to_csv(handle, sep='\t', index=False, lineterminator='\n')
+        return path, clean_acc, clean_gyro
+
+    def test_an_impossible_acceleration_does_not_reach_the_trace(self):
+        from src.toolchest.building.xsens import ACC_RANGE_MS2, read_xsens_txt
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path, clean_acc, _ = self._write(tmpdir, acc_spike=1.15e5)
+            report = BuildReport()
+            trace = read_xsens_txt(path, report=report)
+
+        self.assertLessEqual(float(np.abs(trace.acc).max()), ACC_RANGE_MS2)
+        # Reconstructed from its neighbours rather than zeroed or clipped: the repaired
+        # sample should land near what the underlying signal was doing.
+        self.assertAlmostEqual(trace.acc[40, 0], clean_acc[40, 0], delta=0.05)
+
+        metrics = dict(zip(report.to_frame().metric, report.to_frame().value_num))
+        self.assertEqual(metrics['n_out_of_range_acc'], 1.0)
+        self.assertEqual(metrics['n_rows_dropped'], 1.0)
+        # Both sides of the repair are kept -- what the export claimed and what survived.
+        self.assertAlmostEqual(metrics['raw_acc_abs_max'], 1.15e5)
+        self.assertLess(metrics['acc_abs_max'], ACC_RANGE_MS2)
+
+    def test_an_impossible_rotation_rate_does_not_reach_the_trace(self):
+        from src.toolchest.building.xsens import GYRO_RANGE_DEG_S, read_xsens_txt
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path, _, clean_gyro = self._write(tmpdir, gyro_spike=6116.0)
+            trace = read_xsens_txt(path)
+        self.assertLessEqual(float(np.abs(trace.gyro).max()), GYRO_RANGE_DEG_S)
+        self.assertAlmostEqual(trace.gyro[40, 1], clean_gyro[40, 1], delta=1.0)
+
+    def test_a_whole_row_goes_when_one_channel_is_corrupt(self):
+        """The corruption signature is a burst, not a channel fault, and splines fitted per
+        channel on different support leave the axes inconsistent for that instant."""
+        from src.toolchest.building.xsens import read_xsens_txt
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path, _, clean_gyro = self._write(tmpdir, acc_spike=1.15e5)
+            trace = read_xsens_txt(path)
+        # The gyro at the spike row was never out of range, but it was refitted alongside
+        # the accelerometer, so it must still be close to the truth rather than untouched.
+        self.assertAlmostEqual(trace.gyro[40, 1], clean_gyro[40, 1], delta=1.0)
+
+    def test_a_corrupt_first_sample_does_not_extrapolate(self):
+        """A cubic evaluated outside its support is unbounded -- the same failure that
+        produced 1.3e10 m positions when the resampler extrapolated Al Borno's padding. The
+        edge is held at the nearest real sample instead."""
+        from src.toolchest.building.xsens import ACC_RANGE_MS2, read_xsens_txt
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path, _, _ = self._write(tmpdir, acc_spike=1.15e5, spike_row=0)
+            trace = read_xsens_txt(path)
+        self.assertTrue(np.isfinite(trace.acc).all())
+        self.assertLessEqual(float(np.abs(trace.acc).max()), ACC_RANGE_MS2)
+
+    def test_a_clean_export_is_left_exactly_alone(self):
+        """The repair path must not touch a file that needs no repair; a spline through every
+        sample would resample data that was already right."""
+        from src.toolchest.building.xsens import read_xsens_txt
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path, clean_acc, clean_gyro = self._write(tmpdir)
+            report = BuildReport()
+            trace = read_xsens_txt(path, report=report)
+        # atol rather than exact: the tolerance here is the CSV round-trip (~2e-15), not the
+        # reader. A spline would move these by orders of magnitude more.
+        np.testing.assert_allclose(trace.acc, clean_acc, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(trace.gyro, clean_gyro, rtol=0, atol=1e-12)
+        metrics = dict(zip(report.to_frame().metric, report.to_frame().value_num))
+        self.assertEqual(metrics['n_rows_dropped'], 0.0)

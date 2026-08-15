@@ -290,6 +290,29 @@ class TestCacheStatus(unittest.TestCase):
     def _path(self):
         return paths.cached_trial_path(self.DATASET, '01', 'walking')
 
+    def test_a_report_is_written_without_a_parquet_beside_it(self):
+        """The failure path calls save_build_report on its own, with no artifact to sit
+        beside, so it has to create its own parent directory and be readable afterwards."""
+        import pandas as pd
+        from src.toolchest.building.report import BuildReport
+
+        report = BuildReport()
+        report.add('S1_parse', 'file', 'thigh_r.txt', missing_samples=207)
+        path = eu.save_build_report(report, '01', 'walking', dataset=self.DATASET)
+
+        self.assertIsNotNone(path)
+        self.assertTrue(path.exists())
+        self.assertFalse(self._path().exists(), 'no parquet should have been created')
+        self.assertEqual(list(pd.read_parquet(path).metric), ['missing_samples'])
+
+    def test_an_empty_report_writes_no_sidecar(self):
+        """An empty file would read as 'instrumented, and found nothing' rather than 'this
+        build raised before measuring anything', which is the opposite conclusion."""
+        from src.toolchest.building.report import BuildReport
+        self.assertIsNone(eu.save_build_report(BuildReport(), '01', 'walking',
+                                               dataset=self.DATASET))
+        self.assertFalse(eu.build_report_path(self.DATASET, '01', 'walking').exists())
+
     def test_a_truncated_parquet_is_stale_not_fresh(self):
         """The guard where the work happens, not one level above it.
 

@@ -43,7 +43,8 @@ import paths
 from rich.console import Console
 from rich.table import Table
 from experiments.experiment_utils import (
-    TRIAL_DATASET, cached_trial_status, run_tracked_grid, save_cached_trial,
+    TRIAL_DATASET, cached_trial_status, run_tracked_grid, save_build_report,
+    save_cached_trial,
 )
 from experiments.experiment_utils import RESIDUAL_WARN_DEG_S
 from src.toolchest.building.report import BuildReport
@@ -59,6 +60,13 @@ def build_trial_worker(row_key: Tuple[str, str], stage_labels: List[str], shared
     stage = stage_labels[0]
     shared_state[(row_key, stage)] = "Running"
     started = time.time()
+    # Bound before the try so the failure path can write whatever was collected. Collected
+    # unconditionally: the report is the only record of what the build measured --
+    # reconstruction residuals, per-plate lags, alignment rotations -- and every one of those
+    # numbers is computed anyway, so the cost is the list that holds them. Making it opt-in
+    # would mean the answer to "was this trial any good" required rebuilding, which is the
+    # situation it exists to end.
+    report = BuildReport()
 
     try:
         status, reason = cached_trial_status(subject, activity, dataset=dataset)
@@ -76,12 +84,6 @@ def build_trial_worker(row_key: Tuple[str, str], stage_labels: List[str], shared
         # Straight to the dataset's reader. This is the thing that BUILDS the parquet, so
         # it is the one place that may touch source files at all — everything else in the
         # codebase goes through experiment_utils.load_trial, which reads only the artifact.
-        # Collected unconditionally. The report is the only record of what the build
-        # measured -- reconstruction residuals, per-plate lags, alignment rotations -- and
-        # every one of those numbers is computed anyway, so the cost is the list that holds
-        # them. Making it opt-in would mean the answer to "was this trial any good" required
-        # rebuilding, which is the situation it exists to end.
-        report = BuildReport()
         plates = source.load(subject, activity, report)
         path = save_cached_trial(plates, subject, activity, dataset=dataset, report=report)
 
@@ -98,6 +100,20 @@ def build_trial_worker(row_key: Tuple[str, str], stage_labels: List[str], shared
         # expensive to reproduce -- the build that surfaced it took minutes -- and str(e)
         # alone routinely does not say which of several call paths raised.
         shared_state[(row_key, stage)] = f"Failed ({e})"
+
+        # THE PARTIAL REPORT IS KEPT. Everything the readers measured before the exception is
+        # still valid, and the trials whose diagnostics matter most are exactly the ones that
+        # did not finish -- they used to leave nothing behind but a status string, so the only
+        # way to see how far the build got was to run it again under a debugger. The last step
+        # with rows in the sidecar now says where it stopped.
+        #
+        # Guarded, because a report that fails to write must not replace the real exception
+        # with its own: the traceback below is the thing worth surfacing.
+        try:
+            save_build_report(report, subject, activity, dataset=dataset)
+        except Exception:  # noqa: BLE001 - diagnostics must never mask the build failure
+            pass
+
         return {'subject': subject, 'activity': activity, 'action': 'failed',
                 'error': str(e), 'traceback': traceback.format_exc()}
 
