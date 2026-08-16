@@ -573,13 +573,31 @@ def _static_calibration(plate: PlateTrial) -> Dict[str, float]:
             'acc_scale_error': float(np.median(magnitudes) / GRAVITY_MS2 - 1.0)}
 
 
-def trial_diagnostics(plates: Dict[str, PlateTrial]) -> Dict[str, Any]:
+def trial_diagnostics(plates: Dict[str, PlateTrial], report=None) -> Dict[str, Any]:
     """Per-trial and per-plate quality numbers, recorded in the cache manifest.
 
     The point is triage at scale: with 22 trials you notice a bad one by eye, with the
     660-odd IMoVE adds. Having these in the manifests means a bad sync is a query over
     sidecars rather than a filter run that produces nonsense.
+
+    `report` supplies the one thing the plates cannot say about themselves: whether their
+    cluster-to-IMU offset was FITTED or DEFAULTED. A plate carries `sensor_offset` either way,
+    so `sensor_offset_mm` alone cannot be told apart from a nominal constant, and on 10.4% of
+    IMoVE's taped sensors it is one. That does not touch a joint angle -- `shift_world_origin`
+    moves positions only -- but it costs a lever-arm acceleration error with a median of
+    0.04 m/s^2 and a p95 of 0.30, so anything comparing measured against mocap-derived
+    ACCELERATION wants to know. It goes in the manifest rather than being left in the sidecar
+    because the manifest is what `load_trial` surfaces.
     """
+    fallbacks = {}
+    if report is not None:
+        rows = report.to_frame()
+        lever = rows[(rows.step == 'S8_lever_arm')
+                     & (rows.metric.isin(('used_fallback', 'distance_from_nominal_mm')))]
+        for entity, group in lever.groupby('entity'):
+            fallbacks[entity] = {row.metric: float(row.value_num)
+                                 for row in group.itertuples()
+                                 if row.value_num is not None}
     any_plate = next(iter(plates.values()))
     per_plate = {}
     for name in sorted(plates):
@@ -592,6 +610,9 @@ def trial_diagnostics(plates: Dict[str, PlateTrial]) -> Dict[str, Any]:
             # and a re-derivation can add it back. Without it a refit measures the RESIDUAL
             # and pasting that in as the new constant walks it to zero one run at a time.
             'sensor_offset_mm': [float(v) for v in np.asarray(plate.sensor_offset) * 1000.0],
+            # 1.0 means the offset is the nominal constant, not this trial's own fit.
+            **{f'sensor_offset_{key}': value
+               for key, value in fallbacks.get(name, {}).items()},
             **_alignment_residuals(plate),
         }
     return {
@@ -692,7 +713,7 @@ def save_cached_trial(plates: Dict[str, PlateTrial], subject: str, trial: str,
                                   content=_content_key(frame, plates)),
         dataset=dataset, subject=subject, trial=trial,
         source=str(source.source_dir(subject, trial).relative_to(paths.REPO_ROOT)),
-        diagnostics=trial_diagnostics(plates),
+        diagnostics=trial_diagnostics(plates, report=report),
     )
     return path
 

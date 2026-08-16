@@ -724,3 +724,51 @@ class TestStaticCalibration(unittest.TestCase):
         plate = self._plate(scale=1.5)
         out = eu._static_calibration(plate)
         self.assertAlmostEqual(out['acc_scale_error'], 0.5, places=4)
+
+
+class TestFallbackOffsetIsVisible(unittest.TestCase):
+    """Whether a plate's cluster-to-IMU offset was FITTED or DEFAULTED.
+
+    A plate carries `sensor_offset` either way, so `sensor_offset_mm` in the manifest cannot
+    be told apart from a nominal constant -- and on 10.4% of IMoVE's taped sensors it is one.
+    Joint angles are untouched, because `shift_world_origin` moves positions and leaves
+    rotations alone, but the lever-arm acceleration error is a median 0.04 m/s^2 and a p95 of
+    0.30, so an acceleration comparison wants to be able to exclude those plates.
+    """
+
+    @staticmethod
+    def _report(**per_plate):
+        from src.toolchest.building.report import BuildReport
+        report = BuildReport()
+        for name, values in per_plate.items():
+            report.add('S8_lever_arm', 'plate', name, **values)
+        return report
+
+    def test_a_defaulted_offset_is_marked_in_the_manifest(self):
+        report = self._report(femur_r_imu={'used_fallback': True,
+                                           'distance_from_nominal_mm': 0.0})
+        plates = make_plates(names=('femur_r_imu',))
+        stats = eu.trial_diagnostics(plates, report=report)['plates']['femur_r_imu']
+        self.assertEqual(stats['sensor_offset_used_fallback'], 1.0)
+
+    def test_a_fitted_offset_is_marked_too(self):
+        """Absence of the flag would be ambiguous with 'this dataset has no lever-arm step',
+        so the fitted case says so rather than staying silent."""
+        report = self._report(femur_r_imu={'used_fallback': False,
+                                           'distance_from_nominal_mm': 22.4})
+        plates = make_plates(names=('femur_r_imu',))
+        stats = eu.trial_diagnostics(plates, report=report)['plates']['femur_r_imu']
+        self.assertEqual(stats['sensor_offset_used_fallback'], 0.0)
+        self.assertAlmostEqual(stats['sensor_offset_distance_from_nominal_mm'], 22.4)
+
+    def test_a_dataset_with_no_lever_arm_step_is_unaffected(self):
+        """Al Borno has no cluster-to-IMU offset at all, and must not gain empty keys."""
+        stats = eu.trial_diagnostics(make_plates(), report=None)['plates']['femur_r_imu']
+        self.assertNotIn('sensor_offset_used_fallback', stats)
+        self.assertIn('sensor_offset_mm', stats)
+
+    def test_collecting_it_does_not_disturb_the_other_diagnostics(self):
+        plates = make_plates()
+        without = eu.trial_diagnostics(plates)
+        with_report = eu.trial_diagnostics(plates, report=self._report())
+        self.assertEqual(without, with_report)
