@@ -23,6 +23,7 @@ Both read the parquet cache, so they are real-data tests and are skipped rather 
 when it has not been built.
 """
 import unittest
+import warnings
 
 from test.fixtures import require_cache, require_data
 
@@ -379,3 +380,89 @@ class TestAgainstCachedTrials(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestPerSubjectFallback(unittest.TestCase):
+    """Where a taped sensor's per-trial fit diverges, the fallback is THAT SUBJECT'S offset.
+
+    The cohort nominal is a median over 26 people's taping, so for any subject whose placement
+    differs from the average it is wrong in the same direction every time it is used -- and it
+    is used on 10.4% of taped plates. Leave-one-out over the 1876 trials that did fit: the
+    cohort nominal predicts a held-out trial to 24.63 mm, that subject's other trials to
+    12.29 mm, better in 82.4% of cases across all ten sensors.
+    """
+
+    def _offsets(self, subject, gyro_scale=1.0):
+        from src.toolchest.building.imove_mocap import _sensor_offsets
+        return _sensor_offsets(self._plates(gyro_scale), subject=subject)
+
+    @staticmethod
+    def _plates(gyro_scale=1.0):
+        """One taped plate whose fit cannot succeed, so the fallback is what comes back."""
+        from scipy.spatial.transform import Rotation
+        from src.toolchest.IMUTrace import IMUTrace
+        from src.toolchest.PlateTrial import PlateTrial
+        from src.toolchest.WorldTrace import WorldTrace
+
+        time = np.arange(400) / 100.0
+        rotations = Rotation.from_euler('z', gyro_scale * time).as_matrix()
+        world = WorldTrace(time, np.zeros((len(time), 3)), rotations)
+        imu = IMUTrace(time, np.zeros((len(time), 3)), np.zeros((len(time), 3)),
+                       np.zeros((len(time), 3)))
+        return {'THIGH_L_H': PlateTrial('THIGH_L_H', imu, world)}
+
+    def test_a_subject_in_the_table_gets_its_own_offset(self):
+        from src.toolchest.building.imove_mocap import NOMINAL_SENSOR_OFFSET_MM
+        from src.toolchest.building.imove_subject_offsets import SUBJECT_SENSOR_OFFSET_MM
+        subject = next(s for s, v in SUBJECT_SENSOR_OFFSET_MM.items() if 'THIGH_L_H' in v)
+        expected = np.asarray(SUBJECT_SENSOR_OFFSET_MM[subject]['THIGH_L_H']) / 1000.0
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            _, offset = self._offsets(subject)['THIGH_L_H']
+
+        np.testing.assert_allclose(offset, expected, atol=1e-9)
+        # And it is genuinely a different answer from the cohort's, or this proves nothing.
+        cohort = np.asarray(NOMINAL_SENSOR_OFFSET_MM['THIGH_L_H']) / 1000.0
+        self.assertGreater(np.linalg.norm(offset - cohort) * 1000.0, 1.0)
+
+    def test_an_unknown_subject_falls_through_to_the_cohort(self):
+        """A subject with too few successful fits has no median worth trusting, and the
+        cohort constant -- backed by hundreds of fits -- is the better guess."""
+        from src.toolchest.building.imove_mocap import NOMINAL_SENSOR_OFFSET_MM
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            _, offset = self._offsets('not_a_session')['THIGH_L_H']
+        np.testing.assert_allclose(
+            offset, np.asarray(NOMINAL_SENSOR_OFFSET_MM['THIGH_L_H']) / 1000.0, atol=1e-9)
+
+    def test_the_table_cannot_change_which_fits_are_accepted(self):
+        """THE ANTI-CIRCULARITY PROPERTY, and the whole reason the gate and the fallback use
+        different references. Letting the subject median gate the fit too closes a loop -- a
+        better reference admits more fits, which moves the median, which moves the gate -- and
+        measured over three passes that accepted 1890, then 1951, then 1954 fits while one
+        sensor swung 13.7 mm. The gate is pinned to the cohort constant so one pass is exact.
+        """
+        import inspect
+        from src.toolchest.building import imove_mocap
+
+        source = inspect.getsource(imove_mocap._sensor_offsets)
+        gate = next(line for line in source.splitlines()
+                    if 'FIT_PLAUSIBILITY_MM' in line and 'fitted' in line)
+        self.assertIn('nominal', gate)
+        self.assertNotIn('fallback', gate,
+                         'the gate must not be measured against the derived table')
+
+    def test_the_committed_table_matches_what_the_build_implies(self):
+        """`--check` reruns the derivation against the current build reports. A drift here
+        means the table was hand-edited or the build moved under it."""
+        from test.fixtures import require_cache
+        from experiments.derive_subject_offsets import TARGET, collect, derive, render
+        if not TARGET.exists():
+            self.skipTest('no derived table')
+        fits = collect()
+        require_cache(not fits.empty, 'no built IMoVE trials to derive from')
+        self.assertEqual(
+            TARGET.read_text(),
+            render(derive(fits), len(fits), int(fits.subject.nunique())),
+            'run: python -m experiments.derive_subject_offsets')

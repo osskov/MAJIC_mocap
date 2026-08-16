@@ -36,6 +36,7 @@ from ..PlateTrial import PlateTrial
 from ..WorldTrace import WorldTrace
 from .assembly import (_lag_seconds, _world_on_timestamps, assemble_plate_trials,
                        shift_world_origin)
+from .imove_subject_offsets import SUBJECT_SENSOR_OFFSET_MM
 from .reconstruction import record_reconstruction, fit_plate_to_template
 from .xsens import read_xsens_txt
 
@@ -431,7 +432,7 @@ def load_trial(session_dir: Union[str, Path], trial: str,
     if align_plate_trials:
         plates = {name: shift_world_origin(plate, offset)
                   for name, (plate, offset)
-                  in _sensor_offsets(plates, report=report).items()}
+                  in _sensor_offsets(plates, subject=session_dir.name, report=report).items()}
     return plates
 
 
@@ -479,7 +480,7 @@ def _fit_iteratively(plate: PlateTrial, iterations: int = 4,
     return total
 
 
-def _sensor_offsets(plates: Dict[str, PlateTrial], report=None
+def _sensor_offsets(plates: Dict[str, PlateTrial], subject: str = None, report=None
                     ) -> Dict[str, Tuple[PlateTrial, np.ndarray]]:
     """{sensor: (plate, offset in metres)}, constant where the sensor is bolted on and fitted
     where it is taped on.
@@ -497,6 +498,17 @@ def _sensor_offsets(plates: Dict[str, PlateTrial], report=None
     A fitted offset is checked against its nominal before being trusted, because the per-trial
     solve does occasionally diverge -- one trial returned a magnitude sd of 205 mm, which
     would put the mocap origin further from the sensor than doing nothing at all.
+
+    WHERE IT DIVERGES, THIS SUBJECT'S OWN OFFSET IS THE FALLBACK, not the cohort's. The
+    nominal is a median over 26 people's taping, so for any subject whose placement differs
+    from the cohort average it is wrong in the same direction every time it is used -- and it
+    is used on 10.4% of taped plates. Leave-one-out over the 1876 trials that did fit: hiding
+    a trial and predicting it from the cohort nominal gives 24.63 mm of error, from the median
+    of that subject's other trials 12.29 mm, better in 82.4% of cases across all ten sensors.
+    See experiments/derive_subject_offsets.py, which writes the table.
+
+    The cohort nominal remains the last resort, for a subject with too few successful fits to
+    have a median worth trusting.
     """
     resolved = {}
     for name, plate in plates.items():
@@ -511,7 +523,25 @@ def _sensor_offsets(plates: Dict[str, PlateTrial], report=None
                 f"{name} is in neither RIGID_SENSOR_OFFSET_MM nor "
                 f"NOMINAL_SENSOR_OFFSET_MM, so its lever-arm error would be kept silently. "
                 f"Add it, or derive both with experiments/refit_cluster_offset.py.")
+        # THE GATE AND THE FALLBACK ARE DELIBERATELY DIFFERENT REFERENCES, and separating
+        # them is what keeps the per-subject table derivable.
+        #
+        # The gate asks "is this fit physically plausible", and it is measured against the
+        # COHORT NOMINAL -- a hand-checked constant that no build ever writes. The fallback
+        # asks "what should we use instead", and there the subject's own median is twice as
+        # good (12.29 mm of error against 24.63, leave-one-out).
+        #
+        # Letting the subject median serve as the gate too closes a feedback loop: a better
+        # reference admits more fits, which moves the median, which moves the gate. Measured
+        # rather than argued -- with the loop closed the derivation did not settle, accepting
+        # 1890 then 1951 then 1954 fits over three passes while one sensor's offset swung
+        # 13.7 mm between the last two. With the gate pinned to the cohort constant the
+        # accepted set does not depend on the table at all, so one pass is exact.
         nominal = np.asarray(nominal) / 1000.0
+        subject_offset = SUBJECT_SENSOR_OFFSET_MM.get(subject or '', {}).get(name)
+        fallback_source = 'cohort_nominal' if subject_offset is None else 'subject_median'
+        fallback = (nominal if subject_offset is None
+                    else np.asarray(subject_offset) / 1000.0)
 
         fitted = _fit_iteratively(plate)
 
@@ -519,9 +549,10 @@ def _sensor_offsets(plates: Dict[str, PlateTrial], report=None
             warnings.warn(
                 f"{name}: per-trial offset fit "
                 f"{'failed' if fitted is None else f'{np.round(fitted * 1000, 1)} mm'} is not "
-                f"usable; falling back to the nominal {np.round(nominal * 1000, 1)} mm.",
+                f"usable; falling back to the {fallback_source.replace('_', ' ')} "
+                f"{np.round(fallback * 1000, 1)} mm.",
                 ImplausibleOffsetFitWarning, stacklevel=3)
-            fitted = nominal
+            fitted = fallback
         resolved[name] = (plate, fitted)
         if report is not None:
             report.add('S8_lever_arm', 'plate', name,
@@ -530,7 +561,8 @@ def _sensor_offsets(plates: Dict[str, PlateTrial], report=None
                        nominal_magnitude_mm=float(np.linalg.norm(nominal) * 1000.0),
                        distance_from_nominal_mm=float(
                            np.linalg.norm(fitted - nominal) * 1000.0),
-                       used_fallback=bool(np.allclose(fitted, nominal)),
+                       used_fallback=bool(np.allclose(fitted, fallback)),
+                       fallback_source=fallback_source,
                        bolted=False)
     if report is not None:
         for name in RIGID_SENSOR_OFFSET_MM:
