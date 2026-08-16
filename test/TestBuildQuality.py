@@ -434,3 +434,50 @@ class TestPerTrialCoverageExpectation(unittest.TestCase):
         sensor as unexpected and silently empty the table."""
         from src.toolchest.building.sources import get_source
         self.assertIsNone(get_source('imove_biplane').expected_plates('12', 'A/B/notatrial'))
+
+
+class TestRobustOutliers(unittest.TestCase):
+    """The population-relative rule the fixed thresholds cannot express.
+
+    A build sees one trial at a time, and for the window check the failure is whole-trial --
+    every plate misplaced together, so no inlier is left inside the trial to compare against.
+    Tier 2 sees all 379 at once, which is the level the comparison belongs at.
+    """
+
+    def test_it_is_not_masked_by_its_own_outliers(self):
+        """Why not mean+k*sd. On this dataset the ratio has a skew of 26.6, so the sd is
+        inflated by the very points the rule is meant to find: add one more extreme value and
+        a 3-sigma cutoff moves out past it. A MAD does not move."""
+        from experiments.build_quality import _robust_outliers
+        base = pd.Series(list(np.linspace(1.0, 2.0, 200)) + [75.0])
+        worse = pd.Series(list(np.linspace(1.0, 2.0, 200)) + [75.0, 500.0])
+
+        self.assertTrue(_robust_outliers(base, log=True)[0].iloc[-1])
+        # The 75 must still be flagged once a 500 joins it.
+        self.assertTrue(_robust_outliers(worse, log=True)[0].iloc[200])
+        mean_sd = base.mean() + 3 * base.std()
+        self.assertGreater(worse.mean() + 3 * worse.std(), mean_sd,
+                           'the sd-based cutoff drifts outward, which is the masking')
+
+    def test_a_clean_population_flags_nothing(self):
+        """The control. A rule that fires on a tight distribution would flag a percentage of
+        every dataset forever, which is a quota rather than a detector."""
+        from experiments.build_quality import _robust_outliers
+        tight = pd.Series(np.linspace(1.0, 1.6, 300))
+        self.assertEqual(int(_robust_outliers(tight, log=True)[0].sum()), 0)
+
+    def test_too_few_points_declines_to_judge(self):
+        """With a handful of values the median and MAD are themselves noise, and a verdict
+        drawn from them would be a coin flip presented as a fact."""
+        from experiments.build_quality import _robust_outliers
+        mask, cutoff = _robust_outliers(pd.Series([1.0, 1.2, 90.0]), log=True)
+        self.assertEqual(int(mask.sum()), 0)
+        self.assertTrue(np.isnan(cutoff))
+
+    def test_a_zero_spread_population_declines_rather_than_flagging_everything(self):
+        """MAD of a constant column is 0, and dividing by it would make every non-identical
+        value infinitely anomalous."""
+        from experiments.build_quality import _robust_outliers
+        mask, cutoff = _robust_outliers(pd.Series([2.98] * 50 + [3.5]), log=True)
+        self.assertEqual(int(mask.sum()), 0)
+        self.assertTrue(np.isnan(cutoff))

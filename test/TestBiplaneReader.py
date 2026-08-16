@@ -503,3 +503,89 @@ class TestDeadMarkerChannels(unittest.TestCase):
                                     bp.VICON_CLUSTERS[('left', 'lateral_shank')])
         _, _, used = markers
         self.assertEqual(len(used), 4)
+
+
+class TestPretriggerBracket(unittest.TestCase):
+    """The biplane pre-trigger search, and the check on what it comes back with.
+
+    THE BRACKET HAS TO REACH ZERO. Over 378 trials the fitted offset is tightly unimodal --
+    299 inside 2.9-3.0 -- which makes a narrow bracket look safe. 06/RSHop2 is why it is not:
+    both of its bones independently put the offset at -0.03 and -0.06, meaning that trial's
+    biplane pose is already on the Vicon time base with no pre-trigger at all. A bracket of
+    [2.48, 3.48] cannot reach zero, so the search pinned at 2.81 and displaced a 0.78 s window
+    by 2.8 s -- the whole of that trial's factor-of-75 motion mismatch.
+    """
+
+    def test_the_fallback_bracket_reaches_zero(self):
+        """The specific failure. A bracket that cannot express 'no pre-trigger' silently
+        returns the nearest value it can, which is interior and looks fine."""
+        self.assertLess(
+            bp.BIPLANE_PRETRIGGER_S - bp.BIPLANE_PRETRIGGER_WIDE_BRACKET_S, 0.0)
+
+    def test_the_default_bracket_stays_narrow(self):
+        """Widening unconditionally is not free. On a periodic task the wide bracket reaches
+        the NEXT STRIDE's correlation peak: searching every trial at +/-3.5 s aliased 82 of 89
+        running-stance trials onto one, against 6 of the other 289. The narrow default is what
+        protects them, and it is why the wide search is a fallback rather than the rule."""
+        self.assertLess(bp.BIPLANE_PRETRIGGER_BRACKET_S,
+                        bp.BIPLANE_PRETRIGGER_WIDE_BRACKET_S)
+        self.assertGreater(bp.BIPLANE_PRETRIGGER_S - bp.BIPLANE_PRETRIGGER_BRACKET_S, 0.0)
+
+    def test_the_anomaly_check_is_against_the_constant_not_the_bracket(self):
+        """An edge check would not have caught 06/RSHop2: 2.81 is comfortably interior and
+        still wrong by the width of the window. Only comparing against the hardware value
+        catches it, so the threshold must be far tighter than the bracket."""
+        self.assertLess(bp.PRETRIGGER_ANOMALY_S, bp.BIPLANE_PRETRIGGER_WIDE_BRACKET_S)
+
+    def test_the_threshold_keeps_the_measured_bulk_quiet(self):
+        """Measured over 378 trials the offset spans 2.4-3.5, so a threshold under ~0.52 would
+        flag ordinary trials and stop meaning anything."""
+        self.assertGreaterEqual(bp.PRETRIGGER_ANOMALY_S, 0.5)
+
+
+@require_data
+class TestPretriggerAnomalyOnRealTrials(unittest.TestCase):
+    def _load(self, subject, key):
+        from src.toolchest.building.report import BuildReport
+        report = BuildReport()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            bp.load_trial(subject, key, report=report)
+        frame = report.to_frame()
+        return frame, [w for w in caught
+                       if w.category is bp.PretriggerAnomalyWarning]
+
+    @staticmethod
+    def _metric(frame, name, how='median'):
+        return getattr(frame[frame.metric == name].value_num, how)()
+
+    def test_a_periodic_trial_does_not_alias_onto_the_next_stride(self):
+        """The control on the fallback. 01/RrunStance2 fits 2.980 with the narrow default and
+        5.600 when the wide search runs unconditionally -- one stride out, and its window
+        still lands well enough that the motion check cannot tell. Only not searching wide
+        keeps it right."""
+        frame, _ = self._load('01', 'Test1/C/RrunStance2')
+        self.assertAlmostEqual(self._metric(frame, 'biplane_lag_s'),
+                               bp.BIPLANE_PRETRIGGER_S, delta=0.1)
+        self.assertEqual(self._metric(frame, 'pretrigger_widened'), 0.0)
+
+    def test_the_zero_pretrigger_trial_is_found_and_flagged(self):
+        frame, fired = self._load('06', 'Test1/A/RSHop2')
+        self.assertEqual(self._metric(frame, 'pretrigger_widened'), 1.0)
+        self.assertAlmostEqual(self._metric(frame, 'biplane_lag_s'), 0.0, delta=0.2)
+        self.assertEqual(len(fired), 1)
+
+    def test_finding_it_is_what_lands_the_window(self):
+        """The point of widening the bracket. Before it, this trial's biplane plates read a
+        motion ratio of 73 and 75; the Vicon plates beside them were always fine."""
+        frame, _ = self._load('06', 'Test1/A/RSHop2')
+        self.assertLess(self._metric(frame, 'motion_ratio', 'max'),
+                        bp.MAX_SYNC_MOTION_RATIO)
+
+    def test_an_ordinary_trial_is_unaffected_and_silent(self):
+        """Widening a bracket normally buys spurious matches. The joint estimate over both
+        bones is what stops it, and this is the control that says so."""
+        frame, fired = self._load('01', 'Test1/A/LSDrop1')
+        self.assertAlmostEqual(self._metric(frame, 'biplane_lag_s'),
+                               bp.BIPLANE_PRETRIGGER_S, delta=0.1)
+        self.assertEqual(fired, [])

@@ -528,7 +528,40 @@ def bracketed_lag(imu_trace: IMUTrace, world_trace: WorldTrace, expected_lag_s: 
 # "Time" -- puts the biplane window 3 s from the truth, and the correlation that should catch
 # that has a peak-to-sidelobe ratio of 1.31 against a two-hour record, so it does not.
 BIPLANE_PRETRIGGER_S = 2.98
+
+# WIDE ENOUGH TO REACH ZERO, which 0.5 was not. Over 378 trials the fitted offset is tightly
+# unimodal -- 299 of them inside 2.9-3.0 -- so a narrow bracket looks safe, and for all but a
+# handful it is. 06/RSHop2 is the exception that proves it is not enough: both of its bones
+# independently put the offset at -0.03 and -0.06, i.e. that trial's biplane pose is ALREADY
+# on the Vicon time base with no pre-trigger at all. A bracket of [2.48, 3.48] cannot reach
+# zero, so the search pinned at the closest it could manage, 2.81, and displaced a 0.78 s
+# window by 2.8 s. That is the whole of the factor-of-75 motion mismatch on that trial.
+#
+# Note it did NOT pin at the bracket EDGE, so an edge check would not have caught it -- 2.81
+# is comfortably interior and still wrong by the width of the window. Only comparing the
+# answer against the population catches this class; see PRETRIGGER_ANOMALY_S.
+#
+# Widening normally buys spurious matches. Here it does not, because the peak is taken on the
+# summed correlation of BOTH BONES (see the joint estimate in load_trial): a false peak has to
+# be false in both at the same offset to win.
 BIPLANE_PRETRIGGER_BRACKET_S = 0.5
+
+# The fallback, reached only when the narrow search fails to land its window.
+# Wide enough to express 'no pre-trigger at all', which 06/RSHop2 needs.
+BIPLANE_PRETRIGGER_WIDE_BRACKET_S = 3.5
+
+# How far the fitted pre-trigger may sit from the hardware constant before it is reported.
+#
+# This is a check against a KNOWN VALUE rather than an outlier test, because the build sees one
+# trial at a time and has no population to compare against -- but it does not need one: the
+# pre-trigger is a property of the fluoroscopy system, measured at 2.98 +/- 0.06 s, so a trial
+# that disagrees with it by half a second disagrees with the hardware.
+#
+# 0.5 keeps the whole 2.6-3.4 bulk quiet and flags the two trials that sit outside it. A
+# flagged trial is not necessarily WRONG -- 06/RSHop2's offset really is zero, and once the
+# bracket can reach it the window lands correctly -- it is unusual, and the distinction between
+# "unusual" and "wrong" is what `motion_ratio` decides afterwards.
+PRETRIGGER_ANOMALY_S = 0.5
 
 # Below this, the correlation peak is not meaningfully better than its neighbours and the lag
 # it names should not be trusted. RECORDED, NOT ENFORCED, and now for a measured reason rather
@@ -549,35 +582,54 @@ MIN_PEAK_TO_SIDELOBE = 1.5
 # The window-landed check. See `_check_windows_landed`: the IMU and the reference, over the
 # same frames, must at least agree about how much the limb was moving.
 #
-# Set from the measured distribution. On subject 12 alone the ratio looked cleanly bimodal --
-# 1.00-2.75 for everything that synced and 5.88-23.70 for the one trial that did not -- and
-# 4.0 sat in an empty gap.
+# WHERE THIS NUMBER COMES FROM, and it has been wrong twice.
 #
-# ACROSS ALL 15 SUBJECTS THE GAP IS NOT EMPTY, so that reading was too confident. Over 1462
-# plates the ratio runs q50 1.27, q95 2.46, and the tail is
+# First reading, subject 12 alone: the ratio looked cleanly bimodal, 1.00-2.75 for everything
+# that synced against 5.88-23.70 for the one trial that did not, and 4.0 sat in an empty gap.
+# Second reading, all 15 subjects before the sync work: the gap was not empty, 39 plates were
+# flagged across 14 trials, and 4.0 was separating 8 unflagged plates from 7 flagged ones.
 #
-#     (2, 3]    88 plates        (4, 6]      7 plates
-#     (3, 4]     8 plates        (6, 10]     3 plates
-#                                (10, 124]  29 plates
+# Both readings described a pipeline whose lags were wrong. Now that the Vicon lag and the
+# biplane pre-trigger are each estimated jointly across the trial's sensors, most of what this
+# was flagging has been FIXED rather than filtered, and the distribution over 1493 plates is:
 #
-# The mass above 10 is unambiguous and the bulk below 3 is clearly fine; 4.0 now separates 8
-# unflagged plates from 7 flagged ones rather than nothing from nothing. It stays where it is
-# because the alternative is worse in both directions -- tightening to 3 sweeps in the 88
-# plates at 2-3, which are drop landings where soft tissue alone moves the ratio, and loosening
-# to 10 gives up the 10 plates that are genuinely misplaced. The 15 in 3-10 are judgement, and
-# `motion_ratio` is recorded per plate so that judgement can be revisited on the numbers.
+#     (0, 1.5]   1178        (3, 4]       5
+#     (1.5, 2]    237        (4, 5]       1
+#     (2, 3]       73        (> 5)        0
 #
-# It fires on 39 of 1462 plates, 2.7%, concentrated in 14 trials across 8 subjects.
+# THE GAP THIS USED TO SIT IN IS GONE, and closing it was the point. It ran 4.16 to 72.98,
+# with 06/RSHop2's two plates alone on the far side; that trial is now recovered by the
+# pre-trigger fallback this very constant triggers, and the distribution above is what is
+# left. So nothing fires any more.
 #
-# DELIBERATELY NOT TIGHTER. Soft-tissue artifact, differentiation noise on a 1 s window and
-# the sensor-to-segment rotation itself all move this ratio, and none of them is a sync
-# failure. LDDrop2 reads 3.06 and is genuinely poor -- its alignment residual is the worst of
-# any non-broken plate at 2.2x signal -- but poor is not misplaced, and
-# `residual_fraction_of_signal` is the instrument for that. This check answers one question:
-# did the window land where the IMU was doing the same thing.
-MAX_SYNC_MOTION_RATIO = 4.0
+# The threshold therefore has two jobs and only one of them is still load-bearing:
+#
+#   AS THE FALLBACK TRIGGER it is well placed and doing real work. A trial whose window is
+#   genuinely misplaced reads 10-100 -- RSHop2 read 75 -- and one that is merely a hard
+#   landing reads 2-3, so 5.0 separates them with room on both sides.
+#
+#   AS A WARNING it is now a cut through a smooth tail rather than a gap. Everything from 2.9
+#   to 4.16 is continuous: 12/LSHop3 at 4.16 and 16/RrunStance1 at 3.97 both have sensors
+#   agreeing on their lag to better than 0.4 s, so they are elevated by soft tissue and a
+#   short window rather than misplaced. There is no principled boundary left in that range,
+#   and 5.0 above it is a defensible place to stop rather than a discovered one.
+#
+# NOT TIGHTER, because soft-tissue artifact, differentiation noise on a sub-second window and
+# the sensor-to-segment rotation itself all move this ratio by a factor of 2-4 and none of
+# them is a sync failure. `residual_fraction_of_signal` is the instrument for "this plate is
+# poor"; this one answers only "did the window land where the IMU was doing the same thing".
+#
+# `motion_ratio` is recorded per plate regardless, and build_quality judges it against the
+# population with a robust rule rather than against this number. That is the level the
+# comparison belongs at: the failure is whole-trial, so a build -- which sees one trial at a
+# time -- has no inlier to compare against, and tier 2 sees all 379 at once.
+MAX_SYNC_MOTION_RATIO = 5.0
 # Below this the RMS is dominated by whatever few frames survived, and the ratio is noise.
 MIN_SYNC_CHECK_FRAMES = 30
+
+
+class PretriggerAnomalyWarning(UserWarning):
+    """The fitted biplane pre-trigger disagrees with the fluoroscopy system's constant."""
 
 
 class SyncWindowWarning(UserWarning):
@@ -733,13 +785,43 @@ def load_trial(subject: str, key: str, report=None) -> Dict[str, PlateTrial]:
                       for sensor, (bone, _, _, _) in sources.items()}
     biplane_pairs = [(_as_imu(sources[sensor][3]), world)
                      for sensor, world in biplane_worlds.items() if world is not None]
+    # NARROW FIRST, WIDE ONLY ON FAILURE. A wide bracket is not free on a periodic task: with
+    # +/-3.5 s it reaches the NEXT STRIDE's correlation peak, and 82 of 89 running-stance
+    # trials aliased onto one -- 92% of that task against 6 of the other 289 trials. The
+    # narrow bracket is what was protecting them, and the hardware constant is why: a
+    # pre-trigger of 4.6 s on one trial and 2.98 s on the rest is not a property a
+    # fluoroscopy system has.
+    #
+    # So the default stays narrow and trusts the constant. The wide search runs only when the
+    # narrow answer demonstrably fails to land its window, and its result is kept only if it
+    # measurably beats the narrow one. 06/RSHop2 is the trial that needs it: its offset is
+    # genuinely zero, which [2.48, 3.48] cannot express.
+    biplane_lag, biplane_ratio, biplane_individual = float('nan'), float('nan'), []
+    biplane_widened = False
     if biplane_pairs:
         biplane_lag, biplane_ratio, biplane_individual = joint_lag(
             biplane_pairs, BIPLANE_PRETRIGGER_S, bracket_s=BIPLANE_PRETRIGGER_BRACKET_S)
-    else:
-        biplane_lag, biplane_ratio, biplane_individual = float('nan'), float('nan'), []
+        narrow_cost = _window_cost(biplane_pairs, biplane_lag)
+        if narrow_cost > MAX_SYNC_MOTION_RATIO:
+            wide = joint_lag(biplane_pairs, BIPLANE_PRETRIGGER_S,
+                             bracket_s=BIPLANE_PRETRIGGER_WIDE_BRACKET_S)
+            if _window_cost(biplane_pairs, wide[0]) < narrow_cost:
+                biplane_lag, biplane_ratio, biplane_individual = wide
+                biplane_widened = True
     if not np.isfinite(biplane_lag):
         biplane_lag, biplane_ratio = BIPLANE_PRETRIGGER_S, float('nan')
+
+    # Against the hardware constant, not against the bracket edge. 06/RSHop2 landed at 2.81 --
+    # comfortably interior, so no edge check would have seen it -- while its true offset was
+    # zero, and the 2.8 s displacement is the whole of that trial's factor-of-75 mismatch.
+    pretrigger_anomaly = abs(biplane_lag - BIPLANE_PRETRIGGER_S)
+    if pretrigger_anomaly > PRETRIGGER_ANOMALY_S:
+        warnings.warn(
+            f"{subject}/{trial}: the biplane pre-trigger fits at {biplane_lag:.3f} s against "
+            f"a hardware constant of {BIPLANE_PRETRIGGER_S:.2f} s. Both bones agree, so this "
+            f"is that trial's export rather than a failed search -- but it is unusual, and "
+            f"the motion check is what decides whether the window still landed.",
+            PretriggerAnomalyWarning, stacklevel=2)
 
     plates: Dict[str, PlateTrial] = {}
     for sensor, (bone, site, imu, vicon) in sources.items():
@@ -765,12 +847,49 @@ def load_trial(subject: str, key: str, report=None) -> Dict[str, PlateTrial]:
                        biplane_lag_s=biplane_lag,
                        biplane_lag_spread_s=(float(np.ptp(biplane_individual))
                                              if len(biplane_individual) > 1 else 0.0),
+                       pretrigger_anomaly_s=pretrigger_anomaly,
+                       pretrigger_widened=biplane_widened,
+                       pretrigger_anomalous=bool(
+                           pretrigger_anomaly > PRETRIGGER_ANOMALY_S),
                        biplane_peak_to_sidelobe=biplane_ratio,
                        biplane_sync_weak=bool(not np.isfinite(biplane_ratio)
                                               or biplane_ratio < MIN_PEAK_TO_SIDELOBE))
 
     _check_windows_landed(plates, report)
     return plates
+
+
+def _window_cost(pairs: List[Tuple[IMUTrace, WorldTrace]], lag: float) -> float:
+    """Worst motion-magnitude mismatch across `pairs` if the reference were shifted by `lag`.
+
+    The same question `_check_windows_landed` asks of a built plate, answered before anything
+    is built so a candidate offset can be rejected cheaply. Compared on the reference's own
+    grid rather than the IMU's: the reference is a few hundred frames against a two-hour
+    inertial record, so resampling the short one is the cheap direction and this runs on every
+    trial whose first answer looks wrong.
+    """
+    if not np.isfinite(lag):
+        return float('inf')
+    worst = 0.0
+    for measured, reference in pairs:
+        shifted = WorldTrace(reference.timestamps + lag, reference.positions,
+                             reference.rotations, valid=reference.valid)
+        rate = float(shifted.get_sample_frequency())
+        if not np.isfinite(rate) or rate <= 0:
+            continue
+        resampled = measured.resample(rate)
+        inside = ((resampled.timestamps >= shifted.timestamps[0])
+                  & (resampled.timestamps <= shifted.timestamps[-1]))
+        count = min(int(inside.sum()), len(shifted))
+        if count < MIN_SYNC_CHECK_FRAMES:
+            return float('inf')
+        a = float(np.linalg.norm(resampled.gyro[inside][:count], axis=1).mean())
+        b = float(np.linalg.norm(
+            shifted.calculate_imu_trace(skip_lin_acc=True).gyro[:count], axis=1).mean())
+        if min(a, b) <= 0:
+            continue
+        worst = max(worst, max(a, b) / min(a, b))
+    return worst
 
 
 def _check_windows_landed(plates: Dict[str, PlateTrial], report=None) -> None:

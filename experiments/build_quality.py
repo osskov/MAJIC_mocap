@@ -496,6 +496,80 @@ def _header(number: int, title: str, subtitle: str = "") -> None:
         print(subtitle)
 
 
+# A robust outlier rule, applied in LOG space. The quantities here are ratios and offsets
+# whose distributions are tight, unimodal and right-skewed, and on a skew of 26 a mean+k*sd
+# rule is masked by the very outliers it is meant to find -- the sd is inflated by them, so
+# adding one more bad trial moves the cutoff out past it. A median absolute deviation is not.
+OUTLIER_MADS = 10.0
+
+
+def _robust_outliers(values: pd.Series, log: bool = False) -> Tuple[pd.Series, float]:
+    """(boolean mask of outliers, the cutoff). Empty mask when there is nothing to compare."""
+    clean = values.dropna()
+    if len(clean) < 20:
+        return pd.Series(False, index=values.index), float('nan')
+    scale = np.log(clean.clip(lower=1e-9)) if log else clean
+    centre = float(scale.median())
+    mad = float((scale - centre).abs().median()) * 1.4826
+    if mad <= 0:
+        return pd.Series(False, index=values.index), float('nan')
+    cutoff = centre + OUTLIER_MADS * mad
+    limit = float(np.exp(cutoff)) if log else cutoff
+    return values > limit, limit
+
+
+def _report_sync_population(tables: Dict[str, pd.DataFrame]) -> None:
+    """The sync quantities judged against their own population rather than a constant.
+
+    THE BUILD CANNOT DO THIS. It sees one trial at a time, and for the quantity that matters
+    most the failure is whole-trial -- when a window is misplaced every plate of that trial is
+    misplaced together, so there is no inlier left inside the trial to compare against. Here
+    all 379 trials are visible at once, which is the level the comparison belongs at.
+
+    Two quantities, and they answer different questions. `biplane_lag_s` is the fluoroscopy
+    pre-trigger, which is hardware and should be one number: it is unimodal with 299 of 378
+    trials inside 2.9-3.0, so a trial far from that is genuinely anomalous. `motion_ratio` is
+    whether the window landed, and it is reported here because the build's fixed threshold has
+    to be a compromise while this one adapts to whatever the dataset turns out to look like.
+    """
+    sync = tables.get('S4_sync')
+    if sync is None or sync.empty:
+        return
+    if not any(c in sync for c in ('biplane_lag_s', 'motion_ratio')):
+        return
+    _header(9, "Sync, against its own population", "robust outliers, not a fixed cutoff")
+
+    if 'biplane_lag_s' in sync:
+        lag = sync['biplane_lag_s'].dropna()
+        if not lag.empty:
+            # Not log space: this is an offset in seconds and can legitimately be near zero
+            # or negative, where a log is undefined.
+            spread = float((lag - lag.median()).abs().median()) * 1.4826
+            print(f"  biplane pre-trigger  n={len(lag)}  median {lag.median():.3f} s  "
+                  f"robust sd {spread:.3f} s  range {lag.min():.3f} to {lag.max():.3f}")
+            if 'pretrigger_anomalous' in sync:
+                odd = sync[sync.pretrigger_anomalous.fillna(0) > 0]
+                if not odd.empty:
+                    print(f"  {len(odd.groupby(['subject', 'trial']))} trials disagree with the "
+                          f"hardware constant by more than half a second:")
+                    for (subject, trial), group in odd.groupby(['subject', 'trial']):
+                        print(f"    {subject}/{trial:16s} "
+                              f"{group.biplane_lag_s.median():+.3f} s")
+
+    if 'motion_ratio' in sync:
+        ratio = sync['motion_ratio'].dropna()
+        if not ratio.empty:
+            outliers, limit = _robust_outliers(ratio, log=True)
+            print(f"\n  window motion ratio  n={len(ratio)}  q50 {ratio.median():.2f}  "
+                  f"q95 {ratio.quantile(0.95):.2f}  max {ratio.max():.2f}")
+            print(f"  robust cutoff (log median + {OUTLIER_MADS:.0f} MAD) = {limit:.2f}, "
+                  f"flagging {int(outliers.sum())} of {len(ratio)} plates")
+            worst = sync.loc[ratio.nlargest(5).index]
+            for row in worst.itertuples():
+                print(f"    {row.subject}/{row.trial}/{row.entity}: "
+                      f"{row.motion_ratio:.2f}")
+
+
 def _report_signal_repair(tables: Dict[str, pd.DataFrame]) -> None:
     """What the parser had to throw away and reconstruct, per file.
 
@@ -711,6 +785,7 @@ def run(dataset: str, only_tables: Optional[List[str]] = None) -> Dict[str, pd.D
                       f"normalized r={pair.residual_fraction.corr(pair.gyro_signal_lowpass_rms_deg_s):+.2f}, "
                       f"absolute r={pair.gyro_residual_lowpass_rms_deg_s.corr(pair.gyro_signal_lowpass_rms_deg_s):+.2f}")
 
+    _report_sync_population(tables)
     _report_signal_repair(tables)
     _report_decimation_cost(tables)
 
