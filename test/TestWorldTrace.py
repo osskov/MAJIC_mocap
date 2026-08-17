@@ -419,7 +419,10 @@ class TestWorldTrace(unittest.TestCase):
         parent = WorldTrace(timestamps, parent_positions, parent_rotations)
         child = WorldTrace(timestamps, child_positions, child_rotations)
 
-        estimated_parent, estimated_child, error = parent.get_joint_center(child)
+        # min_frames lowered: this fixture is 60 synthetic frames with an exactly known
+        # answer, and the point is the algebra, not the frame-count policy that protects
+        # real fits from being silently under-determined.
+        estimated_parent, estimated_child, error = parent.get_joint_center(child, min_frames=10)
 
         np.testing.assert_array_almost_equal(estimated_parent, offset_parent)
         np.testing.assert_array_almost_equal(estimated_child, offset_child)

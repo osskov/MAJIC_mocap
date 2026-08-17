@@ -11,6 +11,29 @@ from scipy.spatial.transform import Rotation, Slerp
 from typing import Dict
 
 
+# Minimum frames a joint-centre fit will accept. Six parameters need two frames in principle;
+# this is above that because the failure is silent — a fit from a handful of frames returns six
+# plausible millimetre numbers and no downstream projection can tell them from a good fit.
+#
+# Deliberately a LIBRARY-LEVEL floor, not a research-grade bar. It exists to refuse the absurd
+# (a trial whose mocap dropped out almost entirely), and it is set low enough that a legitimate
+# short synthetic fixture still fits. Callers that need a stricter policy impose their own:
+# experiments/joint_center.py requires 500, because it also needs enough samples for stable
+# quantiles and a holdout split. Putting the strict number here instead made the primitive
+# refuse every 200-frame test fixture in the repo, which is the wrong layer to enforce it at.
+#
+# Frame count is a PROXY for what actually determines the fit, which is the diversity of the
+# relative rotation — a well-excited 200-frame fixture is better conditioned than 100k frames of
+# a pair that barely moves. `experiments/joint_center.fit_conditioning` measures that directly
+# (excitation = 1 - sigma_max/N); this is the cheap guard, not the real one.
+MIN_JOINT_CENTER_FRAMES = 50
+
+
+class UnderdeterminedJointCenter(ValueError):
+    """Too few usable frames to fit a joint centre. Raised rather than returning a number,
+    because an under-determined offset is indistinguishable from a good one at the call site."""
+
+
 class WorldTrace:
     """
     This class contains a trace of a world frame over time. Optionally, this can attach an IMUTrace and manipulate it.
@@ -237,29 +260,68 @@ class WorldTrace:
         angle_deg = np.linalg.norm(angle_axis, axis=1) * 180.0 / np.pi
         return angle_deg
 
-    def get_joint_center(self, other_world_trace: 'WorldTrace') -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """ Given two world traces, solve for the best fit constant offset from a joint center.
-        This is done by minimizing the sum of the squared differences between the two traces. """
-        # Parent is other, child is self
+    def get_joint_center(self, other_world_trace: 'WorldTrace',
+                         mask: Union[np.ndarray, None] = None,
+                         min_frames: int = MIN_JOINT_CENTER_FRAMES
+                         ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Least-squares constant offsets from each trace's origin to their shared joint centre.
+
+        Solves p_parent + R_parent r_parent = p_child + R_child r_child over the frames where
+        BOTH traces are valid, for the two offsets at once.
+
+        FITTED ON VALID FRAMES ONLY. Outside `valid` the world trace holds a constant padded
+        pose (see repair_reconstruction_glitches) — not a measurement, but a placeholder left
+        where marker reconstruction failed. Those frames are not merely uninformative: one pose
+        repeated for thousands of samples is thousands of identical rows in the least squares,
+        which the solution is dragged toward satisfying exactly. This used to fit over every
+        frame, and on the Al Borno trials — 42-58% valid — that moved the returned offsets by
+        14 mm on average and up to 90 mm, measured in section 3 of
+        experiments/joint_center.py's report.
+
+        `mask` selects the frames to FIT ON, and defaults to `valid & other.valid`. Pass an
+        explicit boolean array to fit on any other subset — a holdout split scoring the second
+        half of a trial on offsets fitted from the first, or an all-True array to reproduce the
+        old fit-over-everything behaviour for comparison. It is a full parameter rather than a
+        `use_valid` flag so that callers needing an arbitrary subset do not have to reimplement
+        the least squares beside this one; `experiments/joint_center.py` carried such a copy
+        until this replaced it, and two solvers that must agree only agree until they do not.
+
+        Raises UnderdeterminedJointCenter below `min_frames` usable frames rather than returning
+        a number. Six parameters can be fitted from very few samples, and the result is
+        indistinguishable from a good one at the call site — a downstream projection cannot tell
+        that the offset it was handed came from thirty frames.
+
+        Returns (parent_offset, child_offset, residual). The RESIDUAL IS RETURNED FOR EVERY
+        FRAME, not only the fitted ones, so a caller can score the fit on frames it did not see;
+        it is the separation of the two traces' implied joint centres at each sample.
+        """
         assert isinstance(other_world_trace, WorldTrace), "Must pass a WorldTrace instance to compare."
         assert len(self) == len(other_world_trace), "WorldTraces must have the same length to compare them."
 
-        parent_loc = self.positions
-        child_loc = other_world_trace.positions
+        usable = (np.asarray(self.valid) & np.asarray(other_world_trace.valid) if mask is None
+                  else np.asarray(mask, dtype=bool)[:len(self)])
+        if int(usable.sum()) < min_frames:
+            raise UnderdeterminedJointCenter(
+                f"{int(usable.sum())} usable frame(s) of {len(self)}, below the {min_frames} "
+                f"this fit requires. With no mask both traces must be valid on a frame for it "
+                f"to count; pass an explicit mask to choose the frames, or min_frames to lower "
+                f"the bar deliberately.")
 
-        r_c_p = parent_loc - child_loc
-        r_c_p = r_c_p.flatten()
+        # float64 throughout: the stored poses are float32 (see trial_io) and this is a least
+        # squares over ~10^5 rows, so accumulating in single precision costs more than the
+        # millimetre the callers report in.
+        rotations_parent = self.rotations.astype(np.float64)
+        rotations_child = other_world_trace.rotations.astype(np.float64)
+        separation = (self.positions - other_world_trace.positions).astype(np.float64)
 
-        R_w_parent = self.rotations.reshape(-1, 3)
-        R_w_child = other_world_trace.rotations.reshape(-1, 3)
-        R_w = np.hstack((-R_w_parent, R_w_child))
+        design = np.concatenate([rotations_parent[usable], -rotations_child[usable]], axis=2)
+        offsets, *_ = np.linalg.lstsq(design.reshape(-1, 6),
+                                      -separation[usable].reshape(-1), rcond=None)
+        parent_offset, child_offset = offsets[:3], offsets[3:]
 
-        offsets, res, rank, S = np.linalg.lstsq(R_w, r_c_p, rcond=None)
-
-        parent_offset = offsets[:3]
-        child_offset = offsets[3:]
-        error = R_w_parent @ parent_offset - R_w_child @ child_offset + r_c_p
-        error = error.reshape(-1, 3)
+        error = (separation
+                 + np.einsum('nij,j->ni', rotations_parent, parent_offset)
+                 - np.einsum('nij,j->ni', rotations_child, child_offset))
         return parent_offset, child_offset, error
     
     def get_primary_joint_axis(self, other_world_trace: 'WorldTrace') -> Tuple[np.ndarray, np.ndarray]:

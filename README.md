@@ -45,7 +45,7 @@ under `data/`, so the rule is enforced rather than merely documented.
 │   └── experiments/
 │       ├── noise_sensitivity/
 │       ├── drift_observability/
-│       └── sensor_distributions/              # per-trial sample tables behind its figures
+│       └── global_assumptions/<dataset>/     # per-trial sample tables behind its figures
 │
 ├── plots/                                  # <-- ALL GENERATED FIGURES
 │
@@ -228,8 +228,9 @@ python -m experiments.distortion_tolerance     # how much magnetic distortion ma
 python -m experiments.noise_sensitivity        # gyro/acc/mag noise parameter sweep
 python -m experiments.ekf_oracle_comparison    # EKF vs. its oracle variants
 python -m experiments.drift_observability      # segment-and-reset drift diagnostic
-python -m experiments.acceleration_projection  # validates the joint-center acc projection
-python -m experiments.sensor_distributions     # sensor distortion / acceleration / observability
+python -m experiments.acceleration_projection --dataset alborno  # does the acc projection agree: with markers, across a joint, along a segment
+python -m experiments.magnetic_projection --dataset alborno      # the same three questions for the magnetometer, plus: can an array estimate the field gradient?
+python -m experiments.global_assumptions       # acc/mag assumption departure, static vs moving
 python -m experiments.relative_vs_absolute     # relative vs global-reference correction geometry
 python -m experiments.normalization_comparison # unit-length vs raw-magnitude filter inputs
 ```
@@ -313,7 +314,7 @@ per trial and joint, the fraction of samples each threshold gates, computed with
 post-projection `o^J` the filter compares against. That is what turns the figure's x-axis into
 "how often is the magnetometer switched off", and it is what makes the duty-cycle claim in the
 `DEFAULT_MAG_ADAPT_THRESHOLD` comment checkable rather than quoted. It is not the smoothed,
-winsorized `o^J` `sensor_distributions` tabulates for plotting.
+winsorized `o^J` `global_assumptions` tabulates for plotting.
 
 The duty cycle is cheap and independent of the filter runs, so it can be refreshed on its own;
 the full sweep is the most expensive script here (~2 h on 12 cores, 11 filter arms × 19 trials).
@@ -352,9 +353,90 @@ python -m experiments.distortion_tolerance --distortion-only     # dose tables o
 python -m experiments.distortion_tolerance --all                 # every subject
 ```
 
-`acceleration_projection`, `sensor_distributions` and `relative_vs_absolute` do not need
+`acceleration_projection`, `global_assumptions` and `relative_vs_absolute` do not need
 Step 1: all three measure properties of the data rather than of the filter and never run the
-EKF, so they can be run on the raw data alone.
+EKF, so they can be run on the built trials alone.
+
+`acceleration_projection` asks whether the projected accelerometer signal every `project=True`
+method consumes is real, and it asks it three times because there are three references
+available and each is blind to something the others see:
+
+```bash
+python -m experiments.acceleration_projection --dataset alborno
+python -m experiments.acceleration_projection --dataset imove    # the only one with two sensors per segment
+python -m experiments.acceleration_projection --dataset alborno --report-only
+```
+
+* **against the markers** — the projection at the joint centre against that point's mocap
+  trajectory differentiated twice. The only external reference, so the only one that can catch
+  an error both segments make together; its truth is mostly differentiation noise above ~5 Hz,
+  which is why the analysis cutoff is 6 Hz and why the residual is an upper bound.
+* **against each other** — the parent and child sensors project to one physical point, so their
+  projected readings are one vector in two frames, and that identity *is* what a relative
+  filter's accelerometer residual measures. No differentiated markers; blind to a common-mode
+  offset error. Its magnitude channel uses no mocap orientation at all.
+* **along a segment** — two sensors on one thigh or shank, projected onto each other. The truth
+  is another accelerometer, so it is band-limited by the sensors instead of by the reference.
+  IMoVE only, and it is where the least comfortable result lives: the two sensors disagree about
+  angular velocity by 20-32%% of its magnitude, which no rigid body can do, so the "same rigid
+  segment" assumption is the weakest of the three.
+
+The three constrain each other, which is the reason all three are run rather than whichever one
+reads best: section 7 of the report predicts the cross-segment disagreement from the two marker
+residuals and compares it with the measured one, and neither family can compute that alone.
+
+`magnetic_projection` asks the same three questions of the MAGNETOMETER, in the same families,
+channels and scopes, so the two sets of numbers can be read side by side — it imports the
+windowing and the signal helpers from `acceleration_projection` rather than reimplementing them.
+The asymmetry between the two is the point. An accelerometer reading does not transport to
+another point of a rigid body unchanged; a magnetometer reading is *assumed* to, because every
+filter here feeds the joint centre the sensor's raw reading, which is exact only if the field is
+uniform over 10–47 cm. Nothing else in the repo checks that: `global_assumptions` asks whether
+each sensor sees one constant field, which a smoothly varying room would fail while transporting
+perfectly over 10 cm.
+
+```bash
+python -m experiments.magnetic_projection --dataset alborno
+python -m experiments.magnetic_projection --dataset imove    # three magnetometers per thigh and shank
+python -m experiments.magnetic_projection --dataset alborno --report-only
+```
+
+At the 0th order the two segments of a joint disagree about the field direction by a median
+**7.6°** on IMoVE and **8.0°** on Al Borno, worst distally (R_Ankle 15.2°, hips 3–5°), and that
+is the residual the relative filter's magnetometer update consumes. Its **norm channel needs no
+mocap at all** — `|R m| = |m|`, so neither the orientations nor the offsets enter — which is a
+stronger mocap-free claim than the accelerometer version can make, and it puts a floor under the
+rest: two sensors disagreeing about field *magnitude* by 7% cannot be reconciled by any
+orientation estimate.
+
+The question the file was built for is whether several magnetometers can estimate the field
+**gradient** and beat that. Eight projections are scored — the reading, the segment mean, a 1st-
+and 2nd-order fit along the segment's sensor array, a per-sample and a per-trial whole-body
+gradient tensor, the same tensor constrained *symmetric and traceless* as `curl B = 0` and
+`div B = 0` require, and a `body_model` control that reports a fitted model and ignores the
+measurement. **None of them beats the 0th order.** Three measurements say why, and they agree:
+
+| test | what a real field gradient would give | measured |
+| --- | --- | --- |
+| disagreement vs sensor separation | proportional to distance | 5.5°/100 mm within a segment vs 2.2° across a joint — 2.5× *steeper* at short range |
+| what explains a same-segment difference | a world-frame gradient | a constant in the **sensor's own frame** explains 85% with 3 parameters; a physically admissible gradient explains 79% with 5 |
+| fitted gradient magnitude | the one the markers can see (0.45 a.u./m) | per-sample fit 0.87, i.e. 2× — it is absorbing sensor error, and only the physically constrained per-trial fit (0.38) agrees with the markers |
+
+So the disagreement is a per-sensor, body-fixed term, not a field, and extrapolating a fitted
+"gradient" past the end of a 17 cm array to a joint centre 25 cm away amplifies it. The held-out
+test is the cleanest statement of the limit: two magnetometers predict the third about as well by
+their **mean** as by the line through them where the target lies *between* them (ratio 0.998),
+and the line loses every time it has to reach beyond them (ratio 1.10) — and the joint centre is
+always beyond them. What does help is a three-parameter hard iron: 7.6° → 5.4°, against 1.3° for
+the best spatial model. The caveat is reported in the same section — the fitted offset scatters
+between a subject's own trials by ~92% of its own size, so most of what it removes was the room
+rather than the device, and every calibrated arm here is fitted leave-one-trial-out for that
+reason (the in-sample arm reads 2.5° better, which is exactly the optimism being avoided).
+
+`body_model` is in the table because segment-to-segment agreement can be driven to **exactly
+zero** by discarding the measurement, so every mode is scored on two axes — agreement, and
+distance from a marker-supported field model — and the control makes that visible rather than
+arguable.
 
 `relative_vs_absolute` is the evidence behind the method's central claim — that comparing the
 two sensors of a joint against *each other* beats correcting each one against a global
@@ -382,15 +464,131 @@ python -m experiments.relative_vs_absolute --subjects 06   # one subject
 python -m experiments.relative_vs_absolute --report-only   # reprint from what is on disk
 ```
 
-`sensor_distributions` also replaces the old root-level `generate_sensor_stats.py`. It prints
-the sensor-characterization report (magnetic distortion per segment, the per-subject global
-field, the intrinsic noise floor from ground-anchored feet, and the child-vs-parent field
-consistency behind MAJIC) and writes the per-sample distributions its figures are drawn from:
+`global_assumptions` measures how far the two assumptions every orientation filter here rests
+on are from true — the accelerometer reads gravity and nothing else, the magnetometer reads one
+constant field — and, the point of the experiment, splits every number by whether the sensor was
+moving. It supersedes `sensor_distributions`, which in turn replaced the root-level
+`generate_sensor_stats.py`.
+
+A sensor is **static** wherever its gyroscope stays under 0.05 rad/s across a 0.25 s window.
+Gyro-only, deliberately: a detector that consulted the accelerometer or the magnetometer would
+define its own answer into existence. Its one blind spot is pure translation, and that is
+measured rather than waved away — the report carries the mocap linear and angular speed observed
+during every detected-static stretch (0.5–5 mm/s across both datasets). Two regimes come out of
+it: `static` (this sensor still, so a stance-phase foot counts mid-walk) and `body_static`
+(every sensor still at once), plus `nonstatic` and `all`. Both static regimes get their own
+intrinsic noise floor, and the gap between them is the vibration a stance foot still carries.
+
+`magdev` is reported against **four reference arms**, because "deviation from the global field"
+is only as meaningful as the constant you subtract, and the obvious choice is not neutral. Every
+arm is the identical computation `|m_world − c|`; only `c` differs, so any gap between two of them
+is the reference and nothing else. They are declared once in `MAGDEV_ARMS`:
+
+| arm | reference | what it is for |
+| --- | --- | --- |
+| `magdev` | the SUBJECT's field, pooled over all its (trial, sensor) medians | what a filter calibrated once per session suffers, and the arm the "one constant field" claim is about |
+| `magdev_trial` | the same reduction over ONE trial's sensors | removes between-trial drift, leaves within-trial structure |
+| `magdev_loo` | the subject arm **with this sensor left out** | the only arm unbiased by self-reference — quote this when asking how far a sensor is from a field it did not help define |
+| `magdev_clean` | the single cleanest sensor (`DatasetSpec.clean_sensor`) | a **diagnostic**, matching the construction `_compute_expected_mag_field` hands the EKF's mag oracle |
+
+Two of these carry warnings the report prints in full. `magdev_trial` is fitted on the very
+samples it scores, so it is biased low and more so on short trials — and refitting the constant
+per trial concedes the "one constant field" assumption at the between-trial scale, which is
+evidence, not noise. `magdev_clean` **must never be the arm a proximal-to-distal gradient is
+quoted from**: referencing everything against the cleanest sensor collapses that sensor's own row
+toward its within-trial variation alone (the Al Borno torso goes 1.70° against the pooled
+reference to 0.50° against itself), inflating the gradient from 7.1× to 26.4× while the distal end
+barely moves. That is the top of the gradient being defined to zero.
+
+`magdev_loo` is the one that corrects a real bias in the shipped numbers: a sensor is 1/N of its
+own subject reference, and the sensor set is spatially lopsided (Al Borno carries 6 lower-limb
+sensors near the floor against 2 upper). Leaving the sensor out moves the proximal segments up in
+both datasets — Al Borno torso +0.84°, pelvis +0.43°; IMoVE pelvis +0.43° — and that rise is the
+bias, concentrated proximally because that is where a sensor sits nearest the pooled reference it
+helped define. Its `clean_sensor` is declared per dataset rather than chosen as the measured
+argmin, which costs nothing (the argmin is the torso on 10 of 11 Al Borno subjects and the pelvis
+on 23 of 26 IMoVE sessions) and avoids selecting on a statistic correlated with the measurement.
+
+Section 4 prints all four side by side with a `loo/subj` column, and `sensor_stats` carries
+`reference_drift_<arm>_deg`, the angle between each arm's constant and the subject one. The
+subject-scope arms are rolled up once into `<subject>/subject_references.parquet` (long-form over
+`arm × sensor`, since `loo` is a vector per sensor); the trial arm is recomputed per trial.
+
+Eleven report sections: the headline static-vs-moving contrast, static coverage and detector
+validation, the accelerometer departure, the magnetometer departure, the noise floor, joint
+observability `o^J` by regime against the `mag_adapt` gate, **sensor placement vs observability**,
+local field consistency, the between-sensor residuals the relative filter actually absorbs, and
+per-subject and per-trial spreads. Metrics come in mocap-referenced and reference-free pairs (`linacc`/`acc_norm_dev`,
+`magdev`/`mag_norm_dev`), which matters because the Al Borno walking trials open with a long
+standing pause *before* the cameras start: their static regime is real and large but invisible
+to anything needing a rotation.
+
+Runs on **every dataset in the repository**. Every segment map, joint table and sensor list is a
+`DatasetSpec`, so Al Borno's 8 sensors, IMoVE's 15 (three per thigh and shank, no torso) and the
+biplane half's 4 go through one code path. Four spec names over three build trees:
+
+| `--dataset` | build tree | sensors | ground truth | magnetometer |
+| --- | --- | --- | --- | --- |
+| `alborno` | `alborno` | 8 | marker clusters | yes |
+| `imove` | `imove` | 15 | marker clusters | yes |
+| `imove_biplane` | `imove_biplane` | 4 (one knee per trial) | fluoroscopic bone pose, ~0.48 s | **no** |
+| `imove_biplane_vicon` | `imove_biplane` | 4 | marker clusters, ~6.7 s | **no** |
+
+The two biplane specs analyse one build under two different ground-truth references, so they are
+separate names writing to separate directories rather than one spec carrying both — the IMU is the
+same device in each, and pooling them would double-count every sample. Their reference-free half
+(the `|acc|` departure, the gyro-only static detector, the noise floor) is identical by
+construction, which makes their disagreement on the mocap-referenced half a clean read on what the
+ground-truth choice costs.
+
+**No magnetometer is a first-class case, not a degenerate one.** An MC10 BioStamp measures
+acceleration and rotation only, and the reader fills `mag` with exact zeros so nothing reads
+uninitialized memory. Zeros are not a missing value: pooled into a subject field they give the
+zero vector, every `magdev` against it is exactly 0, and the report would then claim MAG=CONSTANT
+holds perfectly on a dataset that never measured a field. `DatasetSpec.has_magnetometer` therefore
+**omits** every magnetic column rather than NaN-filling it, skips stage one entirely, and prints
+sections 4 and 8 as one line saying why. A downstream slice for `magdev` gets a `KeyError` instead
+of a number that means nothing.
+
+Trials are enumerated from `results/trials/<dataset>/`, so what it analyses is exactly what has
+been built — minus the **orphans**, parquets the dataset's source no longer enumerates. The build
+tree is a cache and nothing prunes it, so a trial built once and later excluded leaves its file
+behind: IMoVE has 25 (the `t0_static_pose` recordings, excluded by `sources.UNSYNCABLE_TRIALS`
+because a static pose has no motion for the gyro cross-correlation to sync on) and `imove_biplane`
+has one (`12/Test1/A/Rstatic1`). They are stale against the current toolchest digest and
+`build_trials` will never refresh them, so each was a permanent `Failed (stale)` cell with no
+command that could clear it. They are now skipped and counted at the top of the run.
+
+IMoVE's three sensors per thigh and shank all sit on one segment against one marker cluster, so
+they border the same joints, and the build gives each its own lever arm to the joint center (it
+shifts every plate's mocap origin onto its own IMU). That makes 18 joint pairs rather than 6 —
+the six Mid-to-Mid ones plus a placement-matched High and Low variant of each — and it exposes an
+effect no other dataset here can measure: how `o^J` depends on where ALONG a segment a sensor is
+mounted. Pooled, the answer is that it barely does — 1.07x between the extremes, against the 3-14x
+that separates one anatomical joint from another — but the SIGN is a clean check on the mechanism.
+o^J scales with the sensor's lever arm to the joint center, and which placement has the longer arm
+depends on which end of the segment the joint is at (a thigh sensor's solved knee-center offsets
+run 257 / 159 / 93 mm going down the segment, so High is furthest from the knee and Low is
+furthest from the hip). That predicts High winning at the knees and ankles and Low at the hips,
+and it holds on all six. The six Mid pairs are `primary_joints` and are what the by-joint tables
+and figures show; all 18 are measured and saved, and section 7 is the placement comparison.
 
 ```bash
-python -m experiments.sensor_distributions --subjects 06     # one subject
-python -m experiments.sensor_distributions --report-only     # reprint from what is on disk
+python -m experiments.global_assumptions --dataset alborno              # ~1.5 min, 19 trials
+python -m experiments.global_assumptions --dataset imove                # 236 trials
+python -m experiments.global_assumptions --dataset imove_biplane        # 379 trials
+python -m experiments.global_assumptions --dataset imove_biplane_vicon  # the same 379, Vicon ref
+python -m experiments.global_assumptions --dataset imove --subjects s13   # one session
+python -m experiments.global_assumptions --dataset alborno --report-only  # reprint from disk
 ```
+
+The IMoVE `t0_static_pose` recordings are excluded because they cannot be **built**: the sync
+step cross-correlates gyros to find the mocap offset, and a static pose has no motion to
+correlate. They would otherwise be the cleanest at-rest data in either dataset — and note that
+this experiment does not actually need the correspondence for most of what it measures, since
+every reference-free metric (`acc_norm_dev`, `mag_norm_dev`, the gyro-only static detector, the
+whole noise floor) is computed on the raw trace and never consults a rotation. Recovering them
+means a build path that emits a `PlateTrial` with `valid` all False instead of refusing to sync.
 
 ### Step 3: Generate the paper figures
 
@@ -409,8 +607,9 @@ python -m plotting.distortion_tolerance
 python -m plotting.noise_sensitivity
 python -m plotting.ekf_oracle_comparison
 python -m plotting.drift_observability
-python -m plotting.acceleration_projection
-python -m plotting.sensor_distributions
+python -m plotting.acceleration_projection --dataset alborno
+python -m plotting.magnetic_projection --dataset alborno
+python -m plotting.global_assumptions
 python -m plotting.relative_vs_absolute
 ```
 
@@ -418,13 +617,27 @@ These read only from `results/` — they never re-run the filter, so a figure ca
 in seconds. If the statistics file is missing, the script says which experiment to run first.
 Figures are written to `plots/`, namespaced per experiment.
 
-`plotting.sensor_distributions` draws the distribution figures (box / ridgeline / strip per
-metric), the time series through one sitting bout, and — with `--diagnostics` — a per-trial
-check of both interval detectors:
+`plotting.global_assumptions` draws the headline two-panel static-vs-moving figure, the
+distribution figures (regime-split box / ridgeline / strip per metric), the noise floor against
+the filter's tuned stds, static coverage and detector validation, a subject x segment heatmap,
+per-trial medians, a time series through a representative whole-body-static bout, and — with
+`--diagnostics` — a per-trial static-detector trace: 22 figures per dataset. It takes `--dataset`
+like the experiment does, including the two biplane specs, where it draws the accelerometer
+figures and a two-panel noise floor and skips the magnetic ones rather than plotting empty axes.
+Box statistics are computed from the full sample tables and drawn with `bxp`, so no box is
+estimated off a subsample.
+
+Observability is deliberately **not** plotted here. `o^J` is a property of a joint pair and of
+the joint-center projection rather than of the global sensor assumptions this experiment measures,
+so its figures belong with the joint-offset work; `scratch/observability_plots_for_joint_offset.py`
+holds the ones lifted out of this module. The experiment still writes `joint_samples` and
+`joint_stats` and report sections 6 and 7 still print off them — only the plotting moved.
 
 ```bash
-python -m plotting.sensor_distributions --sides both --plot-types box
-python -m plotting.sensor_distributions --example-subject 06 --diagnostics
+python -m plotting.global_assumptions --dataset alborno
+python -m plotting.global_assumptions --dataset imove --sides both --plot-types box
+python -m plotting.global_assumptions --dataset imove_biplane
+python -m plotting.global_assumptions --dataset alborno --diagnostics
 ```
 
 `plotting.relative_vs_absolute` writes a nine-panel supplementary figure, a three-panel

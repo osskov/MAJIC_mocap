@@ -94,6 +94,7 @@ rather than parsing from source. Build first:
 import argparse
 import os
 import time
+import warnings
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -108,8 +109,10 @@ from experiments.experiment_utils import (DEFAULT_ACC_STD, DEFAULT_MAG_ADAPT_THR
                                           EXPECTED_GRAVITY, JOINTS, load_trial,
                                           pipeline_constants, project_pair_to_joint_center,
                                           run_tracked_grid, segment_observability)
+from src.toolchest.building.sources import get_source
 from src.toolchest.IMUTrace import IMUTrace
 from src.toolchest.PlateTrial import PlateTrial
+from src.toolchest.WorldTrace import UnderdeterminedJointCenter
 
 EXPERIMENT_NAME = "global_assumptions"
 EXPERIMENT_DIR = paths.experiment_dir(EXPERIMENT_NAME)
@@ -132,18 +135,78 @@ class DatasetSpec:
     here rather than per figure.
 
     `joints` is the pair table o^J and the field-consistency measures run over. It is a
-    property of the dataset because IMoVE has no torso sensor, hence no lumbar joint, and
-    three sensors per thigh and shank of which only the Mid one is bolted to the marker
-    cluster (see building/imove_mocap.RIGID_SENSOR_OFFSET_MM) and therefore the only one whose
-    joint-center projection rests on a hardware-fixed offset rather than a per-trial fit.
+    property of the dataset because IMoVE has no torso segment, hence no lumbar joint, and three
+    sensors per thigh and shank, which multiply its pair table (see `_imove_joints`).
+
+    "No torso segment" is worth stating precisely, because the IMoVE mocap files DO contain a
+    marker group called Trunk and the next person to look will wonder whether one was dropped.
+    There is no torso IMU — all 15 devices are pelvis, thigh, shank and foot — and the Trunk
+    group holds exactly ONE marker, `Trunk:APEX` (bare `APEX` in the flat-named sessions s4, s5
+    and s6). One marker is a position; a pose needs three non-collinear ones, so there is no
+    rotation, no WorldTrace and no PlateTrial to be had from it. The reader ignores it correctly,
+    matching neither CLUSTER_MARKERS nor FOOT_TOKENS.
+
+    `primary_joints` is the subset the console report tabulates and the by-joint figures draw.
+    Every joint in `joints` is measured and saved either way; this only decides what gets shown
+    by default, because IMoVE's 18 pairs against 4 regimes is 72 rows of table for a reader who
+    wants 6. The placement variants get their own short comparison instead.
+
+    `has_magnetometer` is FALSE for a dataset whose IMUs have no magnetometer at all, and it is
+    load-bearing rather than cosmetic. `imove_biplane`'s BioStamps carry an accelerometer and a
+    gyroscope only, and `building/biplane.py` fills `mag` with exact zeros so nothing downstream
+    reads uninitialized memory. Zeros are not a missing value: a subject field pooled over them
+    is the zero vector, every `magdev` against it is exactly 0, and this experiment would report
+    the MAG=CONSTANT assumption as perfectly satisfied on a dataset that never measured a field.
+    Every magnetic column is therefore omitted — not NaN-filled — on a spec with this false, so a
+    reader who slices for `magdev` gets a KeyError instead of a number that means nothing.
+
+    `trials_dataset` is the build tree the trials come from, when that differs from `name`. It
+    differs only where two specs analyse ONE build under different ground-truth references
+    (`imove_biplane` vs `imove_biplane_vicon`); giving them separate `name`s keeps their outputs
+    in separate directories, which is what stops the second run from overwriting the first.
+
+    `clean_sensor` names the segment the `clean` magdev arm references (see MAGDEV_ARMS). It is
+    DECLARED HERE, once, rather than chosen per subject as the argmin of measured variance —
+    same rule as `field_reference` above and for the same reason. Selecting it from the data
+    would be selecting on a statistic correlated with the thing being measured, and the choice
+    turns out to cost nothing: the argmin of `mag_norm_std` is the torso on 10 of 11 Al Borno
+    subjects and the pelvis on 23 of 26 IMoVE sessions, so a fixed choice IS the empirical
+    winner nearly everywhere, without the forking path.
+
+    The arm it defines must be read as a DIAGNOSTIC and never as the arm a proximal-to-distal
+    gradient is quoted from. Referencing every sensor against the cleanest one collapses that
+    sensor's own row toward its within-trial variation alone — measured, the Al Borno torso goes
+    1.70 deg against the pooled reference to 0.50 deg against itself — which inflates the
+    gradient from 7.1x to 26.4x while the distal end barely moves. That is the top of the
+    gradient being defined to zero, not a finding. What it IS good for is comparability: it is
+    the same single-clean-sensor construction `experiment_utils._compute_expected_mag_field`
+    hands the EKF's magnetometer oracle, so this arm says what that oracle is referenced against.
     """
     name: str
     segment_sensor: Dict[str, str]
     joints: Dict[str, Tuple[str, str]]
+    primary_joints: Tuple[str, ...]
     pelvis_sensor: str
     foot_sensors: Tuple[str, ...]
     subject_label: str          # how a subject id is printed; '{}' leaves it verbatim
     field_reference: Dict[str, str]   # joint -> 'parent' | 'child'; see FIELD_REFERENCE below
+    has_magnetometer: bool = True
+    trials_dataset: Optional[str] = None
+    clean_sensor: Optional[str] = None
+
+    @property
+    def build_name(self) -> str:
+        """The directory under results/trials/ this spec's trials are enumerated from."""
+        return self.trials_dataset or self.name
+
+    def segment_metrics(self) -> Tuple[str, ...]:
+        """`SEGMENT_METRICS`, minus the magnetic ones on a dataset with no magnetometer."""
+        return tuple(m for m in SEGMENT_METRICS
+                     if self.has_magnetometer or m not in MAG_METRICS)
+
+    def noise_modalities(self) -> Tuple[str, ...]:
+        """The channels a noise floor is measurable on."""
+        return ('gyro', 'acc', 'mag') if self.has_magnetometer else ('gyro', 'acc')
 
 
 # Which sensor of each pair supplies the LOCAL FIELD REFERENCE in `joint_field_consistency`,
@@ -185,11 +248,68 @@ ALBORNO = DatasetSpec(
         'Calcn L': 'calcn_l_imu',
     },
     joints=dict(JOINTS),
+    primary_joints=tuple(JOINTS),
     pelvis_sensor='pelvis_imu',
     foot_sensors=('calcn_l_imu', 'calcn_r_imu'),
     subject_label='Subject{}',
     field_reference=ALBORNO_FIELD_REFERENCE,
+    clean_sensor='torso_imu',
 )
+
+_IMOVE_JOINT_SEGMENTS = {
+    'R_Hip': ('PELVIS', 'THIGH_R'),
+    'R_Knee': ('THIGH_R', 'SHANK_R'),
+    'R_Ankle': ('SHANK_R', 'FOOT_R'),
+    'L_Hip': ('PELVIS', 'THIGH_L'),
+    'L_Knee': ('THIGH_L', 'SHANK_L'),
+    'L_Ankle': ('SHANK_L', 'FOOT_L'),
+}
+# The segments carrying High and Low sensors as well as a Mid. The pelvis and the feet have one
+# sensor each, so a placement variant on those joints substitutes only the limb side.
+_IMOVE_MULTI_PLACEMENT = ('THIGH_L', 'THIGH_R', 'SHANK_L', 'SHANK_R')
+
+
+def _imove_joints() -> Dict[str, Tuple[str, str]]:
+    """Every sensor pair spanning a joint, INCLUDING the High and Low placements.
+
+    All three placements on a thigh or shank sit on the same segment against one marker cluster,
+    so they border the same two joints the Mid one does — and the joint-center solve is equally
+    well-posed for them. `imove_mocap.load_trial` shifts each plate's mocap origin onto its own
+    IMU, so each placement carries its own position, its own sensor-to-segment rotation and
+    therefore its own lever arm to the joint. Measured on s13/t1_walking_001, the thigh's three
+    solved knee-center offsets are 257 / 159 / 93 mm going down the segment, off one identical
+    5.90 mm fit residual — the residual is a property of the rigid segment, not of the placement.
+
+    That lever arm is the point: o^J is the world-frame sweep rate of the accelerometer vector,
+    so it scales with the arm, and on that one trial the same knee reads 1302 / 939 / 885 across
+    the three placements. Pooled over all 243 trials the effect is far smaller — ~1.07x — and its
+    SIGN flips with which end of the segment the joint is at, which `report_placement` checks
+    against the prediction rather than asserting. Do not quote the single-trial figure.
+
+    An earlier version of this table listed the Mid sensors only, on the reasoning that they are
+    the ones bolted to the cluster (RIGID_SENSOR_OFFSET_MM) while H and L are taped and fitted
+    per trial. That is a real precision difference — the taped sensors' between-fit spread is
+    8.5-21.1 mm per axis against the bolted ones' 3.9-4.8 — but it is a caveat on their accuracy,
+    not grounds to drop them, and dropping them hid the one effect this dataset is uniquely able
+    to measure: it is the only one here with more than one sensor per segment.
+
+    Pairs are PLACEMENT-MATCHED (H with H, L with L) rather than every combination. A full cross
+    product is nine pairs per knee and answers a question nobody asked; the matched pair is what
+    a real two-IMU-per-joint setup taped at that height on both segments would be. Where the
+    other side has no matching placement, it contributes its Mid.
+    """
+    joints = {joint: (f'{parent}_M', f'{child}_M')
+              for joint, (parent, child) in _IMOVE_JOINT_SEGMENTS.items()}
+    for placement in ('H', 'L'):
+        for joint, (parent, child) in _IMOVE_JOINT_SEGMENTS.items():
+            pair = tuple(f'{segment}_{placement}' if segment in _IMOVE_MULTI_PLACEMENT
+                         else f'{segment}_M' for segment in (parent, child))
+            # Skip a variant that names the same sensors as the canonical pair, which would
+            # happen if neither side of the joint carried this placement.
+            if pair != joints[joint]:
+                joints[f'{joint}_{placement}'] = pair
+    return joints
+
 
 # IMoVE carries three sensors on each thigh and shank — High, Mid and Low — against a single
 # 4-marker cluster. They are separate rows here rather than being averaged into one "thigh",
@@ -215,26 +335,72 @@ IMOVE = DatasetSpec(
         'Shank L Low': 'SHANK_L_L',
         'Foot L': 'FOOT_L_M',
     },
-    # Mid sensors only. The High and Low placements are taped on and their cluster offsets are
-    # fitted per trial (building/imove_mocap.NOMINAL_SENSOR_OFFSET_MM), so a joint-center
-    # projection built on them carries that fit's error into o^J; the Mid sensors share one
-    # bolted bracket per segment and their offset is hardware. No lumbar: there is no torso
-    # sensor in this dataset.
-    joints={
-        'R_Hip': ('PELVIS_M', 'THIGH_R_M'),
-        'R_Knee': ('THIGH_R_M', 'SHANK_R_M'),
-        'R_Ankle': ('SHANK_R_M', 'FOOT_R_M'),
-        'L_Hip': ('PELVIS_M', 'THIGH_L_M'),
-        'L_Knee': ('THIGH_L_M', 'SHANK_L_M'),
-        'L_Ankle': ('SHANK_L_M', 'FOOT_L_M'),
-    },
+    joints=_imove_joints(),
+    primary_joints=tuple(_IMOVE_JOINT_SEGMENTS),
     pelvis_sensor='PELVIS_M',
     foot_sensors=('FOOT_L_M', 'FOOT_R_M'),
     subject_label='{}',
     field_reference={},
+    clean_sensor='PELVIS_M',
 )
 
-DATASETS: Dict[str, DatasetSpec] = {ALBORNO.name: ALBORNO, IMOVE.name: IMOVE}
+
+# --- IMoVE biplane: the same subjects, MC10 BioStamps against fluoroscopic bone poses --------
+#
+# NO MAGNETOMETER. A BioStamp measures acceleration and rotation only; see `has_magnetometer`
+# above for why that omits columns rather than filling them with the zeros the reader writes.
+# What is left is still most of this experiment — the accelerometer departure, the static
+# detector and its mocap cross-check, the intrinsic noise floor, and o^J at the knee — measured
+# against the best ground truth in the repository.
+#
+# ONE KNEE PER TRIAL. The trial name's leading letter picks the leg the fluoroscopy imaged, so
+# `RSDrop1` yields the right thigh and shank and nothing else. Both legs are listed here and
+# `_load_spec_plates` narrows to whichever is present, which is the same mechanism that lets an
+# Al Borno subject be missing an activity. The absent leg is not a gap in the trial.
+#
+# TWO REFERENCES OVER ONE BUILD. Every trial carries each IMU twice — `<site>__biplane` against
+# the fluoroscopic bone pose and `<site>__vicon` against a skin-mounted marker cluster — and the
+# INERTIAL DATA IS THE SAME DEVICE in both. Putting both in one spec would double-count every
+# sample in every pooled quantile, so they are two specs over one build tree instead, each
+# writing to its own directory. Which to prefer is a real trade and not settled here:
+#
+#   imove_biplane        bone pose, no soft-tissue artefact, ~180 valid frames per trial (0.48 s)
+#   imove_biplane_vicon  marker cluster, carries soft-tissue artefact, ~2500 valid frames (6.7 s)
+#
+# The reference-free half of the experiment (|acc| departure, the noise floor, the gyro-only
+# static detector) is IDENTICAL between the two by construction, which makes their disagreement
+# on the mocap-referenced half a clean measurement of what the ground-truth choice costs.
+_BIPLANE_SITES = (('Thigh L', 'lateral_thigh_left'), ('Shank L', 'lateral_shank_left'),
+                  ('Thigh R', 'lateral_thigh_right'), ('Shank R', 'lateral_shank_right'))
+
+
+def _biplane_spec(name: str, reference: str) -> DatasetSpec:
+    segment_sensor = {segment: f'{site}__{reference}' for segment, site in _BIPLANE_SITES}
+    joints = {'L_Knee': (segment_sensor['Thigh L'], segment_sensor['Shank L']),
+              'R_Knee': (segment_sensor['Thigh R'], segment_sensor['Shank R'])}
+    return DatasetSpec(
+        name=name,
+        segment_sensor=segment_sensor,
+        joints=joints,
+        primary_joints=tuple(joints),
+        # There is no pelvis sensor. This names the fallback `compute_trial` uses to pick the
+        # trial's sample rate and `label_posture_intervals` uses as its height signal; a thigh
+        # is the most proximal thing here, and posture labeling degrades to 'ambulation'
+        # throughout on a 0.5 s drop landing, which is the correct answer for it.
+        pelvis_sensor=segment_sensor['Thigh L'],
+        foot_sensors=(),
+        subject_label='{}',
+        field_reference={},
+        has_magnetometer=False,
+        trials_dataset='imove_biplane',
+    )
+
+
+IMOVE_BIPLANE = _biplane_spec('imove_biplane', 'biplane')
+IMOVE_BIPLANE_VICON = _biplane_spec('imove_biplane_vicon', 'vicon')
+
+DATASETS: Dict[str, DatasetSpec] = {spec.name: spec for spec in
+                                    (ALBORNO, IMOVE, IMOVE_BIPLANE, IMOVE_BIPLANE_VICON)}
 
 
 def get_dataset(name: str) -> DatasetSpec:
@@ -244,8 +410,18 @@ def get_dataset(name: str) -> DatasetSpec:
         raise ValueError(f"Unknown dataset {name!r}. Registered: {sorted(DATASETS)}.") from None
 
 
+def build_name(dataset: str) -> str:
+    """The build tree a spec name reads from — its own, unless it shares one (see DatasetSpec).
+
+    Falls back to the name for anything unregistered so this stays usable on a build tree that
+    has no spec yet, which is the state every new dataset passes through.
+    """
+    return DATASETS[dataset].build_name if dataset in DATASETS else dataset
+
+
 def enumerate_trials(dataset: str) -> List[Tuple[str, str]]:
-    """Every (subject, trial) with a BUILT parquet under results/trials/<dataset>/.
+    """Every (subject, trial) with a BUILT parquet under results/trials/<dataset>/, minus the
+    orphans (see `orphaned_trials`).
 
     Enumerated from the build tree rather than from the source data or from a constant, for
     the same reason `load_trial` refuses to parse from source: the parquet is the interface,
@@ -253,12 +429,64 @@ def enumerate_trials(dataset: str) -> List[Tuple[str, str]]:
     activity, or a dataset half-built, shows up here as a shorter list instead of as a run of
     failures — and `--check` can then say what is outstanding without loading anything.
     """
-    root = paths.TRIALS_DIR / dataset
+    return [key for key in built_trials(dataset) if key not in set(orphaned_trials(dataset))]
+
+
+def orphaned_trials(dataset: str) -> List[Tuple[str, str]]:
+    """Built parquets the dataset's SOURCE no longer enumerates.
+
+    The build tree is a cache, not a manifest, and nothing prunes it: a trial that was built
+    once and later excluded from the source leaves its parquet behind. IMoVE has 25 of them —
+    the `t0_static_pose` recordings, dropped by `sources.UNSYNCABLE_TRIALS` because a static
+    pose has no motion for the gyro cross-correlation to sync on — and imove_biplane has one,
+    `12/Test1/A/Rstatic1`, for the same reason. They are also stale against the current
+    toolchest digest, and `build_trials` will never refresh them because it enumerates from the
+    source, so every one of them was a permanent `Failed (stale)` cell in this experiment's
+    status grid with no command that could clear it.
+
+    Worth being explicit about what that costs, because it is not nothing: these are the
+    STILLEST recordings in either dataset, and the intrinsic noise floor in section 5 is exactly
+    what they would be best at. What excludes them is a mocap correspondence they do not need —
+    every reference-free metric here (|acc| and |mag| departure, the gyro-only static detector,
+    the noise floor) is computed on the raw trace and never consults a rotation. Recovering them
+    means a build path that emits a PlateTrial with `valid` all False instead of refusing to
+    sync, which is a change to the build layer rather than to this file.
+
+    Dropped here rather than left to fail, and returned rather than merely filtered so `main`
+    can say how many and which. A dataset with no registered source (a build tree from an
+    experiment that predates `sources.py`) has no orphans by definition, not all of them.
+    """
+    try:
+        source = get_source(build_name(dataset))
+    except ValueError:
+        return []
+    known = set(source.enumerate_trials())
+    return [key for key in built_trials(dataset) if key not in known]
+
+
+def built_trials(dataset: str) -> List[Tuple[str, str]]:
+    """Every (subject, trial) with a built parquet, orphans included."""
+    root = paths.TRIALS_DIR / build_name(dataset)
     if not root.is_dir():
         return []
-    return sorted((subject_dir.name, artifact.stem)
+    # A real cached trial is a parquet WITH ITS PROVENANCE MANIFEST beside it — that pairing is
+    # what `save_cached_trial` writes and what `cached_trial_status` reads. Globbing *.parquet
+    # and taking the stem is not enough: the build layer also drops sidecars such as
+    # `<trial>.build.parquet` into the same directory, and those became eleven phantom trials
+    # per IMoVE session, each of which then failed to load with a confusing stale-cache error.
+    # Keying on the manifest keeps this correct as further sidecars are added.
+    #
+    # RECURSIVE, because a trial KEY may contain slashes. `cached_trial_path` joins the key onto
+    # the subject directory verbatim, and the biplane source names its trials by the session and
+    # block they came from — 'Test1/A/RSDrop1' — so those parquets sit three levels down. A flat
+    # glob found none of them and reported the dataset as unbuilt while 379 trials sat on disk.
+    # The trial key is therefore the path relative to the subject directory, minus the suffix,
+    # with forward slashes on every platform so the key round-trips through `cached_trial_path`.
+    return sorted((subject_dir.name,
+                   artifact.relative_to(subject_dir).with_suffix('').as_posix())
                   for subject_dir in root.iterdir() if subject_dir.is_dir()
-                  for artifact in subject_dir.glob('*.parquet'))
+                  for artifact in subject_dir.rglob('*.parquet')
+                  if paths.manifest_path(artifact).exists())
 
 
 def subjects_of(row_keys: Sequence[Tuple[str, str]]) -> List[str]:
@@ -361,20 +589,60 @@ METRIC_UNITS = {
     'acc_norm_dev': 'm/s^2',
     'magdev': MAG_UNIT,
     'magdev_angle': 'deg',
+    'magdev_trial': MAG_UNIT,
+    'magdev_angle_trial': 'deg',
+    'magdev_loo': MAG_UNIT,
+    'magdev_angle_loo': 'deg',
+    'magdev_clean': MAG_UNIT,
+    'magdev_angle_clean': 'deg',
     'mag_norm_dev': MAG_UNIT,
     'obs_min': '(m/s^2)(m/s^3)',
 }
 # Which per-sample column each summarized metric reads, and which table it lives in.
 #
-# Two of the four segment metrics need a mocap ROTATION (linacc, magdev, magdev_angle) and two
+# Three of the five segment metrics need a mocap ROTATION (linacc, magdev, magdev_angle) and two
 # do not (acc_norm_dev, mag_norm_dev). That split matters more than it looks: the static
 # stretches of the Al Borno WALKING trials sit almost entirely outside the mocap window — the
 # subject stood for ~430 s before the cameras rolled — so on those trials the mocap-referenced
 # metrics have no static samples to report and the reference-free pair is the whole static/moving
 # comparison there. The n_valid columns in sensor_stats say which trials that applies to.
-SEGMENT_METRICS = ('linacc', 'acc_norm_dev', 'magdev', 'magdev_angle', 'mag_norm_dev')
-MOCAP_METRICS = ('linacc', 'magdev', 'magdev_angle')
 JOINT_METRICS = ('obs_min',)
+
+# THE FOUR REFERENCE ARMS magdev is measured against, as (magnitude column, angle column, arm).
+# Every one is the identical computation |m_world - c| against a different constant c, so any
+# difference between two of them is the REFERENCE and never the estimator. Declared once here
+# because `segment_samples`, `sensor_stats`, the summary, the report and the figures all iterate
+# it, and a hand-maintained second copy is how those drift apart.
+#
+#   subject  the median over every (trial, sensor) field median the subject has. What a filter
+#            calibrated once per session actually assumes, and the arm the "one constant field"
+#            claim is about. Not neutral: a sensor is 1/N of its own reference, and the sensor
+#            set is spatially lopsided (Al Borno carries 6 lower-limb sensors near the floor
+#            against 2 upper), so it is pulled toward the distorted end.
+#   trial    the same reduction over ONE trial's sensors. Removes between-trial drift in the
+#            reference and leaves within-trial structure; fitted on the samples it scores, so
+#            biased low and more so on short trials. See `trial_field_vector`.
+#   loo      the subject arm with THIS SENSOR LEFT OUT. The correction for the self-reference
+#            bias above and the only arm here that is unbiased in that sense. It moves the
+#            proximal sensors UP in both datasets (Al Borno torso +0.84 deg, pelvis +0.43;
+#            IMoVE pelvis +0.43) — that rise is the bias, concentrated proximally because that
+#            is where a sensor sits closest to the pooled reference it helped define. Quote this
+#            one when the question is how far a sensor is from a field it did not help define.
+#   clean    the field of the ONE cleanest sensor (`DatasetSpec.clean_sensor`). A diagnostic,
+#            not a measurement arm — it collapses the reference segment's own row and inflates
+#            the proximal-to-distal gradient 3-4x. Read the warning on `clean_sensor`.
+MAGDEV_ARMS = (('magdev', 'magdev_angle', 'subject'),
+               ('magdev_trial', 'magdev_angle_trial', 'trial'),
+               ('magdev_loo', 'magdev_angle_loo', 'loo'),
+               ('magdev_clean', 'magdev_angle_clean', 'clean'))
+# The arms whose reference is a property of the SUBJECT rather than of one trial, and so is
+# computed once in stage one's rollup instead of per trial. 'loo' is per (subject, sensor).
+SUBJECT_ARMS = ('subject', 'loo', 'clean')
+
+# The subset that needs a magnetometer, and so is absent on a dataset without one. See
+# `DatasetSpec.has_magnetometer` for why absent rather than NaN.
+MAG_METRICS = tuple(c for dev, angle, _ in MAGDEV_ARMS for c in (dev, angle)) + ('mag_norm_dev',)
+SEGMENT_METRICS = ('linacc', 'acc_norm_dev') + MAG_METRICS
 
 TRIAL_TABLES = ('trial_field', 'segment_samples', 'joint_samples', 'intervals',
                 'sensor_stats', 'joint_stats')
@@ -436,6 +704,10 @@ def trial_table_path(dataset: str, subject: str, trial: str, table: str) -> Path
 
 def subject_field_path(dataset: str, subject: str) -> Path:
     return dataset_dir(dataset) / subject / "subject_field.parquet"
+
+
+def subject_references_path(dataset: str, subject: str) -> Path:
+    return dataset_dir(dataset) / subject / "subject_references.parquet"
 
 
 def statistics_path(dataset: str) -> Path:
@@ -500,6 +772,29 @@ def read_subject_field(dataset: str, subject: str) -> Optional[np.ndarray]:
     row = pd.read_parquet(path, engine='pyarrow').iloc[0]
     return np.array([row['world_mag_x'], row['world_mag_y'], row['world_mag_z']], dtype=float)
 
+
+def read_subject_references(dataset: str, subject: str) -> Dict[str, object]:
+    """One subject's SUBJECT-scope magdev references, keyed by arm.
+
+    `loo` comes back as {sensor: vector} and the rest as bare vectors, which is the shape
+    `resolve_reference` consumes. An empty dict when the file is absent, which is what a run
+    predating this table looks like — every arm then falls back to the subject field rather
+    than the run failing, and the identical columns say so.
+    """
+    path = subject_references_path(dataset, subject)
+    if not path.exists():
+        return {}
+    df = pd.read_parquet(path, engine='pyarrow')
+    columns = ['world_mag_x', 'world_mag_y', 'world_mag_z']
+    out: Dict[str, object] = {}
+    for arm, group in df.groupby('arm'):
+        vectors = group[columns].to_numpy(dtype=float)
+        if arm == 'loo':
+            out[arm] = dict(zip(group['sensor'].astype(str), vectors))
+        else:
+            out[arm] = vectors[0]
+    return out
+
 # ==============================================================================
 # Stage one: the subject's global magnetic field
 # ==============================================================================
@@ -514,7 +809,12 @@ def trial_field_table(plates: Dict[str, PlateTrial], spec: DatasetSpec) -> pd.Da
 
     Median rather than mean because local ferrous distortion is one-sided and heavy-tailed: a
     mean would be pulled toward whichever part of the room the subject spent longest near.
+
+    Empty on a dataset with no magnetometer, which is what makes stage one a no-op there rather
+    than a table of zeros that would then become a zero "global field".
     """
+    if not spec.has_magnetometer:
+        return pd.DataFrame()
     sensor_segment = {sensor: segment for segment, sensor in spec.segment_sensor.items()}
     rows = []
     for sensor, plate in sorted(plates.items()):
@@ -552,8 +852,135 @@ def subject_field_from_trials(trial_fields: pd.DataFrame) -> np.ndarray:
     reference has to be neutral between segments, since comparing segments to each other is the
     whole measurement.
     """
-    vectors = trial_fields[['world_mag_x', 'world_mag_y', 'world_mag_z']].to_numpy(dtype=float)
+    return field_from_sensor_medians(trial_fields)
+
+
+def field_from_sensor_medians(sensor_fields: pd.DataFrame) -> np.ndarray:
+    """Median of the per-sensor world-frame field medians in `sensor_fields`.
+
+    One reduction at two scopes. Over every trial a subject has it is the SUBJECT field
+    (`subject_field_from_trials`); over the rows of one trial's `trial_field` table it is that
+    TRIAL's field (`trial_field_vector`). Sharing the implementation is the point: the two arms
+    in `segment_samples` differ only in which rows go in, so any difference between them is the
+    scope of the reference and not the estimator.
+
+    NaN on an empty frame, which is what a trial with no valid mocap frame produces — the trial
+    arm is then NaN for that trial while the subject arm still has a reference, which is the
+    honest state and is why this returns rather than raises.
+    """
+    if sensor_fields.empty:
+        return np.full(3, np.nan)
+    vectors = sensor_fields[['world_mag_x', 'world_mag_y', 'world_mag_z']].to_numpy(dtype=float)
     return np.median(vectors, axis=0)
+
+
+def subject_reference_table(subject: str, trial_fields: pd.DataFrame,
+                            spec: DatasetSpec) -> pd.DataFrame:
+    """Every SUBJECT-scope magdev reference, long-form: one row per (arm, sensor).
+
+    Long-form rather than extra columns on `subject_field.parquet`, because `loo` is a vector
+    PER SENSOR — fifteen of them on IMoVE — and widening the one-row table to hold them would
+    put sensor names in column names and make the schema depend on the dataset.
+
+    `sensor` is empty for the arms that do not vary by sensor, which keeps the join in
+    `resolve_reference` uniform. All three come off the same per-(trial, sensor) medians and the
+    same reduction, so nothing but the row selection distinguishes them:
+
+        subject   every row
+        loo       every row EXCEPT this sensor's
+        clean     only `spec.clean_sensor`'s rows
+
+    A spec with no `clean_sensor` simply contributes no `clean` rows, and the arm resolves back
+    to the subject field downstream rather than to NaN — an absent reference is a missing
+    configuration, not a measurement of zero.
+    """
+    rows = [{'subject': subject, 'arm': 'subject', 'sensor': '',
+             **_field_columns(field_from_sensor_medians(trial_fields))}]
+    if spec.clean_sensor is not None:
+        clean = trial_fields[trial_fields['sensor'] == spec.clean_sensor]
+        if not clean.empty:
+            rows.append({'subject': subject, 'arm': 'clean', 'sensor': spec.clean_sensor,
+                         **_field_columns(field_from_sensor_medians(clean))})
+    for sensor in sorted(set(trial_fields['sensor'])):
+        others = trial_fields[trial_fields['sensor'] != sensor]
+        # A one-sensor subject has no leave-one-out reference at all. Skipped rather than
+        # NaN-filled, so the arm falls back to the subject field and says so.
+        if not others.empty:
+            rows.append({'subject': subject, 'arm': 'loo', 'sensor': sensor,
+                         **_field_columns(field_from_sensor_medians(others))})
+    return pd.DataFrame(rows)
+
+
+def _field_columns(vector: np.ndarray) -> Dict[str, float]:
+    return {'world_mag_x': float(vector[0]), 'world_mag_y': float(vector[1]),
+            'world_mag_z': float(vector[2])}
+
+
+def resolve_reference(references: Dict[str, object], arm: str, sensor: str,
+                      fallback: np.ndarray) -> np.ndarray:
+    """The constant `arm` scores `sensor` against, or `fallback` when that arm is unavailable.
+
+    `references[arm]` is either one vector (subject, trial, clean) or a {sensor: vector} mapping
+    (loo). Falling back to the subject field rather than to NaN is deliberate: a missing arm is a
+    configuration gap — no `clean_sensor` declared, a one-sensor subject with no leave-one-out,
+    a caller that passed no references at all — and in every one of those the honest answer is
+    that this arm is the subject arm, which the identical numbers then make obvious.
+    """
+    entry = references.get(arm)
+    if entry is None:
+        return fallback
+    if isinstance(entry, dict):
+        return entry.get(sensor, fallback)
+    return entry
+
+
+def trial_field_vector(plates: Dict[str, PlateTrial], spec: DatasetSpec) -> np.ndarray:
+    """This trial's own global field: the median over ITS sensors' world-frame field medians.
+
+    The second arm `magdev` is measured against, and the reason it exists: the subject field is
+    one constant across a session, but a subject's per-trial fields disagree by ~10 deg of
+    heading at the median in both datasets — more than the 1.4-1.7 deg the cleanest sensors are
+    then reported to deviate from it. Scoring against the trial's own field removes that
+    between-trial drift and leaves the WITHIN-trial structure, so the gap between the two arms
+    measures the drift itself.
+
+    Not a replacement for the subject arm, and the report says so. The assumption under test is
+    that the magnetometer reads ONE CONSTANT FIELD; refitting the constant per trial concedes it
+    is not constant at the between-trial scale and then measures a narrower question. The trial
+    field is also fitted on the very samples scored against it, so it is biased low by
+    construction and increasingly so as trials get shorter. Both arms, always.
+
+    Pooled over SENSORS, deliberately, exactly as the subject field is. A per-(trial, sensor)
+    reference would be each sensor's own mean, which collapses magdev to within-sensor
+    variability and erases every between-segment comparison this experiment exists to make.
+    """
+    return field_from_sensor_medians(trial_field_table(plates, spec))
+
+
+def pooled_world_field(plates_by_group: Dict[str, Dict[str, PlateTrial]]) -> np.ndarray:
+    """A subject's global field as the median over POOLED world-frame samples.
+
+    The predecessor's definition, kept because experiments/relative_vs_absolute.py's
+    `subject_median` reference arm is built on it and its published numbers are measured
+    against that exact reference. Switching it to `subject_field_from_trials` would move every
+    theta_parent and theta_child in that experiment for reasons having nothing to do with what
+    it is measuring.
+
+    The difference between the two only bites when a subject's recordings differ wildly in
+    length: pooling weights the reference by recording time, so IMoVE's 2800 s walk would set
+    the field for the 30 s static pose beside it. Al Borno's two activities are within a factor
+    of two of each other, so the two definitions agree there to within the third decimal.
+
+    Needs every plate in memory at once, which is the other reason this experiment does not use
+    it: an IMoVE session is up to twelve trials.
+    """
+    world_mags = []
+    for plates in plates_by_group.values():
+        for plate in plates.values():
+            world_mags.append(plate.get_imu_trace_in_global_frame().mag)
+    if not world_mags:
+        raise ValueError("No plates supplied; cannot estimate a world field.")
+    return np.median(np.concatenate(world_mags, axis=0), axis=0)
 
 
 def subject_field_table(subject: str, trial_fields: pd.DataFrame) -> pd.DataFrame:
@@ -758,6 +1185,26 @@ def smooth_observability(observability: np.ndarray, fs: float,
     return np.maximum(filtfilt(b, a, capped), 0.0)
 
 
+def _joint_center_failed(joint: str, error: Exception) -> None:
+    """One joint's center could not be solved: warn and let the rest of the trial through.
+
+    Both joint tables need `project_pair_to_joint_center`, which fits the shared center from
+    frames where BOTH plates have valid mocap and refuses below 50 of them. That is the right
+    call at its own level — an under-determined offset looks exactly like a good one downstream
+    — but letting it propagate cost far more than the joint it belongs to. It killed the whole
+    trial, including `segment_samples` and `sensor_stats`, which need no joint center at all:
+    125 of `imove_biplane`'s 379 trials produced NOTHING because their fluoroscopy window is 48
+    valid frames against the fit's minimum of 50, and the accelerometer half of the experiment
+    would have run on every one of them.
+
+    Warned rather than silently skipped, because "this joint is absent from this trial" and
+    "this joint's center is unsolvable here" are different states and only the second is a
+    property of the ground truth's coverage.
+    """
+    warnings.warn(f"{joint}: joint center unsolvable, dropping this joint from the joint tables "
+                  f"(the segment tables are unaffected). {error}", RuntimeWarning, stacklevel=3)
+
+
 def joint_center_observability(parent_plate: PlateTrial, child_plate: PlateTrial
                                ) -> Tuple[np.ndarray, np.ndarray]:
     """(parent, child) per-sample observability at the shared joint center.
@@ -774,7 +1221,8 @@ def joint_center_observability(parent_plate: PlateTrial, child_plate: PlateTrial
 
 def segment_samples(plates: Dict[str, PlateTrial], spec: DatasetSpec, global_field: np.ndarray,
                     static_by_sensor: Dict[str, np.ndarray], body_static: np.ndarray,
-                    stride: int = SAMPLE_STRIDE) -> pd.DataFrame:
+                    stride: int = SAMPLE_STRIDE,
+                    references: Optional[Dict[str, object]] = None) -> pd.DataFrame:
     """Per-sample, per-sensor: both assumptions' departure, the raw signal norms, and the
     regime masks that split them.
 
@@ -794,19 +1242,45 @@ def segment_samples(plates: Dict[str, PlateTrial], spec: DatasetSpec, global_fie
     `acc_norm_dev`, `mag_norm_dev` and the three raw norms need no rotation and are kept over
     the FULL record. They are the reference-free half of the same question: a sensor reading
     gravity alone has |acc| = |g| whatever its orientation, and one reading a single constant
-    field has |mag| = |m_global| whatever its orientation, so any departure is real. Unlike
-    `linacc` and `magdev` they are things a filter could measure for itself at runtime — and,
-    for the trials whose still stretches fall outside the mocap window, they are the ONLY
-    static-regime numbers available.
+    field has |mag| = |m_global| whatever its orientation, so a departure is orientation-free
+    evidence that SOMETHING is off. Unlike `linacc` and `magdev` they are things a filter could
+    measure for itself at runtime — and, for the trials whose still stretches fall outside the
+    mocap window, they are the ONLY static-regime numbers available.
 
-    `mag_norm_dev` carries a caveat `acc_norm_dev` does not: |g| is known exactly while
-    |m_global| is estimated from these same sensors, so a per-sensor calibration gain error
-    lands in this column as if it were distortion. `mag_norm_std` is the gain-free companion —
-    the variability of |mag|, which a constant gain cannot move — and the two should be read
-    together.
+    What that something is, is the caveat, and it applies to BOTH `*_norm_dev` columns rather
+    than only the magnetic one. They differ in where the error enters.
+
+    For `mag_norm_dev` the REFERENCE is uncertain: |m_global| is estimated from these same
+    sensors, so a per-sensor gain error lands in the column as if it were distortion.
+
+    For `acc_norm_dev` the reference is exact — |g| is known — but the MEASUREMENT is not. An
+    accelerometer with a scale error or an axis bias reads |a| != |g| while sitting perfectly
+    still, and this column cannot separate that from a real departure from gravity. That is not
+    a small correction; at rest it is the whole column. Over whole-body-static stretches the
+    per-sensor offset of median |a| from |g| reaches -0.084 m/s^2 (IMoVE Foot R) against a
+    within-interval noise floor of 0.011, and hypot(0.084, 0.011) = 0.085 is that sensor's
+    entire measured acc_norm_dev_rms — so essentially none of it is a gravity departure. Al
+    Borno is milder and the same shape (Pelvis: +0.044 offset, 0.028 noise, 0.057 dev_rms).
+
+    The two halves are therefore reported apart, in `sensor_stats`: `acc_norm_bias` is the
+    signed offset, and `acc_norm_std` / `mag_norm_std` are the gain-free companions — the
+    variability of the norm, which a constant bias or gain cannot move. Section 3 of the report
+    prints all three beside each other, and a static-regime `acc_norm_dev` should not be quoted
+    without them.
+
+    FOUR REFERENCE ARMS, one column pair each — see MAGDEV_ARMS for what each is and which to
+    quote. They differ only in the constant subtracted, so any difference between two of them is
+    the reference. Any arm `references` does not supply falls back to the subject field, which
+    makes it identical to the subject arm rather than absent; see `resolve_reference`.
+
+    On a dataset with no magnetometer every magnetic column is OMITTED rather than filled; see
+    `DatasetSpec.has_magnetometer`.
     """
     sensor_segment = {sensor: segment for segment, sensor in spec.segment_sensor.items()}
-    global_norm = float(np.linalg.norm(global_field))
+    magnetic = spec.has_magnetometer
+    global_norm = float(np.linalg.norm(global_field)) if magnetic else np.nan
+    references = dict(references or {})
+    references['subject'] = global_field
     blocks = []
     for segment, sensor in spec.segment_sensor.items():
         plate = plates.get(sensor)
@@ -818,9 +1292,6 @@ def segment_samples(plates: Dict[str, PlateTrial], spec: DatasetSpec, global_fie
         n = len(plate)
 
         linacc = np.linalg.norm(world.acc - EXPECTED_GRAVITY, axis=1)
-        mag_error = world.mag - global_field
-        magdev = np.linalg.norm(mag_error, axis=1)
-        magdev_angle = angle_between_deg(world.mag, np.broadcast_to(global_field, world.mag.shape))
         mocap_only = np.where(valid, 1.0, np.nan)
 
         static = static_by_sensor.get(sensor, np.zeros(n, dtype=bool))[:n]
@@ -834,14 +1305,20 @@ def segment_samples(plates: Dict[str, PlateTrial], spec: DatasetSpec, global_fie
             'static': static,
             'body_static': body,
             'linacc': (linacc * mocap_only).astype(np.float32),
-            'magdev': (magdev * mocap_only).astype(np.float32),
-            'magdev_angle': (magdev_angle * mocap_only).astype(np.float32),
             'acc_norm': np.linalg.norm(local.acc, axis=1).astype(np.float32),
             'gyro_norm': np.linalg.norm(local.gyro, axis=1).astype(np.float32),
-            'mag_norm': np.linalg.norm(local.mag, axis=1).astype(np.float32),
         })
         block['acc_norm_dev'] = np.abs(block['acc_norm'] - GRAVITY_MAGNITUDE).astype(np.float32)
-        block['mag_norm_dev'] = np.abs(block['mag_norm'] - global_norm).astype(np.float32)
+        if magnetic:
+            for dev_column, angle_column, arm in MAGDEV_ARMS:
+                vector = resolve_reference(references, arm, sensor, global_field)
+                reference = np.broadcast_to(np.asarray(vector, dtype=float), world.mag.shape)
+                block[dev_column] = (np.linalg.norm(world.mag - reference, axis=1)
+                                     * mocap_only).astype(np.float32)
+                block[angle_column] = (angle_between_deg(world.mag, reference)
+                                       * mocap_only).astype(np.float32)
+            block['mag_norm'] = np.linalg.norm(local.mag, axis=1).astype(np.float32)
+            block['mag_norm_dev'] = np.abs(block['mag_norm'] - global_norm).astype(np.float32)
         blocks.append(block.iloc[::stride] if stride > 1 else block)
 
     if not blocks:
@@ -867,13 +1344,19 @@ def joint_samples(plates: Dict[str, PlateTrial], spec: DatasetSpec, fs: float,
     A joint counts as `static` only when BOTH its sensors are, which is the same minimum
     argument applied to the regime: a knee with a planted shank and a swinging thigh is not a
     static knee.
+
+    A joint whose center cannot be solved is DROPPED, not raised on; see `_joint_center_failed`.
     """
     rows = []
     for joint, (parent_sensor, child_sensor) in spec.joints.items():
         if parent_sensor not in plates or child_sensor not in plates:
             continue
         parent_plate, child_plate = plates[parent_sensor], plates[child_sensor]
-        obs_parent, obs_child = joint_center_observability(parent_plate, child_plate)
+        try:
+            obs_parent, obs_child = joint_center_observability(parent_plate, child_plate)
+        except UnderdeterminedJointCenter as e:
+            _joint_center_failed(joint, e)
+            continue
         n = min(len(obs_parent), len(obs_child))
         obs_parent, obs_child = obs_parent[:n], obs_child[:n]
         raw_min = np.minimum(obs_parent, obs_child)
@@ -915,7 +1398,8 @@ def regime_masks(static: np.ndarray, body_static: np.ndarray, n: int) -> Dict[st
             'nonstatic': ~static, 'body_static': body}
 
 
-def interval_noise(trace: IMUTrace, mask: np.ndarray) -> Dict[str, float]:
+def interval_noise(trace: IMUTrace, mask: np.ndarray,
+                   modalities: Sequence[str] = ('gyro', 'acc', 'mag')) -> Dict[str, float]:
     """Per-axis noise floor for one sensor over one regime: the length-weighted mean of the
     per-axis standard deviation WITHIN each static interval.
 
@@ -933,11 +1417,11 @@ def interval_noise(trace: IMUTrace, mask: np.ndarray) -> Dict[str, float]:
     least two.
     """
     result: Dict[str, float] = {'n_noise_samples': 0, 'n_noise_intervals': 0}
-    for modality in ('gyro', 'acc', 'mag'):
+    for modality in modalities:
         for axis in 'xyz':
             result[f'{modality}_noise_{axis}'] = np.nan
 
-    weighted = {modality: np.zeros(3) for modality in ('gyro', 'acc', 'mag')}
+    weighted = {modality: np.zeros(3) for modality in modalities}
     total, count = 0, 0
     for start, end in mask_to_intervals(mask):
         end = min(end, len(trace))
@@ -1000,7 +1484,7 @@ def mocap_motion_check(plate: PlateTrial, mask: np.ndarray) -> Dict[str, float]:
 
 def sensor_stats(plates: Dict[str, PlateTrial], spec: DatasetSpec, global_field: np.ndarray,
                  static_by_sensor: Dict[str, np.ndarray], body_static: np.ndarray,
-                 fs: float) -> pd.DataFrame:
+                 fs: float, references: Optional[Dict[str, object]] = None) -> pd.DataFrame:
     """Per-(sensor, regime) scalars: how far each assumption fails, and the noise floor it
     fails against.
 
@@ -1015,8 +1499,15 @@ def sensor_stats(plates: Dict[str, PlateTrial], spec: DatasetSpec, global_field:
     genuinely still stretches sit outside the mocap window: recovering those is what the
     non-destructive alignment was for, and holding them to `valid` would throw the best noise
     data away. `n_samples` and `n_valid` say which span each column had.
+
+    On a dataset with no magnetometer every magnetic column is omitted; see
+    `DatasetSpec.has_magnetometer`.
     """
-    global_norm = float(np.linalg.norm(global_field))
+    magnetic = spec.has_magnetometer
+    global_norm = float(np.linalg.norm(global_field)) if magnetic else np.nan
+    references = dict(references or {})
+    references['subject'] = global_field
+    modalities = spec.noise_modalities()
     rows = []
     for segment, sensor in spec.segment_sensor.items():
         plate = plates.get(sensor)
@@ -1027,10 +1518,20 @@ def sensor_stats(plates: Dict[str, PlateTrial], spec: DatasetSpec, global_field:
         n = len(plate)
 
         acc_norm = np.linalg.norm(local.acc, axis=1)
-        mag_norm = np.linalg.norm(local.mag, axis=1)
         linacc = np.linalg.norm(world.acc - EXPECTED_GRAVITY, axis=1)
-        magdev = np.linalg.norm(world.mag - global_field, axis=1)
-        magdev_angle = angle_between_deg(world.mag, np.broadcast_to(global_field, world.mag.shape))
+        if magnetic:
+            mag_norm = np.linalg.norm(local.mag, axis=1)
+            arms, drift = {}, {}
+            for _, _, arm in MAGDEV_ARMS:
+                vector = resolve_reference(references, arm, sensor, global_field)
+                reference = np.broadcast_to(np.asarray(vector, dtype=float), world.mag.shape)
+                arms[arm] = (np.linalg.norm(world.mag - reference, axis=1),
+                             angle_between_deg(world.mag, reference))
+                # How far this arm's constant sits from the subject one it is an alternative to.
+                # Constant across the sensor's rows by construction, and carried per row anyway
+                # so any slice can weigh an arm against the drift that separates it.
+                drift[f'reference_drift_{arm}_deg'] = float(angle_between_deg(
+                    np.atleast_2d(vector), np.atleast_2d(global_field))[0])
 
         for regime, mask in regime_masks(static_by_sensor.get(sensor, np.zeros(n, dtype=bool)),
                                          body_static, n).items():
@@ -1042,7 +1543,7 @@ def sensor_stats(plates: Dict[str, PlateTrial], spec: DatasetSpec, global_field:
             # motion under a column named "noise". An empty mask fills the columns with NaN,
             # which keeps the schema identical across regimes so the table stays rectangular.
             noise_mask = mask if regime in NOISE_REGIMES else np.zeros(n, dtype=bool)
-            rows.append({
+            row = {
                 'sensor': sensor, 'segment': segment, 'regime': regime,
                 'n_samples': int(mask.sum()), 'n_valid': int(mocap.sum()),
                 'duration_s': float(mask.sum() / fs),
@@ -1050,39 +1551,75 @@ def sensor_stats(plates: Dict[str, PlateTrial], spec: DatasetSpec, global_field:
                 # Reference-free, whole record.
                 'acc_norm_median': float(np.median(acc_norm[mask])),
                 'acc_norm_std': float(np.std(acc_norm[mask])),
+                # The two halves of acc_norm_dev_rms, kept apart. `acc_norm_bias` is the SIGNED
+                # offset of this sensor's median |a| from |g| — a scale or axis-bias error the
+                # sensor carries whether or not it is moving — and `acc_norm_std` is the
+                # variability a constant offset cannot move. Over a static regime
+                # acc_norm_dev_rms is very close to hypot(bias, std), i.e. it is mostly
+                # calibration, and quoting it alone reads as a gravity departure that is not
+                # there. See `segment_samples` for the measured sizes.
+                'acc_norm_bias': float(np.median(acc_norm[mask]) - GRAVITY_MAGNITUDE),
                 'acc_norm_dev_rms': float(np.sqrt(np.mean((acc_norm[mask] - GRAVITY_MAGNITUDE) ** 2))),
-                'mag_norm_median': float(np.median(mag_norm[mask])),
-                'mag_norm_std': float(np.std(mag_norm[mask])),
-                'mag_norm_dev_rms': float(np.sqrt(np.mean((mag_norm[mask] - global_norm) ** 2))),
                 # Mocap-referenced, valid frames only.
-                **_mocap_referenced(linacc, magdev, magdev_angle, world.mag, mocap),
-                **interval_noise(local, noise_mask),
+                **_mocap_referenced(linacc, mocap),
+                **interval_noise(local, noise_mask, modalities),
                 **mocap_motion_check(plate, noise_mask),
-            })
+            }
+            if magnetic:
+                row.update({
+                    'mag_norm_median': float(np.median(mag_norm[mask])),
+                    'mag_norm_std': float(np.std(mag_norm[mask])),
+                    'mag_norm_dev_rms': float(np.sqrt(np.mean((mag_norm[mask] - global_norm) ** 2))),
+                    **drift,
+                })
+                for dev_column, angle_column, arm in MAGDEV_ARMS:
+                    row.update(_mocap_referenced_mag(*arms[arm], world.mag, mocap,
+                                                     dev_column, angle_column))
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
-def _mocap_referenced(linacc: np.ndarray, magdev: np.ndarray, magdev_angle: np.ndarray,
-                      world_mag: np.ndarray, mask: np.ndarray) -> Dict[str, float]:
+def _mocap_referenced(linacc: np.ndarray, mask: np.ndarray) -> Dict[str, float]:
     """The half of `sensor_stats` that needs a mocap rotation, or NaNs where there is none."""
-    keys = ('linacc_rms', 'linacc_median', 'linacc_p95', 'magdev_rms', 'magdev_median',
-            'magdev_p95', 'magdev_angle_median', 'magdev_angle_p95',
-            'world_mag_x', 'world_mag_y', 'world_mag_z')
+    keys = ('linacc_rms', 'linacc_median', 'linacc_p95')
     if mask.sum() < 2:
         return {key: np.nan for key in keys}
     return {
         'linacc_rms': float(np.sqrt(np.mean(linacc[mask] ** 2))),
         'linacc_median': float(np.median(linacc[mask])),
         'linacc_p95': float(np.percentile(linacc[mask], 95)),
-        'magdev_rms': float(np.sqrt(np.mean(magdev[mask] ** 2))),
-        'magdev_median': float(np.median(magdev[mask])),
-        'magdev_p95': float(np.percentile(magdev[mask], 95)),
-        'magdev_angle_median': float(np.median(magdev_angle[mask])),
-        'magdev_angle_p95': float(np.percentile(magdev_angle[mask], 95)),
-        'world_mag_x': float(np.median(world_mag[mask, 0])),
-        'world_mag_y': float(np.median(world_mag[mask, 1])),
-        'world_mag_z': float(np.median(world_mag[mask, 2])),
     }
+
+
+def _mocap_referenced_mag(magdev: np.ndarray, magdev_angle: np.ndarray, world_mag: np.ndarray,
+                          mask: np.ndarray, dev_column: str = 'magdev',
+                          angle_column: str = 'magdev_angle') -> Dict[str, float]:
+    """The magnetic half of the same, for ONE of magdev's two reference arms.
+
+    Column names are passed in rather than fixed so the subject and trial arms share this code
+    exactly: they differ only in the constant subtracted upstream, so any difference in their
+    numbers is the reference and not the estimator. The sensor's own median world-frame field is
+    reference-independent and is emitted by the subject arm alone, which is why it is keyed off
+    the default name rather than the loop.
+    """
+    keys = [f'{dev_column}_rms', f'{dev_column}_median', f'{dev_column}_p95',
+            f'{angle_column}_median', f'{angle_column}_p95']
+    if dev_column == 'magdev':
+        keys += ['world_mag_x', 'world_mag_y', 'world_mag_z']
+    if mask.sum() < 2:
+        return {key: np.nan for key in keys}
+    out = {
+        f'{dev_column}_rms': float(np.sqrt(np.mean(magdev[mask] ** 2))),
+        f'{dev_column}_median': float(np.median(magdev[mask])),
+        f'{dev_column}_p95': float(np.percentile(magdev[mask], 95)),
+        f'{angle_column}_median': float(np.median(magdev_angle[mask])),
+        f'{angle_column}_p95': float(np.percentile(magdev_angle[mask], 95)),
+    }
+    if dev_column == 'magdev':
+        out.update({'world_mag_x': float(np.median(world_mag[mask, 0])),
+                    'world_mag_y': float(np.median(world_mag[mask, 1])),
+                    'world_mag_z': float(np.median(world_mag[mask, 2]))})
+    return out
 
 
 def angle_between_deg(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -1106,21 +1643,31 @@ def joint_stats(plates: Dict[str, PlateTrial], spec: DatasetSpec, global_field: 
     split is where each of them says something a pooled number hides — o^J collapses when a
     joint stops moving, which is exactly when the magnetometer is most trustworthy and least
     needed to be gated.
+
+    The field-consistency block is skipped entirely on a dataset with no magnetometer, which
+    leaves the o^J and accelerometer-residual columns and drops report sections 8's rows. A joint
+    whose center cannot be solved is dropped; see `_joint_center_failed`.
     """
+    magnetic = spec.has_magnetometer
     rows = []
     for joint, (parent_sensor, child_sensor) in spec.joints.items():
         if parent_sensor not in plates or child_sensor not in plates:
             continue
         parent_plate, child_plate = plates[parent_sensor], plates[child_sensor]
-        parent_proj, child_proj = project_pair_to_joint_center(parent_plate, child_plate)
+        try:
+            parent_proj, child_proj = project_pair_to_joint_center(parent_plate, child_plate)
+        except UnderdeterminedJointCenter as e:
+            _joint_center_failed(joint, e)
+            continue
 
         obs_parent = segment_observability(parent_proj.imu_trace)
         obs_child = segment_observability(child_proj.imu_trace)
         n = min(len(obs_parent), len(obs_child))
         obs_min = np.minimum(obs_parent[:n], obs_child[:n])
 
-        parent_mag = parent_plate.get_imu_trace_in_global_frame().mag[:n]
-        child_mag = child_plate.get_imu_trace_in_global_frame().mag[:n]
+        if magnetic:
+            parent_mag = parent_plate.get_imu_trace_in_global_frame().mag[:n]
+            child_mag = child_plate.get_imu_trace_in_global_frame().mag[:n]
         projected_acc = (parent_proj.get_imu_trace_in_global_frame().acc[:n],
                          child_proj.get_imu_trace_in_global_frame().acc[:n])
         raw_acc = (parent_plate.get_imu_trace_in_global_frame().acc[:n],
@@ -1152,15 +1699,16 @@ def joint_stats(plates: Dict[str, PlateTrial], spec: DatasetSpec, global_field: 
             for quantile in QUANTILES:
                 row[f"obs_min_p{int(round(quantile * 100)):02d}"] = float(
                     np.quantile(obs_min[mask], quantile))
-            row.update(field_consistency(joint, spec, parent_sensor, child_sensor,
-                                         parent_mag, child_mag, mocap))
+            if magnetic:
+                row.update(field_consistency(joint, spec, parent_sensor, child_sensor,
+                                             parent_mag, child_mag, global_field, mocap))
             row.update(acc_residual(projected_acc, raw_acc, mocap))
             rows.append(row)
     return pd.DataFrame(rows)
 
 
 def field_consistency(joint: str, spec: DatasetSpec, parent_sensor: str, child_sensor: str,
-                      parent_mag: np.ndarray, child_mag: np.ndarray,
+                      parent_mag: np.ndarray, child_mag: np.ndarray, global_field: np.ndarray,
                       mask: np.ndarray) -> Dict[str, object]:
     """Per-joint test of the premise behind estimating the field locally: is one sensor's field
     better predicted by its NEIGHBOUR across the joint than by the subject's global field?
@@ -1213,12 +1761,24 @@ def field_consistency(joint: str, spec: DatasetSpec, parent_sensor: str, child_s
         reference_mag, target_mag = child_mag, parent_mag
         reference_sensor, target_sensor = child_sensor, parent_sensor
 
-    global_direction = np.broadcast_to(np.median(target_mag, axis=0), target_mag.shape)
+    # TWO "global" baselines, because they answer different questions and an earlier version of
+    # this function conflated them. `cos_sim_target_global` is against the SUBJECT'S field — the
+    # same constant `magdev` and `magdev_angle` are measured against, and the only one that makes
+    # this column comparable with section 4 or with what a filter carrying one field for the whole
+    # body would actually use. `cos_sim_target_trial_median` is against the target sensor's OWN
+    # median over this window, which is the strictly stronger baseline the neighbour has to beat:
+    # it is refitted per trial, per sensor and per regime, in-sample, so it already absorbs every
+    # static offset the subject-level constant cannot. Reporting only the second one flattered the
+    # global arm and understated how much local structure there is.
+    subject_direction = np.broadcast_to(np.asarray(global_field, dtype=float), target_mag.shape)
+    trial_direction = np.broadcast_to(np.median(target_mag, axis=0), target_mag.shape)
     return {
         'reference_role': reference_role,
         'reference_sensor': reference_sensor,
         'target_sensor': target_sensor,
-        'cos_sim_target_global': float(np.mean(_cosine_similarity(target_mag, global_direction))),
+        'cos_sim_target_global': float(np.mean(_cosine_similarity(target_mag, subject_direction))),
+        'cos_sim_target_trial_median': float(np.mean(_cosine_similarity(target_mag,
+                                                                        trial_direction))),
         # Symmetric in the pair, so unaffected by the reference direction.
         'cos_sim_target_reference': float(np.mean(_cosine_similarity(target_mag, reference_mag))),
         'corr_target_reference': _pair_correlation(target_mag, reference_mag),
@@ -1367,28 +1927,39 @@ def trial_masks(plates: Dict[str, PlateTrial], fs: float
 
 def compute_trial(plates: Dict[str, PlateTrial], spec: DatasetSpec, global_field: np.ndarray,
                   tables: Sequence[str] = RECOMPUTABLE_TABLES,
-                  stride: int = SAMPLE_STRIDE) -> Dict[str, pd.DataFrame]:
+                  stride: int = SAMPLE_STRIDE,
+                  references: Optional[Dict[str, object]] = None) -> Dict[str, pd.DataFrame]:
     """Everything this experiment computes for one trial, as the per-trial tables.
 
     `tables` restricts the work to a subset (see --only-tables). Anything only one table needs
     is skipped when that table is not wanted, which is what makes a targeted rerun cheap: the
     two joint tables carry the rigid-body projection and dominate the runtime.
+
+    The TRIAL arm's reference is recomputed here rather than read back from the `trial_field`
+    parquet stage one wrote. Same function over the same plates, so it is the same vector — and
+    computing it removes an ordering dependency that `--only-tables` and `--skip-fields` would
+    otherwise be able to violate, at the cost of one median over the world-frame magnetometer.
+    The SUBJECT-scope arms cannot be recomputed here (they pool over trials this call cannot
+    see), so they arrive in `references`; anything missing falls back to the subject field.
     """
     wanted = set(tables)
     reference = plates.get(spec.pelvis_sensor) or next(iter(plates.values()))
     fs = reference.imu_trace.get_sample_frequency()
     timestamps = reference.imu_trace.timestamps
     static_by_sensor, body_static = trial_masks(plates, fs)
+    references = dict(references or {})
+    if spec.has_magnetometer:
+        references['trial'] = trial_field_vector(plates, spec)
 
     builders = {
         'segment_samples': lambda: segment_samples(plates, spec, global_field, static_by_sensor,
-                                                   body_static, stride),
+                                                   body_static, stride, references),
         'joint_samples': lambda: joint_samples(plates, spec, fs, static_by_sensor, body_static,
                                                stride),
         'intervals': lambda: intervals_table(label_posture_intervals(plates, spec, fs),
                                              static_by_sensor, body_static, timestamps),
         'sensor_stats': lambda: sensor_stats(plates, spec, global_field, static_by_sensor,
-                                             body_static, fs),
+                                             body_static, fs, references),
         'joint_stats': lambda: joint_stats(plates, spec, global_field, static_by_sensor,
                                            body_static, fs),
     }
@@ -1435,12 +2006,17 @@ def _trial_worker(row_key: Tuple[str, str], stage_labels: List[str], shared_stat
     shared_state[(row_key, stage)] = "Running"
     started = time.time()
     try:
-        global_field = read_subject_field(dataset, subject)
+        # A dataset with no magnetometer has no stage one and no subject field; every consumer
+        # of it is skipped downstream, so the NaN vector here is never read.
+        global_field = (read_subject_field(dataset, subject) if spec.has_magnetometer
+                        else np.full(3, np.nan))
         if global_field is None:
             shared_state[(row_key, stage)] = "Failed (no subject field)"
             return None
+        references = read_subject_references(dataset, subject) if spec.has_magnetometer else {}
         plates = _load_spec_plates(subject, trial, dataset, spec)
-        for table, df in compute_trial(plates, spec, global_field, tables, stride).items():
+        for table, df in compute_trial(plates, spec, global_field, tables, stride,
+                                       references).items():
             if df.empty:
                 continue
             _save(df, trial_table_path(dataset, subject, trial, table), dataset,
@@ -1460,20 +2036,38 @@ def _load_spec_plates(subject: str, trial: str, dataset: str,
     sensor the spec does not analyse would still be able to veto every body-static interval in
     the trial. Raises if the trial has none of the spec's sensors, which means the spec and the
     build disagree and is not something to paper over with an empty table.
+
+    On the two biplane specs that state is REAL and expected for a handful of trials, not a bug:
+    `06/Test1/A/LSHop3` and `06/Test1/A/RSHop4` have a Vicon cluster and no fluoroscopic pose, so
+    they are analysable under `imove_biplane_vicon` and not under `imove_biplane`. The message
+    says so rather than leaving the reader to compare two sensor lists by eye.
     """
-    plates = load_trial(subject, trial, dataset=dataset)
+    plates = load_trial(subject, trial, dataset=build_name(dataset))
     selected = {sensor: plate for sensor, plate in plates.items()
                 if sensor in set(spec.segment_sensor.values())}
     if not selected:
+        siblings = [other.name for other in DATASETS.values()
+                    if other.name != spec.name and other.build_name == spec.build_name
+                    and set(other.segment_sensor.values()) & set(plates)]
+        hint = (f" This trial DOES carry the sensors {siblings} names, so run it under that "
+                f"spec instead." if siblings else "")
         raise ValueError(f"{dataset}/{subject}/{trial}: none of the spec's sensors "
                          f"{sorted(spec.segment_sensor.values())} are in this trial "
-                         f"({sorted(plates)}).")
+                         f"({sorted(plates)}).{hint}")
     return selected
 
 
 def aggregate_subject_fields(dataset: str, row_keys: Sequence[Tuple[str, str]]) -> List[str]:
-    """Rolls stage one's per-trial tables up into one global field per subject. Returns the
-    subjects it could write a field for."""
+    """Rolls stage one's per-trial tables up into the subject-scope references. Returns the
+    subjects it could write for.
+
+    Two artifacts off one rollup: `subject_field.parquet`, the single global field the rest of
+    the pipeline and report section 10 read, and `subject_references.parquet`, every arm whose
+    reference is a property of the subject rather than of one trial (see SUBJECT_ARMS). They are
+    separate files because the second is long-form over (arm, sensor) and the first is one row
+    that several callers already index by name.
+    """
+    spec = get_dataset(dataset)
     written = []
     for subject in subjects_of(row_keys):
         frames = []
@@ -1488,6 +2082,8 @@ def aggregate_subject_fields(dataset: str, row_keys: Sequence[Tuple[str, str]]) 
         trial_fields = pd.concat(frames, ignore_index=True)
         _save(subject_field_table(subject, trial_fields), subject_field_path(dataset, subject),
               dataset, subject=subject)
+        _save(subject_reference_table(subject, trial_fields, spec),
+              subject_references_path(dataset, subject), dataset, subject=subject)
         written.append(subject)
     return written
 
@@ -1612,11 +2208,15 @@ def report_headline(spec: DatasetSpec, summary: pd.DataFrame, sensor_df: pd.Data
         print("No per-sample data found.")
         return
     print(f"  {'metric':<16}{'regime':<14}{'median':>12}{'IQR':>24}{'p95':>12}{'n':>16}")
-    for metric in SEGMENT_METRICS + JOINT_METRICS:
+    for metric in spec.segment_metrics() + JOINT_METRICS:
         unit = METRIC_UNITS[metric]
         for regime in REGIMES:
             group_kind = 'joint' if metric in JOINT_METRICS else 'segment'
-            groups = (list(spec.joints) if group_kind == 'joint' else list(spec.segment_sensor))
+            # Canonical joints only. The placement variants span the same anatomical joints with
+            # a different sensor mounted, so pooling all 18 would count each IMoVE knee three
+            # times and weight the pooled median by how many sensors happen to sit on a segment.
+            groups = (list(spec.primary_joints) if group_kind == 'joint'
+                      else list(spec.segment_sensor))
             rows = summary[(summary['subject'] == 'all') & (summary['trial'] == 'all')
                            & (summary['metric'] == metric) & (summary['regime'] == regime)
                            & (summary['group'].isin(groups))]
@@ -1640,6 +2240,43 @@ def report_headline(spec: DatasetSpec, summary: pd.DataFrame, sensor_df: pd.Data
     print("sensors' own units. Read the static/nonstatic pair, not either alone: the assumptions")
     print("are not uniformly wrong, they are wrong WHEN THE SENSOR MOVES, which is an argument")
     print("for gating a measurement update in time rather than for a larger constant noise term.")
+    report_coverage_warning(spec, sensor_df)
+
+
+def report_coverage_warning(spec: DatasetSpec, sensor_df: pd.DataFrame) -> None:
+    """Warns when the dataset's sensors are not all measured over the same trials.
+
+    Every pooled quantile in this report is SAMPLE-weighted, which is the right choice for
+    "what does a filter see" and the wrong one for comparing two sensors that were not recorded
+    together. IMoVE breaks that assumption hard: its long-walk sessions carry only the seven Mid
+    sensors, at 100 Hz for ~2800 s, so one such trial contributes ~120x the samples of a normal
+    40 Hz task trial — and contributes them to the Mid rows only. Comparing 'Thigh R Mid' against
+    'Thigh R High' in any pooled table therefore compares two different sets of recordings.
+
+    Printed rather than corrected because the fix depends on the question: the placement
+    comparison in section 7 pairs over trials and is safe, while a "what does the accelerometer
+    on a thigh read" number legitimately wants every sample it has. What is not safe is reading
+    the two off the same table without knowing this.
+    """
+    if sensor_df.empty:
+        return
+    counts = (sensor_df[sensor_df['regime'] == 'all']
+              .groupby('segment', observed=True)
+              .agg(trials=('n_samples', 'size'), samples=('n_samples', 'sum')))
+    if counts.empty or counts['trials'].nunique() <= 1:
+        return
+    most, fewest = counts['trials'].max(), counts['trials'].min()
+    print(f"\nCAVEAT — the sensors are NOT all measured over the same trials: segment trial counts "
+          f"run\n{fewest} to {most}. In this dataset that is the long-walk sessions, which carry only "
+          f"the Mid sensors\nand are far longer and faster-sampled than the rest, so every "
+          f"SAMPLE-weighted number below\nweights them heavily for those segments and not at all "
+          f"for the others. Cross-segment\ncomparisons within one placement are fine; comparing "
+          f"placements on one segment is not, and\nsection 7 pairs over trials for exactly that "
+          f"reason.")
+    print(f"  {'segment':<16}{'trials':>8}{'samples':>14}")
+    for segment in [s for s in spec.segment_sensor if s in counts.index]:
+        row = counts.loc[segment]
+        print(f"  {segment:<16}{int(row['trials']):>8}{int(row['samples']):>14,}")
 
 
 def report_static_coverage(spec: DatasetSpec, sensor_df: pd.DataFrame) -> None:
@@ -1695,26 +2332,103 @@ def report_static_coverage(spec: DatasetSpec, sensor_df: pd.DataFrame) -> None:
         print(f"  {len(dark)} trial(s) have effectively NO static sample with mocap: {listed}{more}")
 
 
+def with_acc_bias(sensor_df: pd.DataFrame) -> pd.DataFrame:
+    """`sensor_df` guaranteed to carry `acc_norm_bias`, deriving it if the table predates it.
+
+    The column is just median(|a|) - |g|, and `acc_norm_median` has always been saved, so a
+    results tree written before `acc_norm_bias` existed can still be reported on without a
+    recompute. Deriving beats raising here: a partial or older results tree is a legitimate
+    state everywhere else in this module, and the alternative is a KeyError that reads like a
+    corrupt table rather than an out-of-date one.
+    """
+    if sensor_df.empty or 'acc_norm_bias' in sensor_df.columns:
+        return sensor_df
+    if 'acc_norm_median' not in sensor_df.columns:
+        return sensor_df
+    return sensor_df.assign(acc_norm_bias=sensor_df['acc_norm_median'] - GRAVITY_MAGNITUDE)
+
+
+def report_acc_calibration(spec: DatasetSpec, sensor_df: pd.DataFrame) -> None:
+    """How much of the reference-free ||a|-|g|| is a constant calibration offset.
+
+    Exists because the static row of `acc_norm_dev_rms` reads as a gravity departure and is
+    mostly not one. The decomposition is exact up to median-vs-mean: with dev = |a| - |g|,
+
+        dev_rms^2 = mean(dev)^2 + var(dev) = bias^2 + acc_norm_std^2
+
+    so bias^2 / dev_rms^2 is the fraction of the column a sensor would still report while
+    sitting perfectly still on a bench. That is a property of the SENSOR, not of the gravity
+    assumption, and a filter cannot recover it by waiting — which is exactly the property the
+    static/moving split is otherwise used to argue about.
+
+    Reported over the static regimes only. Over `all` and `nonstatic` the sensor's real motion
+    dominates both terms and the ratio says nothing.
+    """
+    rows = sensor_df[sensor_df['regime'].isin(NOISE_REGIMES)]
+    if rows.empty or 'acc_norm_bias' not in rows.columns:
+        return
+    print(f"  {'segment':<16}{'regime':<13}{'bias':>9}{'std |a|':>9}{'dev_rms':>9}"
+          f"{'bias^2/dev^2':>14}")
+    worst = (np.nan, None)
+    for segment in [s for s in spec.segment_sensor if s in set(rows['segment'])]:
+        for regime in NOISE_REGIMES:
+            cell = rows[(rows['segment'] == segment) & (rows['regime'] == regime)]
+            if cell.empty:
+                continue
+            bias = cell['acc_norm_bias'].mean()
+            std = cell['acc_norm_std'].mean()
+            dev = cell['acc_norm_dev_rms'].mean()
+            share = (bias ** 2) / (dev ** 2) if dev > 0 else np.nan
+            if regime == 'body_static' and (np.isnan(worst[0]) or share > worst[0]):
+                worst = (share, f"{segment} ({bias:+.3f} m/s^2 offset)")
+            print(f"  {segment if regime == NOISE_REGIMES[0] else '':<16}{regime:<13}"
+                  f"{bias:>+9.3f}{std:>9.3f}{dev:>9.3f}{100 * share:>13.0f}%")
+        print()
+    print("`bias` is the SIGNED offset of this sensor's median |a| from |g|, and it is what the\n"
+          "||a|-|g|| column is mostly made of once the sensor stops moving: dev_rms^2 = bias^2 +\n"
+          "std^2 exactly, so the last column is the share of that column a sensor would report\n"
+          "while sitting still on a bench. An accelerometer with a scale error or an axis bias\n"
+          "reads |a| != |g| at rest, and no amount of waiting removes it.")
+    if worst[1] is not None and np.isfinite(worst[0]):
+        print(f"\nWorst case here: {worst[1]}, {100 * worst[0]:.0f}% of its whole-body-static "
+              f"||a|-|g||.\nA static-regime ||a|-|g|| quoted without `bias` beside it is a "
+              f"calibration number wearing a\nphysics label.")
+    print("\nThe mocap-referenced `linacc` does not share this failure mode — it subtracts g as "
+          "a VECTOR\nin the world frame, so a scale error in |a| does not survive into it. It "
+          "has a different floor\ninstead: linacc = |R_wb a - g| depends on the mocap rotation, "
+          "so a residual sensor-to-segment\nmisalignment of theta shows up as ~theta*|g| of "
+          "apparent departure, and 1 deg is 0.17 m/s^2.\nThat floor is NOT measured here. "
+          "experiments/acceleration_projection.py fits it per sensor-trial\n(Kabsch, see "
+          "`residual_alignment`) and reports Al Borno at a median 0.83 deg — which alone "
+          "accounts\nfor a static linacc of ~0.14 m/s^2, the size of the static rows above. "
+          "Treat the static linacc\nas an upper bound on the gravity departure, not a "
+          "measurement of it.")
+
+
 def report_acceleration(spec: DatasetSpec, sensor_df: pd.DataFrame) -> None:
     _header(3, "ACCELEROMETER: HOW FAR THE READING DEPARTS FROM GRAVITY ALONE",
             "per-trial values averaged across trials, proximal to distal")
     if sensor_df.empty:
         print("No sensor stats found.")
         return
+    sensor_df = with_acc_bias(sensor_df)
     print(f"  {'segment':<16}{'regime':<13}{'RMS |a-g|':>12}{'median':>10}{'p95':>10}"
-          f"{'||a|-|g||':>11}{'per-axis':>10}{'vs acc_std':>12}")
+          f"{'||a|-|g||':>11}{'bias':>9}{'std |a|':>9}{'per-axis':>10}{'vs acc_std':>12}")
     print(f"  {'':<16}{'':<13}{'(m/s^2)':>12}{'(m/s^2)':>10}{'(m/s^2)':>10}{'(m/s^2)':>11}"
-          f"{'(m/s^2)':>10}{'':>12}")
+          f"{'(m/s^2)':>9}{'(m/s^2)':>9}{'(m/s^2)':>10}{'':>12}")
+    columns = ['linacc_rms', 'linacc_median', 'linacc_p95', 'acc_norm_dev_rms',
+               'acc_norm_bias', 'acc_norm_std']
     for segment in [s for s in spec.segment_sensor if s in set(sensor_df['segment'])]:
         for regime in ('all', 'static', 'nonstatic'):
             rows = sensor_df[(sensor_df['segment'] == segment) & (sensor_df['regime'] == regime)]
             if rows.empty:
                 continue
-            means = rows[['linacc_rms', 'linacc_median', 'linacc_p95', 'acc_norm_dev_rms']].mean()
+            means = rows[columns].mean()
             per_axis = means['linacc_rms'] / np.sqrt(3)
             print(f"  {segment if regime == 'all' else '':<16}{regime:<13}"
                   f"{means['linacc_rms']:>12.3f}{means['linacc_median']:>10.3f}"
                   f"{means['linacc_p95']:>10.3f}{means['acc_norm_dev_rms']:>11.3f}"
+                  f"{means['acc_norm_bias']:>+9.3f}{means['acc_norm_std']:>9.3f}"
                   f"{per_axis:>10.3f}{per_axis / DEFAULT_ACC_STD:>11.0f}x")
         print()
     print("The first three columns need mocap and are blank wherever a regime has no valid "
@@ -1723,6 +2437,7 @@ def report_acceleration(spec: DatasetSpec, sensor_df: pd.DataFrame) -> None:
           "quadrature, so a segment\nswinging horizontally reads |a| ~ |g| throughout while its "
           "non-gravity component is large.\nRead it as a floor on the departure, not an "
           "estimate of it.\n")
+    report_acc_calibration(spec, sensor_df)
 
     ratios = (sensor_df[sensor_df['regime'] == 'nonstatic'].groupby('segment')['linacc_rms'].mean()
               / sensor_df[sensor_df['regime'] == 'static'].groupby('segment')['linacc_rms'].mean())
@@ -1746,24 +2461,35 @@ def report_magnetometer(spec: DatasetSpec, sensor_df: pd.DataFrame) -> None:
     _header(4, "MAGNETOMETER: HOW FAR THE FIELD DEPARTS FROM ONE GLOBAL CONSTANT",
             "deviation from the subject's own global field, per-trial values averaged across "
             "trials")
+    if not spec.has_magnetometer:
+        print(f"{spec.name} has no magnetometer — its IMUs measure acceleration and rotation "
+              f"only, so the\nMAG=CONSTANT assumption is not defined here and no magnetic column "
+              f"is written. Section 8 is\nskipped for the same reason. Everything else in this "
+              f"report stands.")
+        return
     if sensor_df.empty:
         print("No sensor stats found.")
         return
     print(f"  {'segment':<16}{'regime':<13}{'RMS dev':>11}{'median':>10}{'angle':>10}"
-          f"{'angle p95':>11}{'||m|-|M||':>11}{'std |m|':>10}")
+          f"{'angle p95':>11}{'| LOO REF':>12}{'angle':>9}{'| ||m|-|M||':>13}{'std |m|':>10}")
     print(f"  {'':<16}{'':<13}{f'({MAG_UNIT})':>11}{f'({MAG_UNIT})':>10}{'(deg)':>10}"
-          f"{'(deg)':>11}{f'({MAG_UNIT})':>11}{f'({MAG_UNIT})':>10}")
+          f"{'(deg)':>11}{f'| ({MAG_UNIT})':>12}{'(deg)':>9}{f'| ({MAG_UNIT})':>13}"
+          f"{f'({MAG_UNIT})':>10}")
+    columns = ['magdev_rms', 'magdev_median', 'magdev_angle_median', 'magdev_angle_p95',
+               'magdev_loo_rms', 'magdev_angle_loo_median', 'mag_norm_dev_rms',
+               'mag_norm_std']
     for segment in [s for s in spec.segment_sensor if s in set(sensor_df['segment'])]:
         for regime in ('all', 'static', 'nonstatic'):
             rows = sensor_df[(sensor_df['segment'] == segment) & (sensor_df['regime'] == regime)]
             if rows.empty:
                 continue
-            means = rows[['magdev_rms', 'magdev_median', 'magdev_angle_median',
-                          'magdev_angle_p95', 'mag_norm_dev_rms', 'mag_norm_std']].mean()
+            means = rows[columns].mean()
             print(f"  {segment if regime == 'all' else '':<16}{regime:<13}"
                   f"{means['magdev_rms']:>11.3f}{means['magdev_median']:>10.3f}"
                   f"{means['magdev_angle_median']:>10.1f}{means['magdev_angle_p95']:>11.1f}"
-                  f"{means['mag_norm_dev_rms']:>11.4f}{means['mag_norm_std']:>10.4f}")
+                  f"{means['magdev_loo_rms']:>12.3f}"
+                  f"{means['magdev_angle_loo_median']:>9.1f}"
+                  f"{means['mag_norm_dev_rms']:>13.4f}{means['mag_norm_std']:>10.4f}")
         print()
 
     overall = sensor_df[sensor_df['regime'] == 'all'].groupby('segment')['magdev_rms'].mean()
@@ -1778,6 +2504,61 @@ def report_magnetometer(spec: DatasetSpec, sensor_df: pd.DataFrame) -> None:
           f"property of WHERE the sensor is, not\nof whether it is moving, so unlike the "
           f"gravity assumption it cannot be recovered by waiting.\nThat asymmetry is the reason "
           f"the two assumptions need different treatment.")
+    report_reference_arms(spec, sensor_df)
+
+
+def report_reference_arms(spec: DatasetSpec, sensor_df: pd.DataFrame) -> None:
+    """The same departure against all four references, and what separates them.
+
+    Every arm differs only in the constant subtracted, so the spread across a row is the choice
+    of reference and nothing else. It earns a section because that choice is not a detail: the
+    subject constant is one a sensor helped define, and the arm that removes that self-reference
+    (loo) moves the proximal numbers by a third, while the arm that looks most appealing (clean)
+    inflates the headline gradient three- to fourfold by construction.
+    """
+    rows = sensor_df[sensor_df['regime'] == 'all'] if not sensor_df.empty else sensor_df
+    available = [(dev, angle, arm) for dev, angle, arm in MAGDEV_ARMS
+                 if f'{angle}_median' in rows.columns]
+    if rows.empty or len(available) < 2:
+        return
+    print(f"\n  --- the {len(available)} reference arms, median direction error (deg) ---")
+    header = ''.join(f"{arm:>12}" for _, _, arm in available)
+    print(f"\n  {'segment':<16}{header}{'loo/subj':>10}")
+    for segment in [s for s in spec.segment_sensor if s in set(rows['segment'])]:
+        r = rows[rows['segment'] == segment]
+        values = {arm: r[f'{angle}_median'].mean() for _, angle, arm in available}
+        if not np.isfinite(values.get('subject', np.nan)) or values['subject'] <= 0:
+            continue
+        cells = ''.join(f"{values[arm]:>12.2f}" for _, _, arm in available)
+        ratio = values.get('loo', np.nan) / values['subject']
+        print(f"  {segment:<16}{cells}{ratio:>9.0%}")
+
+    for _, _, arm in available:
+        column = f'reference_drift_{arm}_deg'
+        if arm == 'subject' or column not in rows.columns:
+            continue
+        drift = rows[column].dropna()
+        if drift.empty:
+            continue
+        print(f"  {arm:>8} reference sits {drift.median():5.2f} deg from the subject constant at "
+              f"the median, {drift.max():5.2f} deg at the worst.")
+
+    proximal = list(spec.segment_sensor)[0]
+    print(f"\n  Which to quote depends on the question, and one of these is a trap.\n"
+          f"    subject  what a filter calibrated once per session suffers, and the arm the "
+          f"'one constant\n             field' claim is about. NOT neutral — a sensor is 1/N of "
+          f"its own reference.\n"
+          f"    trial    removes between-trial drift, leaves within-trial structure. Fitted on "
+          f"the samples\n             it scores, so biased low and more so on short trials.\n"
+          f"    loo      the subject arm with this sensor left out: the only one here unbiased "
+          f"by\n             self-reference. The loo/subj column is that bias, and it is "
+          f"largest proximally\n             because that is where a sensor sits nearest the "
+          f"pooled reference it helped define.\n"
+          f"    clean    everything against {spec.clean_sensor}. A DIAGNOSTIC — it is the "
+          f"construction the EKF's\n             mag oracle uses — and never a gradient. It "
+          f"collapses {proximal}'s own row toward its\n             within-trial variation, "
+          f"which inflates the proximal-to-distal ratio 3-4x with no\n             change at the "
+          f"distal end. That is the top of the gradient defined to zero.")
 
 
 def report_noise_floor(spec: DatasetSpec, sensor_df: pd.DataFrame) -> None:
@@ -1787,7 +2568,9 @@ def report_noise_floor(spec: DatasetSpec, sensor_df: pd.DataFrame) -> None:
     if sensor_df.empty or 'n_noise_samples' not in sensor_df:
         print("No sensor stats found.")
         return
-    units = {'gyro': 'rad/s', 'acc': 'm/s^2', 'mag': MAG_UNIT}
+    all_units = {'gyro': 'rad/s', 'acc': 'm/s^2', 'mag': MAG_UNIT}
+    modalities = spec.noise_modalities()
+    units = {m: all_units[m] for m in modalities}
     for regime, blurb in (('body_static', 'whole body still — the cleanest estimate'),
                           ('static', 'this sensor still, the rest of the body free to move')):
         rows = sensor_df[(sensor_df['regime'] == regime) & (sensor_df['n_noise_samples'] > 0)]
@@ -1803,24 +2586,25 @@ def report_noise_floor(spec: DatasetSpec, sensor_df: pd.DataFrame) -> None:
             print(f"  {modality.capitalize():<5} ({unit:<6}): mean {np.nanmean(pooled):.6f} | "
                   f"[x={pooled[0]:.5f}, y={pooled[1]:.5f}, z={pooled[2]:.5f}]")
 
-    print(f"\n  {'segment':<16}{'gyro (rad/s)':>15}{'acc (m/s^2)':>15}{f'mag ({MAG_UNIT})':>15}"
-          f"{'samples':>12}")
+    headers = ''.join(f"{f'{m} ({all_units[m]})':>15}" for m in modalities)
+    print(f"\n  {'segment':<16}{headers}{'samples':>12}")
     body = sensor_df[(sensor_df['regime'] == 'body_static') & (sensor_df['n_noise_samples'] > 0)]
+    precision = {'gyro': 6, 'acc': 5, 'mag': 5}
     for segment in [s for s in spec.segment_sensor if s in set(body['segment'])]:
         rows = body[body['segment'] == segment]
-        cells = []
-        for modality in ('gyro', 'acc', 'mag'):
+        cells = ''
+        for modality in modalities:
             pooled = _weighted_noise(rows, modality)
-            cells.append(np.nanmean(pooled) if pooled is not None else np.nan)
-        print(f"  {segment:<16}{cells[0]:>15.6f}{cells[1]:>15.5f}{cells[2]:>15.5f}"
-              f"{int(rows['n_noise_samples'].sum()):>12,}")
+            value = np.nanmean(pooled) if pooled is not None else np.nan
+            cells += f"{value:>15.{precision[modality]}f}"
+        print(f"  {segment:<16}{cells}{int(rows['n_noise_samples'].sum()):>12,}")
 
     constants = pipeline_constants()
     print(f"\nThe filter is tuned with gyro_std={constants['gyro_std']}, "
           f"acc_std={constants['acc_std']}, mag_std={constants['mag_std']}.")
     body_rows = sensor_df[(sensor_df['regime'] == 'body_static') & (sensor_df['n_noise_samples'] > 0)]
     static_rows = sensor_df[(sensor_df['regime'] == 'static') & (sensor_df['n_noise_samples'] > 0)]
-    for modality in ('gyro', 'acc', 'mag'):
+    for modality in modalities:
         clean = _weighted_noise(body_rows, modality)
         loose = _weighted_noise(static_rows, modality)
         if clean is None or loose is None:
@@ -1843,7 +2627,7 @@ def report_observability(spec: DatasetSpec, joint_df: pd.DataFrame) -> None:
     gate = joint_df['gate_threshold'].iloc[0]
     print(f"  {'joint':<10}{'regime':<13}{'median':>11}{'p05':>10}{'p95':>10}"
           f"{'parent':>11}{'child':>11}{'% < gate':>10}")
-    for joint in [j for j in spec.joints if j in set(joint_df['joint'])]:
+    for joint in [j for j in spec.primary_joints if j in set(joint_df['joint'])]:
         for regime in REGIMES:
             rows = joint_df[(joint_df['joint'] == joint) & (joint_df['regime'] == regime)]
             if rows.empty:
@@ -1856,8 +2640,10 @@ def report_observability(spec: DatasetSpec, joint_df: pd.DataFrame) -> None:
                   f"{means['obs_child_median']:>11.1f}{100 * means['frac_below_gate']:>9.1f}%")
         print()
 
-    overall = joint_df[joint_df['regime'] == 'all'].groupby('joint')['obs_min_median'].mean()
-    limiting = joint_df[joint_df['regime'] == 'all'].groupby('joint')[
+    canonical = joint_df[joint_df['joint'].isin(spec.primary_joints)]
+    overall = canonical[canonical['regime'] == 'all'].groupby('joint', observed=True)[
+        'obs_min_median'].mean()
+    limiting = canonical[canonical['regime'] == 'all'].groupby('joint', observed=True)[
         ['obs_parent_median', 'obs_child_median']].mean()
     print(f"o^J is gated at {gate:g} by default (experiment_utils.DEFAULT_MAG_ADAPT_THRESHOLD), so "
           f"the last\ncolumn is the fraction of each regime the magnetometer would be distrusted "
@@ -1879,18 +2665,136 @@ def report_observability(spec: DatasetSpec, joint_df: pd.DataFrame) -> None:
               f"{max(parent, child):.0f})")
 
 
+def placement_of(joint: str, spec: DatasetSpec) -> str:
+    """'R_Knee' -> 'Mid', 'R_Knee_H' -> 'High'. The canonical joints are the Mid mounting."""
+    if joint in spec.primary_joints:
+        return 'Mid'
+    return {'H': 'High', 'L': 'Low'}.get(joint.rsplit('_', 1)[-1], 'other')
+
+
+def canonical_joint(joint: str, spec: DatasetSpec) -> str:
+    """The anatomical joint a placement variant belongs to: 'R_Knee_H' -> 'R_Knee'."""
+    return joint if joint in spec.primary_joints else joint.rsplit('_', 1)[0]
+
+
+def report_placement(spec: DatasetSpec, joint_df: pd.DataFrame) -> None:
+    """Does WHERE on a segment a sensor is mounted change how observable the joint is?
+
+    Only IMoVE can answer this — it is the one dataset here with more than one sensor per
+    segment. The answer is yes but SMALL, ~7% pooled, and the interesting part is its SIGN, which
+    flips with which end of the segment the joint sits at.
+
+    o^J is the world-frame sweep rate of the accelerometer vector, so it grows with the sensor's
+    lever arm to the joint center. For a DISTAL joint the High sensor has the longer arm (a thigh
+    sensor's solved knee-center offsets run 257 / 159 / 93 mm going down the segment), so High
+    should win at the knees and ankles. For a PROXIMAL joint the same ordering reverses — a
+    thigh sensor mounted Low is the one further from the hip — so Low should win there. Both
+    predictions hold on all six joints, which is a much better check on the mechanism than the
+    size of the effect is.
+
+    Silent on Al Borno, which has one sensor per segment and therefore no placement to vary.
+    """
+    variants = [j for j in joint_df['joint'].unique() if j not in spec.primary_joints]
+    if joint_df.empty or not variants:
+        return
+    _header(7, "SENSOR PLACEMENT ON THE SEGMENT vs OBSERVABILITY",
+            "the same anatomical joint, spanned by the High / Mid / Low sensors on its segments")
+    frame = joint_df[joint_df['regime'] == 'all'].copy()
+    if frame.empty:
+        print("No samples in the 'all' regime.")
+        return
+    frame['placement'] = [placement_of(j, spec) for j in frame['joint']]
+    frame['anatomical'] = [canonical_joint(j, spec) for j in frame['joint']]
+
+    # PAIRED, and this is not a refinement — without it the comparison is invalid. The long-walk
+    # sessions carry only the seven Mid sensors, so the Mid arm of this table would be measured
+    # over a set of trials the High and Low arms are absent from, and those trials are 2800 s of
+    # continuous walking at 100 Hz against 30-90 s task trials at 40 Hz. Restricting to the
+    # trials that hold ALL THREE placements makes every row of the table describe the same
+    # recordings, which is the only way a placement difference can be attributed to placement.
+    order = ['High', 'Mid', 'Low']
+    keys = ['subject', 'trial']
+    complete = (frame.groupby(keys + ['anatomical'], observed=True)['placement']
+                .nunique().rename('n_placements').reset_index())
+    complete = complete[complete['n_placements'] == len(order)]
+    before = frame[keys].drop_duplicates().shape[0]
+    frame = frame.merge(complete[keys + ['anatomical']], on=keys + ['anatomical'], how='inner')
+    if frame.empty:
+        print("No trial carries all three placements; nothing to compare.")
+        return
+    after = frame[keys].drop_duplicates().shape[0]
+    print(f"Paired over the {after} of {before} trials that carry all three placements "
+          f"(the long-walk\nsessions carry only the Mid sensors, and are 100 Hz against the "
+          f"others' 40 Hz).\n")
+
+    # Which placement the lever-arm argument PREDICTS should win, from the joint's position on
+    # the segment rather than from the numbers: a distal joint is nearer the Low sensor, so the
+    # High one has the longer arm, and vice versa at the hip.
+    predicted = {joint: ('Low' if joint.endswith('Hip') else 'High')
+                 for joint in spec.primary_joints}
+    print(f"  {'joint':<10}" + "".join(f"{p:>12}" for p in order)
+          + f"{'High/Low':>11}{'predicted':>11}{'holds':>7}")
+    print(f"  {'':<10}" + "".join(f"{'median o^J':>12}" for _ in order)
+          + f"{'ratio':>11}{'winner':>11}{'':>7}")
+    agree = 0
+    tested = 0
+    for joint in [j for j in spec.primary_joints if j in set(frame['anatomical'])]:
+        rows = frame[frame['anatomical'] == joint]
+        medians = rows.groupby('placement', observed=True)['obs_min_median'].mean()
+        high, low = medians.get('High', np.nan), medians.get('Low', np.nan)
+        cells = "".join(f"{medians.get(p, np.nan):>12.1f}" for p in order)
+        ratio = high / low if low else np.nan
+        want = predicted.get(joint, 'High')
+        if np.isfinite(ratio):
+            tested += 1
+            got = 'High' if high > low else 'Low'
+            ok = got == want
+            agree += int(ok)
+            print(f"  {joint:<10}{cells}{ratio:>11.2f}{want:>11}{'yes' if ok else 'NO':>7}")
+        else:
+            print(f"  {joint:<10}{cells}{'—':>11}{want:>11}{'—':>7}")
+
+    pooled = frame.groupby('placement', observed=True)['obs_min_median'].mean()
+    spread = (pooled.max() / pooled.min()) if pooled.min() else np.nan
+    print(f"\nPooled over joints: " + ", ".join(f"{p} {pooled.get(p, np.nan):.1f}" for p in order)
+          + f"  ({spread:.2f}x between the extremes)")
+    print("\nAll three placements sit on the SAME segment against one marker cluster, so they "
+          "border the\nsame joints and share one segment pose. What differs is each sensor's "
+          "LEVER ARM to the joint\ncenter, which the build resolves per placement by putting "
+          "each plate's mocap origin on its own\nIMU. o^J is the world-frame sweep rate of the "
+          "accelerometer vector, so a longer arm buys more of\nit — and which placement has the "
+          "longer arm depends on which END of the segment the joint is at.\nA thigh sensor's "
+          "solved knee-center offsets run 257 / 159 / 93 mm going down the segment, so\nHigh is "
+          "furthest from the KNEE and Low is furthest from the HIP. The prediction column is "
+          "that\nargument applied ahead of the numbers, not fitted to them.")
+    print(f"\nIt holds on {agree} of {tested} joints. The EFFECT SIZE, though, is small — "
+          f"{spread:.2f}x pooled, against\nthe 3-14x that separates one anatomical joint from "
+          f"another in section 6. Where a sensor sits\nALONG a segment is close to irrelevant to "
+          f"observability next to which segment it is on. A single\ntrial can read much larger "
+          f"(1.5x on s13/t1_walking_001) and should not be quoted as the effect.")
+    print("\nOne caveat that runs the same direction as the finding: the taped High and Low "
+          "sensors carry a\nlarger per-trial offset-fit error than the bolted Mid (8.5-21.1 mm "
+          "per axis against 3.9-4.8),\nwhich perturbs their projection. That is ~2 cm on a 10-26 "
+          "cm arm, so it cannot manufacture the\nsign agreement above, but it does mean the "
+          "ratios are softer than they look.")
+
+
 def report_field_consistency(spec: DatasetSpec, joint_df: pd.DataFrame) -> None:
-    _header(7, "LOCAL FIELD CONSISTENCY: NEIGHBOUR SENSOR vs. GLOBAL FIELD",
+    _header(8, "LOCAL FIELD CONSISTENCY: NEIGHBOUR SENSOR vs. GLOBAL FIELD",
             "world-frame fields over the 'all' regime; one value per trial, summarized across "
             "trials")
+    if not spec.has_magnetometer:
+        print(f"{spec.name} has no magnetometer; see section 4.")
+        return
     rows_all = joint_df[joint_df['regime'] == 'all'] if not joint_df.empty else joint_df
     if rows_all.empty or 'var_reduction' not in rows_all.columns:
         print("No joint field-consistency stats found.")
         return
-    print(f"{'Joint':<10}{'Reference':>14}{'CosSim tgt-global':>19}{'CosSim tgt-ref':>16}"
+    print(f"{'Joint':<10}{'Reference':>14}{'CosSim tgt-subj':>17}{'tgt-trialmed':>14}"
+          f"{'CosSim tgt-ref':>16}"
           f"{'Var reduction':>15}{'[min, max]':>18}{'n<0':>5}{'best':>8}{'n':>5}")
     flipped = []
-    for joint in [j for j in spec.joints if j in set(rows_all['joint'])]:
+    for joint in [j for j in spec.primary_joints if j in set(rows_all['joint'])]:
         rows = rows_all[rows_all['joint'] == joint]
         reduction = rows['var_reduction'].dropna()
         if reduction.empty:
@@ -1900,8 +2804,9 @@ def report_field_consistency(spec: DatasetSpec, joint_df: pd.DataFrame) -> None:
         if role != 'parent':
             flipped.append((joint, reference, str(rows['target_sensor'].iloc[0]).replace('_imu', '')))
         print(f"{joint:<10}{reference + ('*' if role != 'parent' else ''):>14}"
-              f"{rows['cos_sim_target_global'].median():>19.3f}"
-              f"{rows['cos_sim_target_reference'].median():>16.3f}"
+              f"{rows['cos_sim_target_global'].median():>17.4f}"
+              f"{rows['cos_sim_target_trial_median'].median():>14.4f}"
+              f"{rows['cos_sim_target_reference'].median():>16.4f}"
               f"{reduction.median():>15.3f}"
               f"{f'[{reduction.min():.2f}, {reduction.max():.2f}]':>18}"
               f"{int((reduction < 0).sum()):>5}{rows['var_reduction_best'].median():>8.3f}"
@@ -1920,7 +2825,14 @@ def report_field_consistency(spec: DatasetSpec, joint_df: pd.DataFrame) -> None:
           "rescaled.\n                 The shortfall against it is exactly (rho - sqrt(k))^2, and "
           "optimal_gain in\n                 the saved table says which way to rescale. Symmetric "
           "in the pair, so\n                 unlike Var reduction it is unaffected by the "
-          "reference direction.")
+          "reference direction.\n"
+          "  tgt-subj       cos-sim against the SUBJECT's global field — the same constant "
+          "section 4\n                 measures magdev against, and the arm the neighbour is "
+          "meant to beat.\n"
+          "  tgt-trialmed   cos-sim against the target's OWN median over this trial. A strictly\n"
+          "                 stronger baseline, refit in-sample per trial and sensor, so the gap\n"
+          "                 between these two columns is how much of the 'global' field's error "
+          "is\n                 between-trial drift rather than within-trial structure.")
     for joint, reference, target in flipped:
         print(f"* {joint}: reference reversed to {reference} (target {target}) by the dataset's "
               f"field_reference —\n  {reference} is the cleaner sensor of the pair, where for "
@@ -1929,30 +2841,37 @@ def report_field_consistency(spec: DatasetSpec, joint_df: pd.DataFrame) -> None:
 
 
 def report_residuals(spec: DatasetSpec, joint_df: pd.DataFrame) -> None:
-    _header(8, "WHAT THE RELATIVE FILTER ACTUALLY HAS TO ABSORB",
+    _header(9, "WHAT THE RELATIVE FILTER ACTUALLY HAS TO ABSORB",
             "the between-sensor residuals RelativeFilter.get_h drives to zero, by regime")
     if joint_df.empty or 'acc_residual_rms' not in joint_df.columns:
         print("No joint residual stats found.")
         return
     constants = pipeline_constants()
+    magnetic = spec.has_magnetometer
+    mag_head = (f"{'mag resid':>12}{'mag angle':>11}{'vs mag_std':>12}") if magnetic else ''
+    mag_unit = (f"{f'({MAG_UNIT})':>12}{'(deg)':>11}{'':>12}") if magnetic else ''
     print(f"  {'joint':<10}{'regime':<13}{'acc resid':>12}{'unprojected':>13}{'vs acc_std':>12}"
-          f"{'mag resid':>12}{'mag angle':>11}{'vs mag_std':>12}")
-    print(f"  {'':<10}{'':<13}{'(m/s^2)':>12}{'(m/s^2)':>13}{'':>12}{f'({MAG_UNIT})':>12}"
-          f"{'(deg)':>11}{'':>12}")
-    for joint in [j for j in spec.joints if j in set(joint_df['joint'])]:
+          f"{mag_head}")
+    print(f"  {'':<10}{'':<13}{'(m/s^2)':>12}{'(m/s^2)':>13}{'':>12}{mag_unit}")
+    columns = ['acc_residual_rms', 'acc_residual_rms_raw']
+    if magnetic:
+        columns += ['mag_residual_rms', 'mag_residual_angle']
+    for joint in [j for j in spec.primary_joints if j in set(joint_df['joint'])]:
         for regime in ('all', 'static', 'nonstatic'):
             rows = joint_df[(joint_df['joint'] == joint) & (joint_df['regime'] == regime)]
             if rows.empty:
                 continue
-            means = rows[['acc_residual_rms', 'acc_residual_rms_raw', 'mag_residual_rms',
-                          'mag_residual_angle']].mean()
+            means = rows[columns].mean()
             acc_axis = means['acc_residual_rms'] / np.sqrt(3)
-            mag_axis = means['mag_residual_rms'] / np.sqrt(3)
+            mag_cells = ''
+            if magnetic:
+                mag_axis = means['mag_residual_rms'] / np.sqrt(3)
+                mag_cells = (f"{means['mag_residual_rms']:>12.4f}"
+                             f"{means['mag_residual_angle']:>11.2f}"
+                             f"{mag_axis / constants['mag_std']:>11.1f}x")
             print(f"  {joint if regime == 'all' else '':<10}{regime:<13}"
                   f"{means['acc_residual_rms']:>12.3f}{means['acc_residual_rms_raw']:>13.3f}"
-                  f"{acc_axis / constants['acc_std']:>11.0f}x{means['mag_residual_rms']:>12.4f}"
-                  f"{means['mag_residual_angle']:>11.2f}"
-                  f"{mag_axis / constants['mag_std']:>11.1f}x")
+                  f"{acc_axis / constants['acc_std']:>11.0f}x{mag_cells}")
         print()
     print("These are the quantities to tune acc_std and mag_std from — not the per-sensor "
           "departures in\nsections 3 and 4. The relative filter never compares one sensor "
@@ -1964,7 +2883,7 @@ def report_residuals(spec: DatasetSpec, joint_df: pd.DataFrame) -> None:
 
 def report_subject_spread(spec: DatasetSpec, summary: pd.DataFrame,
                           fields_df: pd.DataFrame) -> None:
-    _header(9, "PER-SUBJECT SPREAD",
+    _header(10, "PER-SUBJECT SPREAD",
             "median of each metric per subject, pooled over that subject's trials and sensors")
     if summary.empty:
         print("No summary found.")
@@ -1978,15 +2897,16 @@ def report_subject_spread(spec: DatasetSpec, summary: pd.DataFrame,
              .apply(lambda g: np.average(g['p50'], weights=g['n_samples'].clip(lower=1)),
                     include_groups=False)
              .unstack())
-    metrics = [m for m in SEGMENT_METRICS + JOINT_METRICS if m in pivot.columns]
+    metrics = [m for m in spec.segment_metrics() + JOINT_METRICS if m in pivot.columns]
+    magnetic = spec.has_magnetometer
     print("  " + f"{'subject':<12}" + "".join(f"{m:>16}" for m in metrics)
-          + f"{'|field|':>10}")
+          + (f"{'|field|':>10}" if magnetic else ''))
     field_by_subject = (fields_df.set_index('subject')['world_mag_norm'].to_dict()
                         if not fields_df.empty else {})
     for subject in pivot.index:
         cells = "".join(f"{pivot.loc[subject, m]:>16.3g}" for m in metrics)
-        norm = field_by_subject.get(subject, np.nan)
-        print(f"  {subject:<12}{cells}{norm:>10.3f}")
+        norm = f"{field_by_subject.get(subject, np.nan):>10.3f}" if magnetic else ''
+        print(f"  {subject:<12}{cells}{norm}")
     print(f"\n  {'spread':<12}" + "".join(
         f"{pivot[m].max() / max(pivot[m].min(), 1e-12):>15.1f}x" for m in metrics))
     if not fields_df.empty:
@@ -2002,14 +2922,14 @@ def report_subject_spread(spec: DatasetSpec, summary: pd.DataFrame,
 
 
 def report_trial_spread(spec: DatasetSpec, summary: pd.DataFrame, top: int = 12) -> None:
-    _header(10, "PER-TRIAL EXTREMES",
+    _header(11, "PER-TRIAL EXTREMES",
             f"the {top} trials where each assumption fails hardest, pooled over their sensors")
     per_trial = summary[(summary['subject'] != 'all') & (summary['trial'] != 'all')
                         & (summary['regime'] == 'all')]
     if per_trial.empty:
         print("No per-trial rows in the summary.")
         return
-    for metric in ('linacc', 'magdev'):
+    for metric in [m for m in ('linacc', 'magdev') if m in spec.segment_metrics()]:
         rows = per_trial[per_trial['metric'] == metric]
         if rows.empty:
             continue
@@ -2038,6 +2958,7 @@ def print_report(spec: DatasetSpec, summary: pd.DataFrame, sensor_df: pd.DataFra
     report_magnetometer(spec, sensor_df)
     report_noise_floor(spec, sensor_df)
     report_observability(spec, joint_df)
+    report_placement(spec, joint_df)
     report_field_consistency(spec, joint_df)
     report_residuals(spec, joint_df)
     report_subject_spread(spec, summary, fields_df)
@@ -2111,8 +3032,18 @@ def main():
         return 1
     spec = get_dataset(args.dataset)
 
+    orphans = orphaned_trials(args.dataset)
+    if orphans:
+        names = ", ".join(f"{s}/{t}" for s, t in orphans[:3])
+        print(f"Skipping {len(orphans)} built parquet(s) the {spec.build_name} source no longer "
+              f"enumerates\n({names}{', …' if len(orphans) > 3 else ''}) — see "
+              f"`orphaned_trials`. Nothing can rebuild them, so they are not failures.")
+
     if not args.report_only:
-        if not args.skip_fields:
+        if not spec.has_magnetometer:
+            print(f"Stage 1/2 skipped: {args.dataset} has no magnetometer, so there is no "
+                  f"subject field to estimate.")
+        elif not args.skip_fields:
             print(f"Stage 1/2: per-trial magnetic field over {len(row_keys)} trials...")
             run_tracked_grid(row_keys, ['Subject', 'Trial'], ['field'],
                              partial(_field_worker, dataset=args.dataset),
@@ -2134,7 +3065,8 @@ def main():
     # millions of rows across both datasets, and reading the timestamps and raw norms here
     # would cost hundreds of megabytes to throw away.
     segment_df = load_trial_table(args.dataset, 'segment_samples',
-                                  columns=['segment', 'static', 'body_static', *SEGMENT_METRICS])
+                                  columns=['segment', 'static', 'body_static',
+                                           *spec.segment_metrics()])
     joint_sample_df = load_trial_table(args.dataset, 'joint_samples',
                                        columns=['joint', 'static', 'body_static', *JOINT_METRICS])
     sensor_df = load_trial_table(args.dataset, 'sensor_stats')
