@@ -14,11 +14,19 @@ here would just narrow it to this comparison's 5 methods for no benefit.
 import os
 os.environ["DISABLE_TQDM"] = "True"
 import argparse
+from functools import partial
 
 from experiments.experiment_utils import (
-    SUBJECTS, ACTIVITIES, load_all_joint_angles, compute_error_stats, save_statistics,
+    SUBJECTS, ACTIVITIES, TRIAL_DATASET, load_all_joint_angles, compute_error_stats,
+    save_statistics,
     run_tracked_grid, generate_joint_angles_worker,
 )
+
+# THIS EXPERIMENT OWNS ITS OWN JOINT-ANGLE TREE:
+# results/experiments/ekf_oracle_comparison/joint_angles/. `results/joint_angles/` belongs to
+# benchmark_experiment.py alone — see paths.joint_angles_write_path for the failure
+# that rule exists to prevent.
+EXPERIMENT_NAME = "ekf_oracle_comparison"
 
 # The EKF arms are the '_rescaled' variants (normalize + convert the stds into the units
 # a unit-length measurement lives in). Plain 'ekf' normalizes without rescaling, which
@@ -51,11 +59,13 @@ def main():
     to_generate = ALL_METHODS if args.regenerate else ORACLE_METHODS
 
     print(f"Generating joint angles for: {to_generate}")
-    run_tracked_grid(row_keys, ['Subject', 'Activity'], ['load'] + to_generate, generate_joint_angles_worker,
+    run_tracked_grid(row_keys, ['Subject', 'Activity'], ['load'] + to_generate,
+                      partial(generate_joint_angles_worker, experiment=EXPERIMENT_NAME),
                       args.workers, title="EKF ORACLE COMPARISON GENERATION")
 
     print("\n--- Aggregating statistics ---")
-    all_data_df = load_all_joint_angles(args.subjects, args.activities, ALL_METHODS)
+    all_data_df = load_all_joint_angles(TRIAL_DATASET, row_keys, ALL_METHODS,
+                                        experiment=EXPERIMENT_NAME)
     if all_data_df.empty:
         print("Error: no data was loaded for any subject.")
         return

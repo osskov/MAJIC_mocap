@@ -3,7 +3,7 @@ Reader for this repo's original dataset, adapted from Al Borno et al. (2022).
 
 Layout it expects, one directory per subject/activity:
 
-    data/Subject01/walking/
+    data/alborno/Subject01/walking/
         walking.trc                  mocap markers, 4-marker plate per segment
         imu data/femur_r_imu.txt     Xsens export, one file per segment
 

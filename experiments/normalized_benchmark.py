@@ -41,16 +41,28 @@ import pandas as pd
 import paths
 from experiments.experiment_utils import (
     SUBJECTS, ACTIVITIES,
-    load_all_joint_angles, load_statistics, compute_error_stats, save_statistics,
+    TRIAL_DATASET, load_all_joint_angles, load_statistics, compute_error_stats, save_statistics,
     run_tracked_grid, resolve_method_spec, resolve_stds, pipeline_constants,
     generate_joint_angles_worker, compute_stats_worker,
 )
+
+# THIS EXPERIMENT OWNS ITS OWN JOINT-ANGLE TREE:
+# results/experiments/normalized_benchmark/joint_angles/. `results/joint_angles/` belongs to
+# benchmark_experiment.py alone — see paths.joint_angles_write_path for the failure
+# that rule exists to prevent.
+EXPERIMENT_NAME = "normalized_benchmark"
 
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
 
 STATS_NAME = "normalized_benchmark"
+
+# The default-tuned run this one is a delta against. Al Borno's, explicitly: this experiment
+# sweeps a TUNING on one dataset, so the comparison has to come from the same dataset — and
+# the benchmark's statistics file is namespaced per dataset now, so 'all_subject' alone names
+# nothing and would silently resolve to a file left behind by the pre-dataset pipeline.
+BENCHMARK_STATS_NAME = f"all_subject_{TRIAL_DATASET}"
 
 # The output namespace for this tuning's joint angles, and the one thing that keeps this
 # run from overwriting the default-tuned pipeline's parquets — see paths.joint_angles_path.
@@ -92,7 +104,7 @@ def _benchmark_provenance() -> str:
     this script prints a delta against are whichever run happened last — and if that run
     predates a change to the DEFAULT_*_STD constants, the delta spans two retunings rather
     than one. The manifest is the only record of which, so it gets printed."""
-    manifest = paths.read_manifest(paths.statistics_path("all_subject"))
+    manifest = paths.read_manifest(paths.statistics_path(BENCHMARK_STATS_NAME))
     if manifest is None:
         return ("That file has no manifest sidecar, so its tuning and code version are "
                 "unknown — treat the delta as indicative only.")
@@ -113,7 +125,7 @@ def _print_summary(summary_stats_df: pd.DataFrame, subjects: List[str], activiti
     same base method where that file exists.
 
     The benchmark column is a CROSS-RUN comparison and is labelled as one: it is whatever
-    results/statistics/all_subject_statistics.parquet holds, pooled over the same subjects
+    results/statistics/all_subject_alborno_statistics.parquet holds, pooled over the same subjects
     and activities requested here. It is here to answer "did this tuning help", which is
     the question this script exists to ask, but it is not a controlled contrast — two
     things moved at once.
@@ -137,7 +149,7 @@ def _print_summary(summary_stats_df: pd.DataFrame, subjects: List[str], activiti
 
     tuned = np.degrees(df.groupby('method')[metric].mean())
 
-    benchmark_df = load_statistics("all_subject")
+    benchmark_df = load_statistics(BENCHMARK_STATS_NAME)
     benchmark, benchmark_provenance = None, ""
     if benchmark_df is not None and metric in benchmark_df.columns:
         subject_names = [f"Subject{s}" for s in subjects]
@@ -169,14 +181,14 @@ def _print_summary(summary_stats_df: pd.DataFrame, subjects: List[str], activiti
     print(f"\n  Tuning: gyro_std={stds['gyro_std']}, acc_std={stds['acc_std']}, "
           f"mag_std={stds['mag_std']}, normalize_measurements=True.")
     if benchmark is not None:
-        print("  'benchmark' is results/statistics/all_subject_statistics.parquet, pooled over the\n"
+        print(f"  'benchmark' is {paths.statistics_path(BENCHMARK_STATS_NAME).name}, pooled over the\n"
               "  same subjects and activities — unnormalized except its EKF.")
         print(f"  {benchmark_provenance}")
         print("  Negative delta = this run beat it. Two factors moved (normalization and the\n"
               "  stds), so this ranks tunings; it does not attribute the difference — see\n"
               "  experiments/normalization_comparison.py for that.")
     else:
-        print("  No results/statistics/all_subject_statistics.parquet on disk, so there is no\n"
+        print(f"  No {paths.statistics_path(BENCHMARK_STATS_NAME).name} on disk, so there is no\n"
               "  benchmark column. Run experiments/benchmark_experiment.py for the comparison.")
 
 
@@ -232,7 +244,8 @@ def main():
         print(f"\nStarting parallel generation of joint angles for {len(row_keys)} tasks "
               f"using {args.workers} workers...")
         run_tracked_grid(row_keys, ['Subject', 'Activity'], ['load'] + args.methods,
-                          partial(generate_joint_angles_worker, stds=stds, variant=VARIANT),
+                          partial(generate_joint_angles_worker, stds=stds, variant=VARIANT,
+                                  experiment=EXPERIMENT_NAME),
                           args.workers, title="NORMALIZED BENCHMARK GENERATION")
         print("Joint angles generation phase complete.\n")
 
@@ -240,13 +253,17 @@ def main():
     print("--- Starting Statistics Aggregation Phase ---")
     run_tracked_grid(row_keys, ['Subject', 'Activity'], ['stats'],
                       partial(compute_stats_worker, methods=args.methods, stats_name=STATS_NAME,
-                              variant=VARIANT, stds=stds),
+                              variant=VARIANT, stds=stds, experiment=EXPERIMENT_NAME),
                       args.workers, title="NORMALIZED BENCHMARK STATISTICS")
 
     # 3. Global aggregation & statistics phase
     print("\n--- Starting Global Aggregation & Statistics Phase ---")
 
-    all_data_df = load_all_joint_angles(args.subjects, args.activities, args.methods, variant=VARIANT)
+    # `stds` travels with `variant` on the read side too: these arms were generated under this
+    # experiment's re-tuning, so checking them against the module default would call every one
+    # of them stale.
+    all_data_df = load_all_joint_angles(TRIAL_DATASET, row_keys, args.methods, variant=VARIANT,
+                                        experiment=EXPERIMENT_NAME, stds=stds)
     if all_data_df.empty:
         print("Error: No data was loaded for any subject. Exiting.")
         return

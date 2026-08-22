@@ -53,7 +53,7 @@ from ..resampling import resample_values
 from ..PlateTrial import PlateTrial
 from ..WorldTrace import WorldTrace
 
-BIPLANE_ROOT = paths.DATA_DIR / 'IMoveLab_Raw_Data' / 'biplane_ref' / 'data'
+BIPLANE_ROOT = paths.IMOVE_DIR / 'biplane_ref' / 'data'
 STUDY = 'HAKnee'
 
 # A BioStamp measures acceleration and rotation only. Named rather than left implicit so a

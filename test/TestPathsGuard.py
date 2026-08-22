@@ -13,7 +13,7 @@ import paths
 class TestDataDirectoryIsReadOnly(unittest.TestCase):
     def test_ensure_parent_refuses_a_path_under_data(self):
         with self.assertRaises(ValueError) as caught:
-            paths.ensure_parent(paths.DATA_DIR / 'Subject01' / 'walking' / 'out.parquet')
+            paths.ensure_parent(paths.raw_trial_dir('01', 'walking') / 'out.parquet')
         self.assertIn('read-only', str(caught.exception))
 
     def test_ensure_parent_refuses_data_itself(self):
@@ -24,7 +24,7 @@ class TestDataDirectoryIsReadOnly(unittest.TestCase):
         """The sidecar writer is a separate entry point, so it needs its own guard rather
         than relying on whoever created the parent directory."""
         with self.assertRaises(ValueError):
-            paths.write_manifest(paths.DATA_DIR / 'Subject01' / 'walking' / 'out.parquet')
+            paths.write_manifest(paths.raw_trial_dir('01', 'walking') / 'out.parquet')
 
     def test_a_path_that_merely_mentions_data_is_allowed(self):
         """The guard is on containment, not on the string. results/data_summary/ is fine."""

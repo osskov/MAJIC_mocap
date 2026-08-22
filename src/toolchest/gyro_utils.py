@@ -3,6 +3,68 @@ from typing import List
 from scipy.linalg import logm, expm
 from scipy.spatial.transform import Rotation
 
+# cos(theta) below which `matrix_rotvec` hands off to scipy rather than trusting its own
+# closed form. 0.1 is theta = 84.3 deg IN ONE SAMPLE -- 3370 deg/s at 40 Hz -- which no limb
+# reaches, but a corrupt reconstruction is not bounded by physiology: over the 262 IMoVE
+# trials 36 samples do, all on foot plates in the long walks, at the boundaries where the pose
+# is held across the gaps between mocap takes. The largest is 159.8 deg.
+#
+# DELIBERATELY CONSERVATIVE, not tight. The closed form does not break at 84 deg -- its error
+# goes as (input precision) / sin(theta), which on float32 rotations is 1.7e-7 rad even at
+# that 159.8 deg worst case. It breaks at theta = pi, where the antisymmetric part vanishes
+# and the answer is off by pi itself. Setting the threshold far from that costs 36 samples out
+# of 23.9 M and buys not having to reason about how close to pi a bad marker fit can get.
+# test/TestRotvec.py pins both the failure at pi and the error curve leading up to it.
+_COARSE_ROTATION_COS = 0.1
+
+
+def matrix_rotvec(matrices: np.ndarray) -> np.ndarray:
+    """Rotation vectors of (N, 3, 3) rotation matrices, with the angle in [0, pi].
+
+    Equivalent to `Rotation.from_matrix(matrices).as_rotvec()` -- agreeing to 8e-16 rad over
+    the band a sample of limb rotation lives in, and being exactly it past
+    `_COARSE_ROTATION_COS`, where it defers -- but ~89x faster on the near-identity matrices
+    this is called with: 1704 ms -> 19 ms over a 462 k-frame long walk.
+
+    The speed is entirely in what is NOT done. scipy orthogonalizes its input before
+    extracting a quaternion, which is the right default for a matrix of unknown provenance
+    and pure waste here: these are products of two already-near-orthonormal matrices
+    (measured departure 1.7e-7, which is float32 storage precision), and that orthogonalization
+    was 89% of the call. Nothing downstream wants the projected matrix, only the vector.
+
+    A rotation matrix carries its own rotvec in closed form:
+
+        skew(R) = (R21 - R12, R02 - R20, R10 - R01)  =  2 sin(theta) * axis
+        trace(R)                                     =  1 + 2 cos(theta)
+
+    so theta = atan2(|skew| / 2, (trace - 1) / 2) and rotvec = skew * theta / (2 sin theta),
+    whose small-angle limit is skew / 2 rather than a division by zero.
+
+    That is well-conditioned everywhere EXCEPT theta near pi, where the antisymmetric part
+    vanishes and takes the axis with it: at exactly pi the small-angle branch returns zero for
+    a half turn. Those samples go to scipy, which recovers the axis from the symmetric part
+    and is exact. Real trials do enter the guarded band -- see `_COARSE_ROTATION_COS` -- so it
+    is reachable code, and a version of this without it would return zero rather than raise.
+    """
+    matrices = np.asarray(matrices, dtype=np.float64)
+    skew = np.stack([matrices[:, 2, 1] - matrices[:, 1, 2],
+                     matrices[:, 0, 2] - matrices[:, 2, 0],
+                     matrices[:, 1, 0] - matrices[:, 0, 1]], axis=1)
+    sin_theta = 0.5 * np.linalg.norm(skew, axis=1)
+    cos_theta = 0.5 * (np.trace(matrices, axis1=1, axis2=2) - 1.0)
+    theta = np.arctan2(sin_theta, cos_theta)
+
+    # theta / (2 sin theta), which tends to 1/2 as theta -> 0. The np.maximum keeps the
+    # division itself finite; the np.where is what actually selects the limit.
+    scale = np.where(sin_theta < 1e-12, 0.5,
+                     0.5 * theta / np.maximum(sin_theta, 1e-300))
+    rotvec = skew * scale[:, None]
+
+    coarse = cos_theta < _COARSE_ROTATION_COS
+    if coarse.any():
+        rotvec[coarse] = Rotation.from_matrix(matrices[coarse]).as_rotvec()
+    return rotvec
+
 
 def finite_difference_rotations(rotation_matrices: List[np.ndarray], timestamps: np.ndarray) -> np.ndarray:
     """
@@ -11,22 +73,27 @@ def finite_difference_rotations(rotation_matrices: List[np.ndarray], timestamps:
     as the world frame. So they're all R_wb, where w is the world frame and b is the body frame.
     :param timestamps: Array of timestamps corresponding to the rotation matrices.
     :return: Array of angular velocity vectors.
+
+    The rotvec comes from `matrix_rotvec` rather than from scipy, which is worth ~3x on
+    everything that calls this -- and that is most of the pipeline, since WorldTrace's
+    calculate_imu_trace runs it for every sync lag search, every alignment, every per-plate
+    diagnostic and every sensor-offset fit.
     """
     if len(rotation_matrices) < 2:
         return np.zeros((max(1, len(rotation_matrices)), 3))
-        
+
     R = np.array(rotation_matrices)
     R_prev_T = R[:-1].transpose((0, 2, 1))
     R_curr = R[1:]
-    
+
     R_rel = np.matmul(R_prev_T, R_curr)
     dts = np.diff(timestamps)
-    
+
     # Avoid divide by zero
     dts = np.where(dts == 0, 1e-9, dts)
-    
-    omegas = Rotation.from_matrix(R_rel).as_rotvec() / dts[:, None]
-    
+
+    omegas = matrix_rotvec(R_rel) / dts[:, None]
+
     angular_velocities = np.vstack([omegas, omegas[-1:]])
     return angular_velocities
 

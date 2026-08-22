@@ -18,9 +18,9 @@ import unittest
 os.environ.setdefault("DISABLE_TQDM", "True")
 
 import paths
-from experiments.experiment_utils import (DEFAULT_ACC_STD, DEFAULT_GYRO_STD, DEFAULT_MAG_STD,
-                                          METHODS, STD_KEYS, pipeline_constants,
-                                          resolve_method_spec, resolve_stds)
+from experiments.experiment_utils import (DATASET_STDS, DEFAULT_ACC_STD, DEFAULT_GYRO_STD,
+                                          DEFAULT_MAG_STD, METHODS, STD_KEYS, TRIAL_DATASET,
+                                          pipeline_constants, resolve_method_spec, resolve_stds)
 from experiments.normalized_benchmark import (BASE_METHODS, DEFAULT_METHODS, NORMALIZED_METHODS,
                                               STATS_NAME, TUNED_STDS, VARIANT, base_of)
 
@@ -70,6 +70,56 @@ class TestResolveStds(unittest.TestCase):
         self.assertEqual(set(STD_KEYS), set(resolve_stds()))
 
 
+class TestDatasetStds(unittest.TestCase):
+    """The tuning is per dataset (see experiments/filter_gains.py). Every failure here is the
+    same silent one: a run reads another lab's magnetometer weighting and says nothing."""
+
+    def test_the_bare_defaults_are_the_default_dataset_row(self):
+        """DEFAULT_*_STD still exist for the dozen call sites that read them directly. If
+        they ever drift from DATASET_STDS[TRIAL_DATASET], half the pipeline runs one tuning
+        and half runs another."""
+        self.assertEqual(
+            {'gyro_std': DEFAULT_GYRO_STD, 'acc_std': DEFAULT_ACC_STD, 'mag_std': DEFAULT_MAG_STD},
+            DATASET_STDS[TRIAL_DATASET])
+
+    def test_each_dataset_resolves_to_its_own_row(self):
+        for dataset, row in DATASET_STDS.items():
+            with self.subTest(dataset=dataset):
+                self.assertEqual(resolve_stds(dataset=dataset), row)
+
+    def test_the_datasets_are_not_all_the_same_tuning(self):
+        """If they were, the per-dataset table would be a more complicated way to write one
+        triple, and this whole mechanism should be deleted rather than believed."""
+        distinct = {tuple(sorted(row.items())) for row in DATASET_STDS.values()}
+        self.assertGreater(len(distinct), 1)
+
+    def test_an_unknown_dataset_raises_instead_of_falling_back(self):
+        with self.assertRaises(ValueError) as ctx:
+            resolve_stds(dataset='not_a_dataset')
+        self.assertIn('not_a_dataset', str(ctx.exception))
+        self.assertIn('filter_gains', str(ctx.exception))
+
+    def test_every_registered_dataset_has_a_tuning(self):
+        """The registry is the list of things that can be tracked; a dataset in it with no
+        row cannot run at all now that the fallback raises."""
+        from experiments.global_assumptions import DATASETS, tracking_spec
+        for name in DATASETS:
+            with self.subTest(dataset=name):
+                self.assertIn(tracking_spec(name).dataset, DATASET_STDS)
+
+    def test_an_override_still_beats_the_dataset_row(self):
+        resolved = resolve_stds({'acc_std': 0.03}, dataset='imove')
+        self.assertEqual(resolved['acc_std'], 0.03)
+        self.assertEqual(resolved['mag_std'], DATASET_STDS['imove']['mag_std'])
+
+    def test_pipeline_constants_records_which_row_it_used(self):
+        """Three stds with no note of which dataset they came from cannot be checked against
+        anything, now that there is more than one row."""
+        constants = pipeline_constants(dataset='imove')
+        self.assertEqual(constants['stds_dataset'], 'imove')
+        self.assertEqual(constants['mag_std'], DATASET_STDS['imove']['mag_std'])
+
+
 class TestPipelineConstants(unittest.TestCase):
     def test_no_override_reports_the_defaults(self):
         constants = pipeline_constants()
@@ -95,28 +145,49 @@ class TestPipelineConstants(unittest.TestCase):
 
 
 class TestJointAnglesVariant(unittest.TestCase):
-    def test_no_variant_is_the_flat_layout(self):
-        path = paths.joint_angles_path('01', 'walking', 'mag_on')
-        self.assertEqual(path, paths.JOINT_ANGLES_DIR / 'Subject01' / 'walking' / 'mag_on.parquet')
+    def test_no_variant_is_the_dataset_namespaced_layout(self):
+        path = paths.joint_angles_path('alborno', '01', 'walking', 'mag_on')
+        self.assertEqual(path,
+                         paths.JOINT_ANGLES_DIR / 'alborno' / '01' / 'walking' / 'mag_on.parquet')
 
     def test_a_variant_inserts_one_level_under_the_joint_angles_root(self):
-        path = paths.joint_angles_path('01', 'walking', 'mag_on', variant=VARIANT)
-        self.assertEqual(path, paths.JOINT_ANGLES_DIR / VARIANT / 'Subject01' / 'walking' / 'mag_on.parquet')
+        path = paths.joint_angles_path('alborno', '01', 'walking', 'mag_on', variant=VARIANT)
+        self.assertEqual(path, paths.JOINT_ANGLES_DIR / VARIANT / 'alborno' / '01' / 'walking'
+                         / 'mag_on.parquet')
 
     def test_a_variant_never_collides_with_the_default_tuning(self):
         """The one thing the variant exists for: same method name, same trial, two tunings.
         Without it the second run overwrites the first and the filename says nothing."""
         for method in DEFAULT_METHODS:
             with self.subTest(method=method):
-                self.assertNotEqual(paths.joint_angles_path('01', 'walking', method),
-                                    paths.joint_angles_path('01', 'walking', method, variant=VARIANT))
+                self.assertNotEqual(
+                    paths.joint_angles_path('alborno', '01', 'walking', method),
+                    paths.joint_angles_path('alborno', '01', 'walking', method, variant=VARIANT))
 
     def test_variants_do_not_collide_with_each_other(self):
-        self.assertNotEqual(paths.joint_angles_path('01', 'walking', 'mag_on', variant='a'),
-                            paths.joint_angles_path('01', 'walking', 'mag_on', variant='b'))
+        self.assertNotEqual(paths.joint_angles_path('alborno', '01', 'walking', 'mag_on',
+                                                    variant='a'),
+                            paths.joint_angles_path('alborno', '01', 'walking', 'mag_on',
+                                                    variant='b'))
+
+    def test_datasets_do_not_collide_with_each_other(self):
+        """The same guard one dimension out. Two datasets carry the same trial names and the
+        same method names, so without the namespace an IMoVE run overwrites Al Borno's
+        parquets under a path that claims to be Al Borno's."""
+        self.assertNotEqual(paths.joint_angles_path('alborno', '01', 'walking', 'mag_on'),
+                            paths.joint_angles_path('imove', '01', 'walking', 'mag_on'))
+
+    def test_a_trial_key_with_slashes_stays_under_its_subject(self):
+        """The biplane half names a trial by the session and block it came from, so the key
+        contains separators. It has to land under the subject directory, at the same depth the
+        build tree puts it."""
+        path = paths.joint_angles_path('imove_biplane', '12', 'Test1/A/RSDrop1', 'mag_off')
+        self.assertEqual(path, paths.JOINT_ANGLES_DIR / 'imove_biplane' / '12' / 'Test1' / 'A'
+                         / 'RSDrop1' / 'mag_off.parquet')
 
     def test_a_variant_path_is_still_outside_the_read_only_data_tree(self):
-        paths.ensure_parent(paths.joint_angles_path('01', 'walking', 'mag_on', variant=VARIANT))
+        paths.ensure_parent(
+            paths.joint_angles_path('alborno', '01', 'walking', 'mag_on', variant=VARIANT))
 
 
 class TestNormalizedBenchmarkConfig(unittest.TestCase):

@@ -47,6 +47,10 @@ except ImportError:                                              # pragma: no co
 NUM_VECTOR_SENSORS = 2          # accelerometer, magnetometer
 MEAS_DIM = 3 * NUM_VECTOR_SENSORS
 
+# Mirrors RelativeFilterPlus.HEADING_AXIS_MIN_SINE; imported rather than redefined would be
+# cleaner, but the kernel must not import the reference module at compile time.
+HEADING_AXIS_MIN_SINE = 0.1
+
 
 # ---------------------------------------------------------------------------
 # quaternion helpers, mirroring scipy.spatial.transform.Rotation exactly
@@ -170,7 +174,7 @@ def _solve_spd(S, rhs, L, out):
 
 @njit(cache=True)
 def _kernel(gyro_p, gyro_c, vp, vc, dt, Q, var_p, var_c,
-            q_wp0, q_wc0, P0, normalize):
+            q_wp0, q_wc0, P0, normalize, heading_only, heading_pure):
     """vp/vc are (N, 2, 3): [accelerometer, magnetometer] in each body frame.
 
     A sensor is switched off for a sample by zeroing its reading, which is how
@@ -180,9 +184,22 @@ def _kernel(gyro_p, gyro_c, vp, vc, dt, Q, var_p, var_c,
     of the surviving noise block, so the dead sensor's columns of K are exactly zero
     and it contributes nothing to either the state or the covariance update. No
     branching on sensor presence is needed anywhere.
+
+    `heading_only` is a sensor index (or -1) restricted to the one relative DOF sensor 0
+    cannot observe -- rotation about sensor 0's world direction. Its three rows are kept and
+    projected to rank 1 rather than collapsed to a scalar, which leaves MEAS_DIM alone and,
+    by exactly the argument above, makes the two discarded rows contribute nothing. Their
+    block of M R M^T is deliberately left unprojected: it is what keeps S invertible.
+    `heading_pure` additionally strips the reference direction out of the restricted sensor's
+    reading, against ONE shared world direction for both bodies. That leaves the retained scalar
+    bit-identical and rotates the Jacobian row from t = unit(m x w) onto the reference direction
+    itself, at gain |v_w| sin(theta) instead of |v_w|. See RelativeFilter.heading_only_pure.
+
+    See RelativeFilter.heading_only_sensor for why this DOF is the magnetometer's alone.
     """
     N = gyro_p.shape[0]
     R_pc = np.empty((N, 3, 3))
+
     dt2 = dt * dt
 
     P = P0.copy()
@@ -210,6 +227,11 @@ def _kernel(gyro_p, gyro_c, vp, vc, dt, Q, var_p, var_c,
     n = np.empty(6)
     aa = np.empty(3)
     bb = np.empty(3)
+    wmean = np.zeros((NUM_VECTOR_SENSORS, 3))
+    axis = np.empty(3)
+    hrow = np.empty(6)
+    ref_p = np.empty(3)
+    ref_c = np.empty(3)
 
     _quat_to_mat(q_wp, Rp)
     _quat_to_mat(q_wc, Rc)
@@ -275,11 +297,33 @@ def _kernel(gyro_p, gyro_c, vp, vc, dt, Q, var_p, var_c,
                     bb[1] /= nb
                     bb[2] /= nb
 
+            if si == heading_only and heading_pure:
+                # Strip the shared reference direction out of both readings. wmean[0] is the
+                # reference sensor's world-frame mean, already written this sample because
+                # sensor 0 is processed first; rotating it into each body frame is what makes
+                # the direction SHARED rather than each body using its own reading.
+                nref = np.sqrt(wmean[0, 0] ** 2 + wmean[0, 1] ** 2 + wmean[0, 2] ** 2)
+                if nref > 0.0:
+                    for i in range(3):
+                        sp = 0.0
+                        sc = 0.0
+                        for k in range(3):
+                            sp += Rp[k, i] * wmean[0, k]
+                            sc += Rc[k, i] * wmean[0, k]
+                        ref_p[i] = sp / nref
+                        ref_c[i] = sc / nref
+                    da = ref_p[0] * aa[0] + ref_p[1] * aa[1] + ref_p[2] * aa[2]
+                    db = ref_c[0] * bb[0] + ref_c[1] * bb[1] + ref_c[2] * bb[2]
+                    for i in range(3):
+                        aa[i] -= ref_p[i] * da
+                        bb[i] -= ref_c[i] * db
+
             r = 3 * si
             for i in range(3):
                 pw = Rp[i, 0] * aa[0] + Rp[i, 1] * aa[1] + Rp[i, 2] * aa[2]
                 cw = Rc[i, 0] * bb[0] + Rc[i, 1] * bb[1] + Rc[i, 2] * bb[2]
                 e[r + i] = pw - cw
+                wmean[si, i] = 0.5 * (pw + cw)
                 # row i of  R_wp @ skew(a).T  is  a x R_wp[i, :]
                 H[r + i, 0] = aa[1] * Rp[i, 2] - aa[2] * Rp[i, 1]
                 H[r + i, 1] = aa[2] * Rp[i, 0] - aa[0] * Rp[i, 2]
@@ -288,6 +332,34 @@ def _kernel(gyro_p, gyro_c, vp, vc, dt, Q, var_p, var_c,
                 H[r + i, 3] = -(bb[1] * Rc[i, 2] - bb[2] * Rc[i, 1])
                 H[r + i, 4] = -(bb[2] * Rc[i, 0] - bb[0] * Rc[i, 2])
                 H[r + i, 5] = -(bb[0] * Rc[i, 1] - bb[1] * Rc[i, 0])
+
+            if si == heading_only:
+                # axis = unit(wmean[0] x wmean[si]): the only direction of this sensor's
+                # residual that responds to rotation about sensor 0's world direction.
+                axis[0] = wmean[0, 1] * wmean[si, 2] - wmean[0, 2] * wmean[si, 1]
+                axis[1] = wmean[0, 2] * wmean[si, 0] - wmean[0, 0] * wmean[si, 2]
+                axis[2] = wmean[0, 0] * wmean[si, 1] - wmean[0, 1] * wmean[si, 0]
+                n0 = np.sqrt(wmean[0, 0] ** 2 + wmean[0, 1] ** 2 + wmean[0, 2] ** 2)
+                ns = np.sqrt(wmean[si, 0] ** 2 + wmean[si, 1] ** 2 + wmean[si, 2] ** 2)
+                na = np.sqrt(axis[0] ** 2 + axis[1] ** 2 + axis[2] ** 2)
+                if na == 0.0 or na < HEADING_AXIS_MIN_SINE * n0 * ns:
+                    # Undefined projection (a zeroed sensor, or the two directions too near
+                    # parallel to tell heading from tilt): drop the sensor for this sample.
+                    for i in range(3):
+                        e[r + i] = 0.0
+                        for j in range(6):
+                            H[r + i, j] = 0.0
+                else:
+                    for i in range(3):
+                        axis[i] /= na
+                    se = axis[0] * e[r] + axis[1] * e[r + 1] + axis[2] * e[r + 2]
+                    for j in range(6):
+                        hrow[j] = (axis[0] * H[r, j] + axis[1] * H[r + 1, j]
+                                   + axis[2] * H[r + 2, j])
+                    for i in range(3):
+                        e[r + i] = axis[i] * se
+                        for j in range(6):
+                            H[r + i, j] = axis[i] * hrow[j]
 
             # M R M^T for this sensor: R_wp diag(var_p) R_wp^T + R_wc diag(var_c) R_wc^T.
             # Cross-sensor blocks are zero, so only the diagonal block is written.
@@ -385,6 +457,8 @@ def run_relative_filter(gyro_p: np.ndarray, gyro_c: np.ndarray,
                         vector_sensor_stds_child: List[np.ndarray],
                         R_wp0: np.ndarray, R_wc0: np.ndarray,
                         normalize_measurements: bool = False,
+                        heading_only_sensor: Optional[int] = None,
+                        heading_only_pure: bool = False,
                         init_orientation_std: float = np.deg2rad(0.1)) -> np.ndarray:
     """Run the whole trial and return R_pc, shape (N, 3, 3).
 
@@ -394,6 +468,10 @@ def run_relative_filter(gyro_p: np.ndarray, gyro_c: np.ndarray,
 
     sensors_p / sensors_c are (N, 2, 3), ordered [accelerometer, magnetometer] to
     match vector_sensor_stds_*.
+
+    heading_only_sensor mirrors RelativeFilter's argument of the same name: pass 1 to let the
+    magnetometer correct relative heading about the joint-centre acceleration and nothing else.
+    heading_only_pure likewise: it re-attributes that single row to the reference direction.
 
     Raises NotImplementedError for any configuration this kernel does not cover, so a
     caller cannot silently get the wrong filter. Use RelativeFilter directly for joint
@@ -410,6 +488,15 @@ def run_relative_filter(gyro_p: np.ndarray, gyro_c: np.ndarray,
             f"This kernel covers exactly {NUM_VECTOR_SENSORS} vector sensors; got "
             f"{len(vector_sensor_stds_parent)}/{len(vector_sensor_stds_child)}. "
             f"Use RelativeFilter for other configurations.")
+
+    if heading_only_pure and heading_only_sensor is None:
+        raise ValueError("heading_only_pure requires heading_only_sensor; on its own it names "
+                         "no row to re-attribute.")
+    if heading_only_sensor is not None and not 0 < heading_only_sensor < NUM_VECTOR_SENSORS:
+        raise ValueError(
+            f"heading_only_sensor={heading_only_sensor} is not a vector sensor other than 0; "
+            f"this kernel has {NUM_VECTOR_SENSORS} and sensor 0 is the reference whose "
+            f"unobservable axis the restriction is defined against.")
 
     gyro_p = np.ascontiguousarray(gyro_p, dtype=np.float64)
     gyro_c = np.ascontiguousarray(gyro_c, dtype=np.float64)
@@ -432,4 +519,6 @@ def run_relative_filter(gyro_p: np.ndarray, gyro_c: np.ndarray,
     P0 = np.eye(6) * init_orientation_std ** 2
 
     return _kernel(gyro_p, gyro_c, vp, vc, float(dt), Q, var_p, var_c,
-                   q_wp0, q_wc0, P0, bool(normalize_measurements))
+                   q_wp0, q_wc0, P0, bool(normalize_measurements),
+                   -1 if heading_only_sensor is None else int(heading_only_sensor),
+                   bool(heading_only_pure))

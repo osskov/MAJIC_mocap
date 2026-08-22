@@ -6,7 +6,7 @@ have to assume: what trials exist, where each one's files are, which of those fi
 its contents, and how to turn them into PlateTrials.
 
 Before this, all four were hardcoded to the Al Borno layout — `paths.raw_trial_dir` templated
-`Subject{n}/{activity}`, `SUBJECTS x ACTIVITIES` was a cross product of two constants, and the
+`alborno/Subject{n}/{activity}`, `SUBJECTS x ACTIVITIES` was a cross product of two constants, and the
 cache key hashed a fixed tuple of globs. IMoVE matches none of them: its sessions are `s2`
 through `s25l`, its trials are `t1_walking_001`, and its files are `mocap_data/*.csv` beside
 `imu_data/*.txt`.
@@ -70,13 +70,13 @@ class TrialSource:
 # ==============================================================================
 
 def _alborno_dir(subject: str, trial: str) -> Path:
-    return paths.DATA_DIR / f"Subject{subject}" / trial
+    return paths.raw_trial_dir(subject, trial)
 
 
 def _alborno_trials() -> List[Tuple[str, str]]:
-    """Every Subject<NN>/<trial>/ that actually holds a .trc, in sorted order."""
+    """Every alborno/Subject<NN>/<trial>/ that actually holds a .trc, in sorted order."""
     found = []
-    for subject_dir in sorted(paths.DATA_DIR.glob("Subject*")):
+    for subject_dir in sorted(paths.ALBORNO_DIR.glob("Subject*")):
         if not subject_dir.is_dir():
             continue
         subject = subject_dir.name.replace("Subject", "")
@@ -106,7 +106,7 @@ ALBORNO = TrialSource(
 # IMoVE / CMU-MBL — OptiTrack markers beside Xsens MTw2
 # ==============================================================================
 
-IMOVE_ROOT = paths.DATA_DIR / 'IMoveLab_Raw_Data' / 'mocap_ref' / 'data'
+IMOVE_ROOT = paths.IMOVE_DIR / 'mocap_ref' / 'data'
 
 
 def _imove_dir(session: str, trial: str) -> Path:

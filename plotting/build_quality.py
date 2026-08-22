@@ -409,7 +409,6 @@ def plot_data_state(tables: Dict[str, pd.DataFrame], dataset: str, save: bool,
                  height=0.72)
     axes[2].set_title('Session mean', fontsize=10)
     axes[2].set_xlabel('mean health', fontsize=8)
-    axes[2].grid(alpha=0.3, axis='x')
     axes[2].tick_params(labelsize=7)
     axes[0].invert_yaxis()
 
@@ -456,7 +455,6 @@ def plot_reconstruction(tables: Dict[str, pd.DataFrame], dataset: str, save: boo
     axes[0].set_ylabel('fraction of segment-trials')
     axes[0].set_title('Reconstruction residual, by segment kind')
     axes[0].legend(fontsize=9)
-    axes[0].grid(alpha=0.3)
 
     if 'valid_fraction' in recon:
         order = recon.groupby('entity')['valid_fraction'].median().sort_values().index[:20]
@@ -468,7 +466,6 @@ def plot_reconstruction(tables: Dict[str, pd.DataFrame], dataset: str, save: boo
                         whis=(5, 95))          # p5/p95, matching the house _box_stats
         axes[1].set_xlabel('valid fraction')
         axes[1].set_title('Least-complete segments (p5–p95 whiskers)')
-        axes[1].grid(alpha=0.3, axis='x')
         axes[1].tick_params(labelsize=7)
 
     finalize_and_save_plot(fig, f'Ground-truth quality — {dataset}',
@@ -505,7 +502,6 @@ def plot_sync_and_timeline(tables: Dict[str, pd.DataFrame], dataset: str, save: 
         axes[0].set_xscale('symlog', linthresh=1e-3)
         axes[0].set_xlabel('|per-plate lag − trial median| (s)')
         axes[0].set_title('Worst 25 trials by sync disagreement')
-        axes[0].grid(alpha=0.3, axis='x')
 
     if timeline is not None and not timeline.empty and 'deviation_from_origin_s' in timeline:
         values = timeline['deviation_from_origin_s'].dropna()
@@ -517,7 +513,6 @@ def plot_sync_and_timeline(tables: Dict[str, pd.DataFrame], dataset: str, save: 
         axes[1].set_ylabel('plates (log)')
         axes[1].set_title(f'Timeline agreement — {len(nonzero)} of {len(values)} plates '
                           f'start late')
-        axes[1].grid(alpha=0.3, axis='y')
 
     finalize_and_save_plot(fig, f'Synchronization and timeline — {dataset}',
                            'sync_timeline.png', plots_dir=_plots_dir(dataset),
@@ -553,7 +548,6 @@ def plot_alignment(tables: Dict[str, pd.DataFrame], dataset: str, save: bool,
         axes[0].set_xlabel('valid frames the rotation was fitted on (log)', fontsize=9)
         axes[0].set_ylabel('residual / measured gyro RMS (log)', fontsize=9)
         axes[0].set_title('Alignment quality vs how much data supported it', fontsize=11)
-        axes[0].grid(alpha=0.3)
 
     if has_residual and 'gyro_residual_before_deg_s' in alignment:
         before = alignment['gyro_residual_before_deg_s']
@@ -568,7 +562,6 @@ def plot_alignment(tables: Dict[str, pd.DataFrame], dataset: str, save: bool,
         axes[1].set_xlabel('residual before the rotation (deg/s, log)', fontsize=9)
         axes[1].set_ylabel('residual after (deg/s, log)', fontsize=9)
         axes[1].set_title('What the rotation bought', fontsize=11)
-        axes[1].grid(alpha=0.3)
 
     if 'angle_to_nearest_plate_axis_deg' in alignment:
         axes[2].hist(alignment['angle_to_nearest_plate_axis_deg'].dropna(), bins=40,
@@ -577,7 +570,6 @@ def plot_alignment(tables: Dict[str, pd.DataFrame], dataset: str, save: bool,
                        fontsize=9)
         axes[2].set_ylabel('plates', fontsize=9)
         axes[2].set_title('Mounting convention, or an arbitrary fit?', fontsize=11)
-        axes[2].grid(alpha=0.3, axis='y')
 
     if not has_residual:
         # Rather than an empty pair of panels: the metric is written at build time, so a tree
@@ -619,7 +611,6 @@ def plot_replicate_structure(tables: Dict[str, pd.DataFrame], dataset: str, save
     ax.set_ylabel('fraction of metrics')
     ax.set_title('How much of each metric is shared within a grouping')
     ax.legend(fontsize=9)
-    ax.grid(alpha=0.3)
 
     finalize_and_save_plot(fig, f'Replicate structure — {dataset}',
                            'replicate_structure.png', plots_dir=_plots_dir(dataset),
@@ -657,12 +648,10 @@ def plot_health(tables: Dict[str, pd.DataFrame], dataset: str, save: bool,
     axes[0].invert_yaxis()
     axes[0].set_xlabel('composite')
     axes[0].set_title('health (triage only)', fontsize=10)
-    axes[0].grid(alpha=0.3, axis='x')
 
     for axis, column in zip(axes[1:], components):
         axis.barh(positions, worst[column].astype(float), color='#4477aa')
         axis.set_xlabel(column, fontsize=8)
-        axis.grid(alpha=0.3, axis='x')
         axis.tick_params(labelsize=7)
 
     finalize_and_save_plot(fig, f'Worst trials, with components — {dataset}',

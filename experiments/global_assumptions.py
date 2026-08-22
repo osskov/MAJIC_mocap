@@ -106,7 +106,7 @@ from scipy.signal import butter, filtfilt
 
 import paths
 from experiments.experiment_utils import (DEFAULT_ACC_STD, DEFAULT_MAG_ADAPT_THRESHOLD,
-                                          EXPECTED_GRAVITY, JOINTS, load_trial,
+                                          EXPECTED_GRAVITY, JOINTS, TrackingSpec, load_trial,
                                           pipeline_constants, project_pair_to_joint_center,
                                           run_tracked_grid, segment_observability)
 from src.toolchest.building.sources import get_source
@@ -181,6 +181,19 @@ class DatasetSpec:
     gradient being defined to zero, not a finding. What it IS good for is comparability: it is
     the same single-clean-sensor construction `experiment_utils._compute_expected_mag_field`
     hands the EKF's magnetometer oracle, so this arm says what that oracle is referenced against.
+
+    `gravity` is gravity AS AN ACCELEROMETER READS IT in this dataset's mocap world frame, or
+    None for the pipeline default (`EXPECTED_GRAVITY`, Y-up with the positive specific-force
+    convention). It is here because the biplane half does NOT share that frame: its world is
+    Z-UP, measured at [-0.11, -0.06, 9.82] over the quiet frames of its Vicon-referenced plates,
+    against Al Borno's [0.016, 9.812, -0.003] and IMoVE's [0.072, 9.810, -0.006].
+
+    Getting it wrong is silent. It does not raise; it corrupts the EKF's world reference and both
+    acceleration oracles, and the relative-filter arms — which are seeded from mocap and estimate
+    a relative rotation — never touch it, so nothing else in a run would look wrong. Only the
+    consumers named on `experiment_utils.TrackingSpec` read it today; this experiment's own
+    mocap-referenced accelerometer metrics still measure against the module constant, so its
+    `linacc` on the biplane specs remains a 90-degree frame artifact.
     """
     name: str
     segment_sensor: Dict[str, str]
@@ -193,11 +206,17 @@ class DatasetSpec:
     has_magnetometer: bool = True
     trials_dataset: Optional[str] = None
     clean_sensor: Optional[str] = None
+    gravity: Optional[np.ndarray] = None
 
     @property
     def build_name(self) -> str:
         """The directory under results/trials/ this spec's trials are enumerated from."""
         return self.trials_dataset or self.name
+
+    @property
+    def world_gravity(self) -> np.ndarray:
+        """`gravity`, or the pipeline default when this spec shares the Y-up mocap convention."""
+        return EXPECTED_GRAVITY if self.gravity is None else np.asarray(self.gravity, dtype=float)
 
     def segment_metrics(self) -> Tuple[str, ...]:
         """`SEGMENT_METRICS`, minus the magnetic ones on a dataset with no magnetometer."""
@@ -373,6 +392,28 @@ IMOVE = DatasetSpec(
 _BIPLANE_SITES = (('Thigh L', 'lateral_thigh_left'), ('Shank L', 'lateral_shank_left'),
                   ('Thigh R', 'lateral_thigh_right'), ('Shank R', 'lateral_shank_right'))
 
+# Z-UP, unlike either marker-referenced dataset. Measured over the quiet frames (|gyro| < 0.5
+# rad/s) of the Vicon-referenced plates, where gravity is the whole accelerometer signal:
+# [-0.11, -0.06, 9.82], i.e. +9.81 on the third axis to within 0.2%.
+#
+# The frames are selected on the GYROSCOPE, not on |acc|, for the same reason
+# `experiment_utils._static_calibration` does: picking frames where the accelerometer reads 9.81
+# and then reporting that it reads 9.81 would hide the error being looked for.
+#
+# The trial-mean version of this number does NOT come out at [0, 0, 9.81] on this dataset, and the
+# reason is worth recording. `measure_world_frame_gravity` averages over a whole trial and relies
+# on linear accelerations cancelling; these trials are 0.5 s drop landings and running stance
+# phases, where they do not. Pooled over all 380 built trials the mean is [-0.10, -1.78, 9.14]
+# with a per-axis sd of 1.9-4.1 — the up axis is unambiguous, the rest is the landing. Over the
+# BONE-POSE plates alone, which carry only ~0.48 s of valid frames each, the quiet-frame mean is
+# [1.16, -2.60, 9.03]: 9 qualifying plates out of 6 trials, so it is a small-sample statement
+# about how little quiet time a drop landing has and not evidence of a second world frame.
+#
+# Consequence for reading results: the EKF arm is the only one that consults this, and on
+# `imove_biplane` it is the arm whose world reference is least well pinned down. The relative
+# filters do not use it at all.
+BIPLANE_GRAVITY = np.array([0.0, 0.0, 9.81])
+
 
 def _biplane_spec(name: str, reference: str) -> DatasetSpec:
     segment_sensor = {segment: f'{site}__{reference}' for segment, site in _BIPLANE_SITES}
@@ -393,6 +434,7 @@ def _biplane_spec(name: str, reference: str) -> DatasetSpec:
         field_reference={},
         has_magnetometer=False,
         trials_dataset='imove_biplane',
+        gravity=BIPLANE_GRAVITY,
     )
 
 
@@ -408,6 +450,38 @@ def get_dataset(name: str) -> DatasetSpec:
         return DATASETS[name]
     except KeyError:
         raise ValueError(f"Unknown dataset {name!r}. Registered: {sorted(DATASETS)}.") from None
+
+
+def tracking_spec(dataset: str) -> TrackingSpec:
+    """The dataset as the TRACKING pipeline needs it: joint table, gravity, mag reference.
+
+    The bridge between this module's registry and `experiment_utils`, which defines the shape but
+    cannot build one — it is imported by this module, so the dependency only runs this way. Every
+    experiment that runs filters over more than one dataset resolves its spec here, so there is
+    one place where "which sensors, which way is up, which magnetometer reference" is answered.
+
+    PRIMARY JOINTS ONLY. `DatasetSpec.joints` carries IMoVE's High and Low placement variants as
+    additional pairs, which is what that dataset is uniquely able to measure and which this
+    experiment does report — but they triple the filter runtime and are a different question from
+    "how well is this joint tracked". They are recoverable by passing a spec with the full table.
+
+    `clean_sensor` becomes the magnetometer reference, and the two are the same construction for
+    the same reason: one clean sensor, declared up front rather than chosen per subject from the
+    data. Read the warning on `DatasetSpec.clean_sensor` for what that reference is and is not
+    good for — it is exactly the arm `_compute_expected_mag_field` has always implemented.
+    """
+    spec = get_dataset(dataset)
+    return TrackingSpec(
+        # The SPEC name, not the build name: the two biplane specs share one build tree and would
+        # otherwise write the same joint-angle files. See TrackingSpec.build_dataset.
+        dataset=spec.name,
+        trials_dataset=spec.trials_dataset,
+        joints={joint: spec.joints[joint] for joint in spec.primary_joints},
+        gravity=spec.world_gravity,
+        mag_reference=spec.clean_sensor,
+        has_magnetometer=spec.has_magnetometer,
+        subject_label=spec.subject_label,
+    )
 
 
 def build_name(dataset: str) -> str:

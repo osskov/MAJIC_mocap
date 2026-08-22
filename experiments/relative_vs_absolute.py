@@ -159,7 +159,7 @@ different physical reasons, which is what makes running both worth the effort:
                    ferrous material in the room and on the body. Distortion is spatially
                    correlated, so two sensors a segment apart see similar fields — small
                    theta_rel — while both differ from the global field — large theta_parent,
-                   theta_child. (experiments/sensor_distributions.py measures that spatial
+                   theta_child. (experiments/global_assumptions.py measures that spatial
                    correlation directly, as var_reduction.)
 
     ACCELEROMETER  u_J and u_K differ from gravity because the body accelerates. Here the
@@ -246,7 +246,7 @@ from experiments.experiment_utils import (ACTIVITIES, EXPECTED_GRAVITY, JOINTS, 
                                           _compute_expected_mag_field, load_raw_data,
                                           pipeline_constants, project_pair_to_joint_center,
                                           run_tracked_grid)
-from experiments.sensor_distributions import expected_mag_field
+from experiments.global_assumptions import pooled_world_field
 from src.toolchest.PlateTrial import PlateTrial
 
 EXPERIMENT_NAME = "relative_vs_absolute"
@@ -282,8 +282,11 @@ FIELDS = ('mag', 'acc', 'acc_unprojected')
 #
 #   subject_median    median world-frame field over every sensor and both activities of the
 #                     subject. Median and pooled for the reasons given in
-#                     sensor_distributions.expected_mag_field: distortion is one-sided and
+#                     global_assumptions.pooled_world_field: distortion is one-sided and
 #                     heavy-tailed, and pooling keeps any one segment from being privileged.
+#                     Note this is the POOLED-SAMPLE median, not the per-trial one
+#                     global_assumptions itself now uses — see that function for why the two
+#                     differ and why this arm deliberately keeps the older definition.
 #   torso_median      median world-frame field over the TORSO sensors of this trial — i.e.
 #                     experiment_utils._compute_expected_mag_field, which is literally the
 #                     reference the `ekf` baseline's ground plate is built from. Included so
@@ -961,7 +964,7 @@ def _subject_worker(row_key: str, stage_labels: List[str], shared_state: Dict,
 
     The subject, not the trial, is the unit of work here because the magnetometer's primary
     global reference is the subject's median world field over BOTH activities (see
-    sensor_distributions.expected_mag_field). Splitting the activities across processes would
+    global_assumptions.pooled_world_field). Splitting the activities across processes would
     either compute two different references or require a separate pass to reconcile them, and
     the reference has to be the same in both for a subject's two trials to be comparable.
     """
@@ -990,7 +993,7 @@ def _subject_worker(row_key: str, stage_labels: List[str], shared_state: Dict,
             shared_state[(row_key, activity)] = "Skipped"
         return None
 
-    subject_field = expected_mag_field(plates_by_activity)
+    subject_field = pooled_world_field(plates_by_activity)
     shared_state[(row_key, f"{load_stage}_time")] = time.time() - t_start
     shared_state[(row_key, load_stage)] = "Success"
 

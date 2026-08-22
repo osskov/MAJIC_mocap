@@ -174,8 +174,8 @@ class TestEnumeration(unittest.TestCase):
         trials = get_source('alborno').enumerate_trials()
         self.assertTrue(trials)
         for subject, trial in trials:
-            self.assertTrue((paths.DATA_DIR / f'Subject{subject}' / trial).is_dir())
-            self.assertTrue(any((paths.DATA_DIR / f'Subject{subject}' / trial).glob('*.trc')))
+            self.assertTrue(paths.raw_trial_dir(subject, trial).is_dir())
+            self.assertTrue(any(paths.raw_trial_dir(subject, trial).glob('*.trc')))
 
     def test_alborno_reflects_that_some_subjects_have_walking_only(self):
         """Subjects 05, 08 and 10 have no complexTasks. Enumerating rather than crossing two

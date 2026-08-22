@@ -28,3 +28,5 @@ plots/
 
 # Ignore .vscode folder
 .vscode/
+# Ad-hoc exploratory scripts and their intermediates.
+scratch/

@@ -40,7 +40,7 @@ from scipy.spatial.transform import Rotation
 
 from plotting import utils as plot_utils  # noqa: F401  (applies the shared paper rcParams on import)
 import paths
-from experiments.experiment_utils import load_raw_data, JOINTS, SUBJECTS
+from experiments.experiment_utils import load_raw_data, JOINTS, SUBJECTS, TRIAL_DATASET
 from experiments.drift_observability import (
     load_joint_angles, compute_obs_metric, detect_quiet_sitting_segments,
     invert_segments, chunk_segments, clip_segments, segment_drift,
@@ -104,7 +104,8 @@ CAPTIONS = {
 
 
 def subjects_with_data(activity: str):
-    return [s for s in SUBJECTS if paths.joint_angles_path(s, activity, "mag_off").exists()]
+    return [s for s in SUBJECTS
+            if paths.joint_angles_path(TRIAL_DATASET, s, activity, "mag_off").exists()]
 
 
 def compute_for_subject(subject: str, activity: str):

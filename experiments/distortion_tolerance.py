@@ -66,12 +66,18 @@ import pandas as pd
 
 import paths
 from experiments.experiment_utils import (
-    JOINTS, SUBJECTS, ACTIVITIES,
+    JOINTS, SUBJECTS, ACTIVITIES, TRIAL_DATASET,
     load_all_joint_angles, compute_error_stats, save_statistics, load_raw_data,
     run_tracked_grid, generate_joint_angles_worker, compute_stats_worker,
     _compute_expected_mag_field, pipeline_constants,
 )
 from src.toolchest.PlateTrial import PlateTrial
+
+# THIS EXPERIMENT OWNS ITS OWN JOINT-ANGLE TREE:
+# results/experiments/distortion_tolerance/joint_angles/. `results/joint_angles/` belongs to
+# benchmark_experiment.py alone — see paths.joint_angles_write_path for the failure
+# that rule exists to prevent.
+EXPERIMENT_NAME = "distortion_tolerance"
 
 EXPERIMENT_DIR = paths.experiment_dir("distortion_tolerance")
 STATS_NAME = "distortion_tolerance"
@@ -180,7 +186,7 @@ def distortion_tables(subject: str, activity: str, plates: Dict[str, PlateTrial]
             segment_rows.append({
                 **common, 'sensor': sensor,
                 # In the arbitrary units the Xsens magnetometer channels are exported in
-                # (see sensor_distributions.MAG_UNIT), so also given as a fraction of the
+                # (see global_assumptions.MAG_UNIT), so also given as a fraction of the
                 # assumed field's own magnitude, which is unit-free and comparable.
                 **_summarize(residual, 'magdev'),
                 **_summarize(residual / field_norm, 'magdev_frac'),
@@ -329,13 +335,16 @@ def main():
     print(f"Running distortion sweep with methods: {methods}")
     if not args.stats_only:
         run_tracked_grid(row_keys, ['Subject', 'Activity'], methods,
-                         generate_joint_angles_worker, args.workers,
+                         partial(generate_joint_angles_worker,
+                                 experiment=EXPERIMENT_NAME), args.workers,
                          title="DISTORTION TOLERANCE GENERATION", per_cell=True)
     run_tracked_grid(row_keys, ['Subject', 'Activity'], ['stats'],
-                     partial(compute_stats_worker, methods=methods, stats_name=STATS_NAME),
+                     partial(compute_stats_worker, methods=methods, stats_name=STATS_NAME,
+                             experiment=EXPERIMENT_NAME),
                      args.workers, title="DISTORTION TOLERANCE STATISTICS")
 
-    all_data_df = load_all_joint_angles(subjects, args.activities, methods)
+    all_data_df = load_all_joint_angles(TRIAL_DATASET, row_keys, methods,
+                                        experiment=EXPERIMENT_NAME)
     if all_data_df.empty:
         print("Error: no data was loaded for any subject.")
         return

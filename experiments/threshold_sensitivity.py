@@ -15,7 +15,7 @@ Two things are measured, and the figure needs both:
   experiment_utils.DEFAULT_MAG_ADAPT_THRESHOLD's comment checkable rather than quoted.
   Computed with _calculate_observability_metric_ on joint-center-projected traces, i.e.
   the identical quantity _run_relative_filter gates on — an unsmoothed, post-projection
-  o^J. (sensor_distributions writes a superficially similar per-joint o^J table, but it
+  o^J. (global_assumptions writes a superficially similar per-joint o^J table, but it
   is winsorized and smoothed for plotting, so a duty cycle read off it would not be the
   filter's.)
 
@@ -51,12 +51,18 @@ import pandas as pd
 
 import paths
 from experiments.experiment_utils import (
-    JOINTS, SUBJECTS, ACTIVITIES, DEFAULT_MAG_ADAPT_THRESHOLD,
+    JOINTS, SUBJECTS, ACTIVITIES, TRIAL_DATASET, DEFAULT_MAG_ADAPT_THRESHOLD,
     load_all_joint_angles, compute_error_stats, save_statistics, load_raw_data,
     run_tracked_grid, generate_joint_angles_worker, compute_stats_worker,
     _calculate_observability_metric_, project_pair_to_joint_center, pipeline_constants,
 )
 from src.toolchest.PlateTrial import PlateTrial
+
+# THIS EXPERIMENT OWNS ITS OWN JOINT-ANGLE TREE:
+# results/experiments/threshold_sensitivity/joint_angles/. `results/joint_angles/` belongs to
+# benchmark_experiment.py alone — see paths.joint_angles_write_path for the failure
+# that rule exists to prevent.
+EXPERIMENT_NAME = "threshold_sensitivity"
 
 EXPERIMENT_DIR = paths.experiment_dir("threshold_sensitivity")
 STATS_NAME = "observability_threshold"
@@ -226,7 +232,13 @@ def gating_worker(row_key, stage_labels: List[str], shared_state: Dict,
 def arm_constants(subject: str, activity: str, method: str,
                   variant: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """The constants recorded in one arm's manifest sidecar, or None if it is missing."""
-    path = paths.manifest_path(paths.joint_angles_path(subject, activity, method, variant=variant))
+    # THIS EXPERIMENT'S OWN arms, not the benchmark's. The sweep exists to compare its swept
+    # arms against its own limit arms at one tuning; reading the canonical tree here would check
+    # the provenance of parquets this run never wrote, which is the exact mix-up the guard below
+    # is for.
+    path = paths.manifest_path(
+        paths.joint_angles_path(TRIAL_DATASET, subject, activity, method, variant=variant,
+                                experiment=EXPERIMENT_NAME))
     if not path.exists():
         return None
     with open(path) as handle:
@@ -370,26 +382,30 @@ def main():
     if not (args.stats_only or args.references_only):
         print(f"Running threshold sweep with methods: {['marker'] + swept}")
         run_tracked_grid(row_keys, ['Subject', 'Activity'], ['load', 'marker'] + swept,
-                         generate_joint_angles_worker, args.workers,
+                         partial(generate_joint_angles_worker,
+                                 experiment=EXPERIMENT_NAME), args.workers,
                          title="OBSERVABILITY THRESHOLD GENERATION")
     if references and not args.stats_only:
         print(f"Generating limit arms {references} under variant '{REFERENCE_VARIANT}'")
         run_tracked_grid(row_keys, ['Subject', 'Activity'], ['load'] + references,
                          partial(generate_joint_angles_worker, variant=REFERENCE_VARIANT,
-                                 stds=reference_stds),
+                                 stds=reference_stds, experiment=EXPERIMENT_NAME),
                          args.workers, title="OBSERVABILITY THRESHOLD LIMIT ARMS")
 
     run_tracked_grid(row_keys, ['Subject', 'Activity'], ['stats'],
                      partial(compute_stats_worker, methods=['marker'] + swept,
-                             stats_name=STATS_NAME),
+                             stats_name=STATS_NAME, experiment=EXPERIMENT_NAME),
                      args.workers, title="OBSERVABILITY THRESHOLD STATISTICS")
 
     # Loaded in two passes because the arms live in two namespaces. 'marker' is the ground
     # truth and runs no filter, so one copy of it serves both.
-    frames = [load_all_joint_angles(args.subjects, args.activities, ['marker'] + swept)]
+    frames = [load_all_joint_angles(TRIAL_DATASET, row_keys, ['marker'] + swept,
+                                    experiment=EXPERIMENT_NAME)]
     if references:
-        frames.append(load_all_joint_angles(args.subjects, args.activities, references,
-                                            variant=REFERENCE_VARIANT))
+        frames.append(load_all_joint_angles(TRIAL_DATASET, row_keys, references,
+                                            experiment=EXPERIMENT_NAME,
+                                            variant=REFERENCE_VARIANT,
+                                            stds=reference_stds))
     all_data_df = pd.concat([f for f in frames if not f.empty], ignore_index=True) \
         if any(not f.empty for f in frames) else pd.DataFrame()
     if all_data_df.empty:

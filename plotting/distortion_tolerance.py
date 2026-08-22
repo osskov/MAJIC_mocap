@@ -735,7 +735,6 @@ def panel_tolerance(ax: plt.Axes, marks: pd.DataFrame) -> None:
     # which are the furthest right and the ones the figure is read for.
     ax.set_xlim(0, max(float(marks[['breakeven_deg', 'measured_deg', 'max_swept_deg']]
                              .max().max()) * 1.12, 1.0))
-    ax.grid(axis='x', alpha=0.25)
 
     handles = [
         Line2D([], [], color='#666666', marker='o', linewidth=0, markersize=9,

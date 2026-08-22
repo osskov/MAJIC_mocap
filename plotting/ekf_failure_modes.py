@@ -35,7 +35,7 @@ from scipy.spatial.transform import Rotation
 
 import paths
 from experiments.experiment_utils import (
-    JOINTS, load_raw_data, load_joint_angles, load_statistics,
+    JOINTS, TRIAL_DATASET, load_raw_data, load_joint_angles, load_statistics,
     _compute_expected_mag_field, _compute_perfect_segment_acc, _compute_perfect_mag,
 )
 from experiments.drift_observability import detect_quiet_sitting_segments
@@ -163,8 +163,8 @@ def joint_error_trace(subject: str, activity: str, method: str,
     thing. The rotation itself is kept rather than just the angle because the zoom
     panels need error *growth* relative to a window start (see drift_since).
     """
-    est = load_joint_angles(subject, activity, method)
-    truth = load_joint_angles(subject, activity, 'marker')
+    est = load_joint_angles(TRIAL_DATASET, subject, activity, method)
+    truth = load_joint_angles(TRIAL_DATASET, subject, activity, 'marker')
     if est is None or truth is None:
         return None
 

@@ -446,7 +446,7 @@ class TestNormalizationConstants(unittest.TestCase):
 
     def test_the_mag_nominal_is_the_xsens_calibrated_unit(self):
         """These exports are normalized at calibration so a nominal Earth field reads 1.0
-        (see MAG_UNIT in experiments/sensor_distributions.py), NOT microtesla. A ~50x
+        (see MAG_UNIT in experiments/global_assumptions.py), NOT microtesla. A ~50x
         value here would silently de-weight the magnetometer in the rescaled arm only."""
         self.assertEqual(experiment_utils.NOMINAL_MAG_MAGNITUDE, 1.0)
 

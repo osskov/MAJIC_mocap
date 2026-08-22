@@ -12,9 +12,16 @@ from functools import partial
 from typing import List, Tuple
 
 from experiments.experiment_utils import (
-    SUBJECTS, ACTIVITIES, load_all_joint_angles, compute_error_stats, save_statistics,
+    SUBJECTS, ACTIVITIES, TRIAL_DATASET, load_all_joint_angles, compute_error_stats,
+    save_statistics,
     run_tracked_grid, generate_joint_angles_worker, compute_stats_worker,
 )
+
+# THIS EXPERIMENT OWNS ITS OWN JOINT-ANGLE TREE:
+# results/experiments/oracle_ablation/joint_angles/. `results/joint_angles/` belongs to
+# benchmark_experiment.py alone — see paths.joint_angles_write_path for the failure
+# that rule exists to prevent.
+EXPERIMENT_NAME = "oracle_ablation"
 
 ORACLE_BASE_METHODS = ['mag_on', 'mag_off', 'mag_adapt', 'ekf']
 ACC_SOURCES = ['real', 'perfect']
@@ -62,13 +69,16 @@ def main():
 
     row_keys = [(subject, activity) for subject in args.subjects for activity in args.activities]
 
-    run_tracked_grid(row_keys, ['Subject', 'Activity'], ['load'] + methods, generate_joint_angles_worker,
+    run_tracked_grid(row_keys, ['Subject', 'Activity'], ['load'] + methods,
+                      partial(generate_joint_angles_worker, experiment=EXPERIMENT_NAME),
                       args.workers, title="ORACLE ABLATION GENERATION")
     run_tracked_grid(row_keys, ['Subject', 'Activity'], ['stats'],
-                      partial(compute_stats_worker, methods=methods, stats_name="oracle_ablation"),
+                      partial(compute_stats_worker, methods=methods, stats_name=EXPERIMENT_NAME,
+                              experiment=EXPERIMENT_NAME),
                       args.workers, title="ORACLE ABLATION STATISTICS")
 
-    all_data_df = load_all_joint_angles(args.subjects, args.activities, methods)
+    all_data_df = load_all_joint_angles(TRIAL_DATASET, row_keys, methods,
+                                        experiment=EXPERIMENT_NAME)
     if all_data_df.empty:
         print("Error: no data was loaded for any subject.")
         return

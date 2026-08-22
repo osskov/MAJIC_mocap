@@ -90,7 +90,7 @@ from matplotlib.patches import Patch
 
 import paths
 from plotting import utils as plot_utils  # noqa: F401  (applies the shared paper rcParams on import)
-from plotting.sensor_distributions import joint_label
+from plotting.global_assumptions import joint_label
 from experiments.experiment_utils import JOINTS
 from experiments.relative_vs_absolute import (EXAMPLE_JOINT, FIELD_LABELS, INVARIANT_FIELDS,
                                               SAMPLE_STRIDE, load_trial_table)

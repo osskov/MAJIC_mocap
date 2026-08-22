@@ -30,10 +30,10 @@ import pandas as pd
 
 import paths
 
-from experiments.experiment_utils import (DEFAULT_MAG_ADAPT_THRESHOLD,
+from experiments.experiment_utils import (DEFAULT_MAG_ADAPT_THRESHOLD, TRIAL_DATASET,
                                           _calculate_observability_metric_, _run_relative_filter,
                                           project_pair_to_joint_center, resolve_method_spec)
-from experiments.threshold_sensitivity import (OBS_PERCENTILES, REFERENCE_METHODS,
+from experiments.threshold_sensitivity import (EXPERIMENT_NAME, OBS_PERCENTILES, REFERENCE_METHODS,
                                                REFERENCE_VARIANT, THRESHOLDS,
                                                constants_disagreements, describe_disagreements,
                                                arm_constants, gating_tables,
@@ -394,13 +394,22 @@ class TestCrossArmConsistency(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        patcher = mock.patch.object(paths, 'JOINT_ANGLES_DIR', Path(self.tmp.name))
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # BOTH roots. This experiment's arms now live under
+        # results/experiments/<name>/joint_angles/, which resolves through EXPERIMENTS_DIR, so
+        # patching JOINT_ANGLES_DIR alone let these tests write real manifests into the real
+        # results tree — and then the two "nothing on disk" cases found the previous test's
+        # leftovers and failed. Anything that redirects one root has to redirect the other.
+        for attr in ('JOINT_ANGLES_DIR', 'EXPERIMENTS_DIR'):
+            patcher = mock.patch.object(paths, attr, Path(self.tmp.name) / attr.lower())
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def write(self, method, constants, subject='01', activity='walking', variant=None):
+        # Written where `arm_constants` now looks: this experiment's own tree, not the
+        # benchmark's canonical one.
         path = paths.manifest_path(
-            paths.joint_angles_path(subject, activity, method, variant=variant))
+            paths.joint_angles_path(TRIAL_DATASET, subject, activity, method, variant=variant,
+                                    experiment=EXPERIMENT_NAME))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({'constants': constants}))
 

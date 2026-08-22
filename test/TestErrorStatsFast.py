@@ -187,13 +187,30 @@ class TestComputeErrorStatsUnchanged(unittest.TestCase):
 
 
 class TestAsCategoricalLabels(unittest.TestCase):
+    def _present(self, df):
+        """The label columns this frame actually has.
+
+        Not all of LABEL_COLUMNS: `dataset` and `trial` joined it when the pipeline gained a
+        second dataset, and a frame is not required to carry them — a single-trial caller has
+        nothing to put in them, and artifacts written before they existed do not have them.
+        Tolerating that is the documented contract (see the idempotence test below), so a test
+        that indexed every name unconditionally would be pinning the opposite.
+        """
+        return [col for col in LABEL_COLUMNS if col in df.columns]
+
     def test_converts_only_the_label_columns(self):
         df = _synthetic_joint_angles()
         out = as_categorical_labels(df.copy())
-        for col in LABEL_COLUMNS:
+        for col in self._present(df):
             self.assertIsInstance(out[col].dtype, pd.CategoricalDtype, col)
         for col in ('timestamp', 'rx', 'ry', 'rz'):
             self.assertEqual(out[col].dtype, np.float64)
+
+    def test_it_converts_the_dataset_and_trial_labels_too(self):
+        df = _synthetic_joint_angles().assign(dataset='alborno', trial='walking')
+        out = as_categorical_labels(df)
+        for col in ('dataset', 'trial'):
+            self.assertIsInstance(out[col].dtype, pd.CategoricalDtype, col)
 
     def test_is_idempotent_and_tolerates_missing_columns(self):
         df = _synthetic_joint_angles().drop(columns=['trial_type'])
@@ -204,9 +221,54 @@ class TestAsCategoricalLabels(unittest.TestCase):
     def test_values_are_preserved(self):
         df = _synthetic_joint_angles()
         out = as_categorical_labels(df.copy())
-        for col in LABEL_COLUMNS:
+        for col in self._present(df):
             pd.testing.assert_series_equal(
                 out[col].astype(str), df[col].astype(str), check_dtype=False)
+
+
+class TestTrialIsPartOfTheKey(unittest.TestCase):
+    """`trial` and `dataset` join the merge key and the grouping when they are present.
+
+    The failure this guards is silent and quadratic. Al Borno has one trial per activity, so
+    (subject, trial_type) identified a trial and nothing needed the distinction; IMoVE holds
+    several takes of one activity per session. Without `trial` in the merge key, take A's
+    estimate joins take B's ground truth on (subject, trial_type, joint, timestamp) — every
+    pairing of the two — and the resulting error is the difference between two different
+    walks.
+    """
+
+    def _two_trials(self):
+        """One activity, two takes, with DIFFERENT ground truth in each.
+
+        The second take's marker angles are offset, so a cross-join shows up as an error where
+        there should be none: within each take the estimate equals its own marker exactly.
+        """
+        frames = []
+        for trial, offset in (('t1_walking_001', 0.0), ('t1_walking_002', 0.5)):
+            truth = offset + 0.01 * np.arange(N_SAMPLES)[:, None] * np.ones(3)
+            for method in ('marker', 'mag_on'):
+                frames.append(pd.DataFrame({
+                    'timestamp': 0.01 * np.arange(N_SAMPLES),
+                    'joint_name': 'R_Knee',
+                    'rx': truth[:, 0], 'ry': truth[:, 1], 'rz': truth[:, 2],
+                    'subject': 's13', 'trial': trial, 'trial_type': 'walking',
+                    'method': method, 'dataset': 'imove',
+                }))
+        return pd.concat(frames, ignore_index=True)
+
+    def test_each_trial_is_scored_against_its_own_ground_truth(self):
+        stats = compute_error_stats(self._two_trials())
+        self.assertEqual(sorted(stats['trial'].unique()),
+                         ['t1_walking_001', 't1_walking_002'])
+        # Each take's estimate IS its own marker, so every error is exactly zero. A cross-join
+        # would put the 0.5 rad offset between the takes into these rows.
+        np.testing.assert_allclose(stats['rmse_rad'].to_numpy(), 0.0, atol=1e-12)
+
+    def test_dropping_the_trial_column_is_what_cross_joins(self):
+        """The counterfactual, so the test above is known to be measuring the guard and not
+        an accident of the fixture."""
+        without = compute_error_stats(self._two_trials().drop(columns=['trial']))
+        self.assertGreater(float(without['rmse_rad'].max()), 0.1)
 
 
 if __name__ == '__main__':

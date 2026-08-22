@@ -27,7 +27,7 @@ plt.rcParams.update({
     'axes.linewidth': 0.8,
     'axes.spines.top': False,
     'axes.spines.right': False,
-    'axes.grid': True,
+    'axes.grid': False,
     'grid.color': '#EEEEEE',
     'grid.linestyle': '-',
     'grid.linewidth': 0.8,
@@ -538,14 +538,19 @@ def plot_metric_heatmap(
     labels: Optional[Dict[str, str]] = None, joint_order: List[str] = DEFAULT_JOINT_ORDER,
     higher_is_better: bool = False, save: bool = True, show: bool = True,
     block_cols: Optional[List[str]] = None, alpha: float = 0.05,
-    caption: Optional[str] = None
+    caption: Optional[str] = None, filename: Optional[str] = None,
+    title: Optional[str] = None
 ) -> None:
     """Heatmap of mean `metric` by joint (rows) x `group_col` (columns), annotated
     with a significance marker vs. the best value in each row.
 
     Every row is one panel of a single Holm family, so a star means "differs from
     this row's best after correcting across the whole heatmap", not just across the
-    row. Writes a `<figure>_stats.csv` beside the figure."""
+    row. Writes a `<figure>_stats.csv` beside the figure.
+
+    `filename`/`title` override the names derived from `metric`, which a caller drawing ONE
+    HEATMAP PER ERROR AXIS needs: the derived name is `heatmap_<metric>.png` for all of them, so
+    without an override the three anatomical axes overwrite each other and the last one wins."""
     labels = labels or {}
     groups = order_present(df[group_col].unique(), group_order)
     joints = [j for j in joint_order if j in df['joint_name'].unique()]
@@ -585,11 +590,12 @@ def plot_metric_heatmap(
     ax.set_xticklabels([labels.get(g, g) for g in groups], rotation=30, ha='right')
     ax.tick_params(axis='y', rotation=0)
 
-    out_name = f"heatmap_{metric}.png"
+    out_name = filename or f"heatmap_{metric}.png"
     n_blocks = {r.n_blocks for r in results.values() if r.skipped_reason is None}
     n_text = f"n={n_blocks.pop()}" if len(n_blocks) == 1 else "n varies by row"
     finalize_and_save_plot(
-        fig, f"Mean {metric} by Joint and {group_col}", out_name, plots_dir,
+        fig, title if title is not None else f"Mean {metric} by Joint and {group_col}",
+        out_name, plots_dir,
         epilog=(f"* Differs from best in row (Wilcoxon signed-rank, Holm-corrected across the "
                 f"whole heatmap, p < {alpha:g}, {n_text} subjects)"),
         save=save, show=show, caption=caption

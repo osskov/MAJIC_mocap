@@ -149,6 +149,17 @@ class TestRelativeFilterSetup(unittest.TestCase):
         with self.assertRaises(ValueError):
             make_filter(joint_type='2dof', dof2_axis_parent=np.array([0., 0., 1.]))
 
+    def test_rejects_2dof_without_an_angle(self):
+        """dof2_angle_rad has no default, and the omission must raise rather than be guessed.
+
+        It used to default to pi/2 while the residual compared against sin(alpha), which made
+        the default enforce a dot product of 1 — coincident axes. The failure was silent, so
+        the guard is what keeps it from coming back.
+        """
+        with self.assertRaises(ValueError):
+            make_filter(joint_type='2dof', dof2_axis_parent=np.array([0., 0., 1.]),
+                        dof2_axis_child=np.array([0., 1., 0.]), dof2_std=0.1)
+
     def test_joint_axes_are_normalized(self):
         filt = make_filter(joint_type='1dof',
                            dof1_axis_parent=np.array([0., 0., 4.]),
@@ -206,6 +217,133 @@ class TestRelativeFilterJacobians(unittest.TestCase):
 
         H = self.filter.get_H_jacobian(R_wp, R_wc, data_p, data_c)
         np.testing.assert_allclose(H, numerical_H(self.filter, R_wp, R_wc, data_p, data_c), atol=1e-6)
+
+    def test_heading_only_ignores_a_disagreement_the_accelerometer_owns(self):
+        """A relative tilt error about a_w x m_w is invisible to the restricted magnetometer.
+
+        This is the whole claim, stated as geometry rather than as an RMSE. A relative rotation
+        delta perturbs the magnetometer residual by -delta x m_w, and the retained direction is
+        w = unit(a_w x m_w), so the retained scalar is -delta . (m_w x w) -- and m_w x w is
+        parallel to the part of a_w perpendicular to m_w. Choosing delta along a_w x m_w makes
+        that dot product exactly zero: the residual is real, the full-vector magnetometer would
+        correct it, and this one refuses because the accelerometer already owns that DOF.
+        """
+        R_wp = np.eye(3)
+        R_wc = np.eye(3)
+        data_p, data_c = consistent_measurements(R_wp, R_wc)
+        tilt = np.cross(WORLD_GRAVITY, WORLD_MAG)
+        R_wc_err = Rotation.from_rotvec(0.02 * tilt / np.linalg.norm(tilt)).as_matrix() @ R_wc
+
+        full = make_filter().get_h(R_wp, R_wc_err, data_p, data_c)[3:]
+        restricted = make_filter(heading_only_sensor=1).get_h(R_wp, R_wc_err, data_p, data_c)[3:]
+
+        self.assertGreater(np.linalg.norm(full), 1e-3)
+        np.testing.assert_allclose(restricted, np.zeros(3), atol=1e-12)
+
+    def test_heading_only_keeps_a_disagreement_only_it_can_see(self):
+        """The complement: a relative rotation about a_w is retained in full.
+
+        The accelerometer residual is stationary to first order under this perturbation -- that
+        is what makes heading unobservable from accelerometers -- so nothing is being duplicated.
+        """
+        R_wp = np.eye(3)
+        R_wc = np.eye(3)
+        data_p, data_c = consistent_measurements(R_wp, R_wc)
+        heading = 0.02 * WORLD_GRAVITY / np.linalg.norm(WORLD_GRAVITY)
+        R_wc_err = Rotation.from_rotvec(heading).as_matrix() @ R_wc
+
+        full = make_filter().get_h(R_wp, R_wc_err, data_p, data_c)
+        restricted = make_filter(heading_only_sensor=1).get_h(R_wp, R_wc_err, data_p, data_c)
+
+        np.testing.assert_allclose(restricted[3:], full[3:], atol=1e-6)
+        # And the accelerometer, whose null direction this is, sees essentially nothing.
+        self.assertLess(np.linalg.norm(full[:3]), 1e-3 * np.linalg.norm(full[3:]))
+
+    def test_heading_only_residual_and_jacobian_share_one_direction(self):
+        """Both blocks are rank 1 along the same axis: h stays the exact derivative's residual.
+
+        The projection is applied to h and to H separately, so nothing but a test stops the two
+        from drifting onto different axes, and an H that is not dh/d_eta is an inconsistent
+        update rather than a loud failure.
+        """
+        R_wp = Rotation.from_rotvec([0.2, -0.1, 0.3]).as_matrix()
+        R_wc = Rotation.from_rotvec([-0.1, 0.25, 0.05]).as_matrix()
+        data_p, data_c = consistent_measurements(R_wp, R_wc)
+        data_c[1] = data_c[1] * 0.9 + np.array([0.02, -0.01, 0.03])   # a real disagreement
+
+        filt = make_filter(heading_only_sensor=1)
+        axis = filt._heading_projection_axis(R_wp, R_wc, data_p, data_c)
+        h_mag = filt.get_h(R_wp, R_wc, data_p, data_c)[3:]
+        H_mag = filt.get_H_jacobian(R_wp, R_wc, data_p, data_c)[3:]
+
+        np.testing.assert_allclose(h_mag - axis * axis.dot(h_mag), np.zeros(3), atol=1e-12)
+        self.assertEqual(np.linalg.matrix_rank(H_mag, tol=1e-9), 1)
+        np.testing.assert_allclose(H_mag - np.outer(axis, axis @ H_mag), np.zeros((3, 6)),
+                                   atol=1e-12)
+
+    def test_heading_only_jacobian_is_the_frozen_axis_derivative(self):
+        """H is dh/d_eta with the projection axis HELD FIXED, which is the approximation made.
+
+        The axis is built from the current estimate, so differentiating h exactly would add a
+        d(axis)/d_eta term -- first order, not second, because the residual is not zero. Treating
+        the axis as data (it is where the accelerometer says its own null direction lies) is the
+        standard choice and is what the kernel implements too; this pins it so the choice is
+        visible rather than discovered later as a mismatch.
+        """
+        R_wp = Rotation.from_rotvec([0.2, -0.1, 0.3]).as_matrix()
+        R_wc = Rotation.from_rotvec([-0.1, 0.25, 0.05]).as_matrix()
+        data_p, data_c = consistent_measurements(R_wp, R_wc)
+        data_c[1] = data_c[1] * 0.9 + np.array([0.02, -0.01, 0.03])
+
+        filt = make_filter(heading_only_sensor=1)
+        axis = filt._heading_projection_axis(R_wp, R_wc, data_p, data_c)
+        numerical_full = numerical_H(make_filter(), R_wp, R_wc, data_p, data_c)
+        H = filt.get_H_jacobian(R_wp, R_wc, data_p, data_c)
+
+        np.testing.assert_allclose(H[:3], numerical_full[:3], atol=1e-6)
+        np.testing.assert_allclose(H[3:], np.outer(axis, axis @ numerical_full[3:]), atol=1e-6)
+
+    def test_heading_only_drops_the_row_when_the_field_is_parallel_to_gravity(self):
+        """No cross product, no heading information -- so no row, rather than a normalized
+        near-zero vector pointing wherever the noise happened to send it."""
+        filt = make_filter(heading_only_sensor=1)
+        R = np.eye(3)
+        parallel = [WORLD_GRAVITY, WORLD_GRAVITY * 0.5]
+        self.assertIsNone(filt._heading_projection_axis(R, R, parallel, parallel))
+        np.testing.assert_allclose(filt.get_h(R, R, parallel, parallel)[3:], np.zeros(3))
+        np.testing.assert_allclose(filt.get_H_jacobian(R, R, parallel, parallel)[3:],
+                                   np.zeros((3, 6)))
+
+    def test_heading_only_leaves_a_zeroed_magnetometer_a_no_op(self):
+        """mag_off and mag_adapt zero the reading, and the projection must not turn that into
+        a NaN: the axis is undefined, so the row drops exactly as it did before."""
+        filt = make_filter(heading_only_sensor=1)
+        R = np.eye(3)
+        data_p = [WORLD_GRAVITY, np.zeros(3)]
+        data_c = [WORLD_GRAVITY, np.zeros(3)]
+        self.assertIsNone(filt._heading_projection_axis(R, R, data_p, data_c))
+        filt.update(np.zeros(3), np.zeros(3), data_p, data_c, 0.01)
+        self.assertTrue(np.isfinite(filt.get_R_pc()).all())
+
+    def test_heading_only_noise_block_is_deliberately_left_unprojected(self):
+        """M R M^T for the restricted sensor stays full rank, and that is load-bearing.
+
+        The discarded rows contribute nothing because their H and their residual are zero. Their
+        variance is what keeps S invertible; projecting M as well would zero that block and the
+        Cholesky solve would fail on every sample.
+        """
+        R_wp = Rotation.from_rotvec([0.2, -0.1, 0.3]).as_matrix()
+        R_wc = Rotation.from_rotvec([-0.1, 0.25, 0.05]).as_matrix()
+        filt = make_filter(heading_only_sensor=1)
+        M = filt.get_M_jacobian(R_wp, R_wc)
+        noise = M @ filt.R @ M.T
+        self.assertEqual(np.linalg.matrix_rank(noise[3:, 3:], tol=1e-12), 3)
+
+    def test_rejects_heading_only_on_the_reference_sensor(self):
+        """Sensor 0 defines the axis, so restricting it to that axis would delete it."""
+        for bad in (0, 2, -1):
+            with self.assertRaises(ValueError):
+                make_filter(heading_only_sensor=bad)
 
     def test_noise_jacobian_matches_numerical(self):
         R_wp = Rotation.from_rotvec([0.6, -0.2, 0.03]).as_matrix()
@@ -275,7 +413,7 @@ class TestRelativeFilterJacobians(unittest.TestCase):
 
         h = filt.get_h(R_wp, R_wc, data_p, data_c)
         self.assertEqual(h.shape, (7,))
-        expected_scalar = (R_wp @ v_parent).dot(R_wc @ u_child) - np.sin(alpha)
+        expected_scalar = (R_wp @ v_parent).dot(R_wc @ u_child) - np.cos(alpha)
         self.assertAlmostEqual(float(h[6]), float(expected_scalar), places=12)
 
         H = filt.get_H_jacobian(R_wp, R_wc, data_p, data_c)
@@ -283,6 +421,147 @@ class TestRelativeFilterJacobians(unittest.TestCase):
         M = filt.get_M_jacobian(R_wp, R_wc)
         self.assertEqual(M.shape, (7, 13))
         np.testing.assert_allclose(M[6:, 12:], np.eye(1))
+
+    def test_2dof_residual_vanishes_at_the_true_carrying_angle(self):
+        """THE GEOMETRIC ASSERTION, and the one the sin/cos slip would have failed.
+
+        The test above compares the residual against the same expression the implementation
+        evaluates, so it passes for any trigonometric function chosen consistently in both
+        places — which is exactly how `sin(alpha)` survived. This one states the geometry
+        instead: alpha is the angle BETWEEN the two world-frame axes, so a configuration
+        built to hold them at alpha must produce a residual of zero.
+        """
+        v_parent = np.array([0., 0., 1.])
+        u_child = np.array([0., 1., 0.])
+
+        for alpha in (0.0, np.pi / 6, np.pi / 3, np.pi / 2, 2 * np.pi / 3, np.pi):
+            with self.subTest(alpha_deg=np.rad2deg(alpha)):
+                filt = make_filter(joint_type='2dof', dof2_axis_parent=v_parent,
+                                   dof2_axis_child=u_child, dof2_angle_rad=alpha, dof2_std=0.1)
+                # Place the parent arbitrarily, then place the child so that its world-frame
+                # axis sits exactly alpha away from the parent's.
+                R_wp = Rotation.from_rotvec([0.6, -0.2, 0.03]).as_matrix()
+                v_world = R_wp @ v_parent
+                perpendicular = np.cross(v_world, np.array([1., 0., 0.]))
+                perpendicular /= np.linalg.norm(perpendicular)
+                u_world_target = np.cos(alpha) * v_world + np.sin(alpha) * perpendicular
+                R_wc = Rotation.align_vectors(
+                    u_world_target.reshape(1, 3), u_child.reshape(1, 3))[0].as_matrix()
+
+                data_p, data_c = consistent_measurements(R_wp, R_wc)
+                h = filt.get_h(R_wp, R_wc, data_p, data_c)
+                self.assertAlmostEqual(float(h[6]), 0.0, places=12)
+
+    def test_every_joint_constraint_jacobian_matches_numerical(self):
+        """Numerical differentiation of get_h, for EVERY constraint, over random poses.
+
+        This is the test that would have caught both 2DOF bugs, and it exists because neither
+        of the two that were here did. `test_2dof_joint_residual_and_shapes` checked the
+        residual against the implementation's own expression and the Jacobian's SHAPE, so a
+        Jacobian that was negated and missing a frame rotation passed it — an H that is wrong
+        by a sign sends the correction the wrong way, which no shape assertion can see.
+
+        Random poses rather than one fixed pair because the coupling's Jacobian carries
+        J_r(nu)^-1 and J_l(nu)^-1, which coincide at nu = 0 and differ everywhere else: a
+        single near-neutral configuration would not separate them.
+        """
+        rng = np.random.default_rng(20260816)
+        for trial in range(6):
+            R_wp = Rotation.random(random_state=int(rng.integers(1 << 30))).as_matrix()
+            R_wc = Rotation.random(random_state=int(rng.integers(1 << 30))).as_matrix()
+            R_0 = Rotation.random(random_state=int(rng.integers(1 << 30))).as_matrix()
+            axis = rng.normal(size=3)
+            axis /= np.linalg.norm(axis)
+            neutral = rng.normal(size=3)
+            neutral /= np.linalg.norm(neutral)
+            channel_map = Rotation.random(
+                random_state=int(rng.integers(1 << 30))).as_matrix()[:2, :2]
+
+            constraints = {
+                '1dof': dict(joint_type='1dof', dof1_axis_parent=rng.normal(size=3),
+                             dof1_axis_child=rng.normal(size=3), dof1_std=np.ones(3) * 0.1),
+                '2dof': dict(joint_type='2dof', dof2_axis_parent=rng.normal(size=3),
+                             dof2_axis_child=rng.normal(size=3),
+                             dof2_angle_rad=float(rng.uniform(0.2, 2.9)), dof2_std=0.1),
+                'coupling': dict(joint_type='coupling', model_R_0=R_0,
+                                 coupling_axis_child=axis, coupling_channel_map=channel_map,
+                                 coupling_flexion_sign=float(rng.choice([1.0, -1.0])),
+                                 coupling_std=0.05),
+                'spring': dict(joint_type='spring', model_R_0=R_0,
+                               spring_axis_child=neutral, spring_std=0.3),
+            }
+
+            for name, kwargs in constraints.items():
+                with self.subTest(constraint=name, trial=trial):
+                    filt = make_filter(**kwargs)
+                    data_p, data_c = consistent_measurements(R_wp, R_wc)
+                    analytic = filt.get_H_jacobian(R_wp, R_wc, data_p, data_c)
+                    numeric = numerical_H(filt, R_wp, R_wc, data_p, data_c)
+                    np.testing.assert_allclose(analytic, numeric, atol=1e-5)
+
+    def test_coupling_residual_vanishes_on_a_knee_that_obeys_the_curve(self):
+        """A pose built to satisfy the published coupling exactly must score zero.
+
+        The geometric counterpart to the Jacobian test: it pins the RESIDUAL's convention
+        (nu = log(R_0^T R_pc), axes in the child frame, flexion read off nu's component along
+        u_c) rather than re-deriving the implementation's own arithmetic.
+        """
+        from src import joint_constraints
+
+        R_0 = Rotation.from_rotvec([0.2, -0.4, 0.1]).as_matrix()
+        u_c = np.array([0.0, 0.0, 1.0])
+        channel_map = np.eye(2)
+        basis_P = joint_constraints.so3.tangent_basis(u_c)
+
+        filt = make_filter(joint_type='coupling', model_R_0=R_0, coupling_axis_child=u_c,
+                           coupling_channel_map=channel_map, coupling_flexion_sign=1.0,
+                           coupling_std=0.05)
+
+        for flexion_deg in (5.0, 20.0, 45.0, 80.0):
+            with self.subTest(flexion_deg=flexion_deg):
+                q = np.deg2rad(flexion_deg)
+                curve, _ = joint_constraints.reuben_design(np.array([q]), 1.0)
+                nu = q * u_c + basis_P @ (channel_map.T @ curve[0])
+                R_pc = R_0 @ Rotation.from_rotvec(nu).as_matrix()
+
+                R_wp = Rotation.from_rotvec([0.3, 0.1, -0.2]).as_matrix()
+                R_wc = R_wp @ R_pc
+                data_p, data_c = consistent_measurements(R_wp, R_wc)
+
+                h = filt.get_h(R_wp, R_wc, data_p, data_c)
+                np.testing.assert_allclose(h[6:], np.zeros(2), atol=1e-12)
+
+    def test_spring_residual_is_the_deviation_from_neutral(self):
+        """Zero at the neutral pose, and equal to the off-neutral angle when rotated off it."""
+        R_0 = Rotation.from_rotvec([-0.1, 0.35, 0.2]).as_matrix()
+        neutral = np.array([0.0, 1.0, 0.0])
+        filt = make_filter(joint_type='spring', model_R_0=R_0,
+                           spring_axis_child=neutral, spring_std=0.3)
+
+        R_wp = Rotation.from_rotvec([0.2, -0.3, 0.15]).as_matrix()
+
+        R_wc = R_wp @ R_0
+        data_p, data_c = consistent_measurements(R_wp, R_wc)
+        self.assertAlmostEqual(float(filt.get_h(R_wp, R_wc, data_p, data_c)[6]), 0.0, places=12)
+
+        for angle in (0.05, -0.2, 0.4):
+            with self.subTest(angle=angle):
+                R_wc = R_wp @ R_0 @ Rotation.from_rotvec(angle * neutral).as_matrix()
+                data_p, data_c = consistent_measurements(R_wp, R_wc)
+                self.assertAlmostEqual(
+                    float(filt.get_h(R_wp, R_wc, data_p, data_c)[6]), angle, places=12)
+
+    def test_2dof_perpendicular_axes_are_a_zero_dot_product(self):
+        """A universal joint's axes are perpendicular, so alpha = pi/2 must enforce v.u = 0.
+
+        Stated separately from the sweep above because pi/2 was the old default, and under
+        the old sin() convention it enforced v.u = 1 — coincident axes. This is the single
+        configuration a caller was most likely to hit by accident.
+        """
+        filt = make_filter(joint_type='2dof', dof2_axis_parent=np.array([0., 0., 1.]),
+                           dof2_axis_child=np.array([0., 1., 0.]),
+                           dof2_angle_rad=np.pi / 2, dof2_std=0.1)
+        self.assertAlmostEqual(float(filt.joint_params['cos_alpha']), 0.0, places=15)
 
     def test_rejects_a_filter_with_nothing_to_measure(self):
         # No vector sensors and no joint constraint leaves the relative orientation
@@ -337,6 +616,19 @@ class TestRelativeFilterTimeUpdate(unittest.TestCase):
         before = self.filter.P.copy()
         self.filter._get_time_update(np.zeros(3), np.zeros(3), dt)
         # With no rotation the propagation is the identity, so P grows by exactly dt^2 * Q.
+        #
+        # dt^2 AND NOT dt, which looks wrong and is not. The textbook continuous-discrete form
+        # is Q_d = Q_c*dt, but that is paired with R_d = R_c/dt -- it assumes the measurement
+        # noise is white, so sampling faster buys proportionally more information. Here R is
+        # dominated by MODEL error (linear acceleration, field distortion), which is
+        # band-limited physical signal: sampling it at 100 Hz rather than 40 Hz does not make
+        # it 2.5x more informative, so R is rate-independent and the pairing that keeps the
+        # filter's time constant rate-independent is q ~ dt^2 * r. With q = dt^2*sigma_g^2 and
+        # r = sigma_acc^2 the time constant is tau = dt*sqrt(r/q) = sigma_acc/sigma_gyro,
+        # independent of rate.
+        #
+        # Measured, decimating one trial to 100/50/20 Hz at a tuning matched at 100 Hz: dt^2
+        # spreads the RMSE by 20%, dt by 114%. Changing this to dt was tried and reverted.
         np.testing.assert_allclose(self.filter.P, before + dt ** 2 * self.filter.Q, atol=1e-12)
 
 

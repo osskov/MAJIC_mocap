@@ -25,25 +25,28 @@ under `data/`, so the rule is enforced rather than merely documented.
 ```
 .
 ├── data/                                   # <-- INPUTS ONLY, exactly as downloaded
-│   ├── Subject01/
-│   │   ├── walking/
-│   │   │   ├── imu data/                   # Raw IMU .txt files
-│   │   │   ├── madgwick (al borno)/        # Outputs from Al Borno et al. (2022)
-│   │   │   └── walking.trc                 # Mocap ground truth
-│   │   └── complexTasks/                   # ... same structure
-│   └── ... (Subject02 … Subject11)
+│   ├── alborno/                            # one directory per dataset
+│   │   ├── Subject01/
+│   │   │   ├── walking/
+│   │   │   │   ├── imu data/               # Raw IMU .txt files
+│   │   │   │   ├── madgwick (al borno)/    # Outputs from Al Borno et al. (2022)
+│   │   │   │   └── walking.trc             # Mocap ground truth
+│   │   │   └── complexTasks/               # ... same structure
+│   │   └── ... (Subject02 … Subject11)
+│   └── IMoveLab_Raw_Data/                  # mocap_ref/ and biplane_ref/ halves
 │
 ├── results/                                # <-- ALL GENERATED DATA
 │   ├── joint_angles/
-│   │   ├── Subject01/walking/mag_on.parquet
-│   │   └── <variant>/Subject01/walking/...      # a run at non-default filter stds
+│   │   ├── alborno/01/walking/mag_on.parquet     # <dataset>/<subject>/<trial>/<method>
+│   │   ├── imove/s13/t1_walking_001/mag_on.parquet
+│   │   └── <variant>/alborno/01/walking/...     # a run at non-default filter stds
 │   ├── statistics/
-│   │   ├── all_subject_statistics.parquet      # benchmark summary (paper figures)
-│   │   ├── all_subject_joint_angles.parquet    # concatenated time series (~1 GB)
+│   │   ├── all_subject_alborno_statistics.parquet   # benchmark summary (paper figures)
+│   │   ├── all_subject_alborno_joint_angles.parquet # concatenated time series, opt-in (~1 GB)
 │   │   ├── oracle_ablation_statistics.parquet  # one per named experiment
-│   │   └── per_subject/<experiment>/Subject01/walking.parquet
+│   │   └── per_subject/<experiment>/<dataset>/01/walking.parquet
 │   └── experiments/
-│       ├── noise_sensitivity/
+│       ├── filter_gains/<dataset>/          # the gain sweep surface each tuning is read off
 │       ├── drift_observability/
 │       └── global_assumptions/<dataset>/     # per-trial sample tables behind its figures
 │
@@ -86,6 +89,32 @@ produced a given file:
 }
 ```
 
+**The sidecar is a gate, not just a record.** Every cached layer is checked against current
+code before it is read, and an artifact that does not match is refused rather than served:
+
+| Layer | Read through | Refuses when |
+| --- | --- | --- |
+| `results/trials/` | `load_trial` → `StaleTrialCache` | the toolchest code, the source files or the schema moved, or the parquet is truncated |
+| `results/joint_angles/` | `load_joint_angles` → `StaleJointAngles` | the filter code, the method spec, the tuning or the geometry moved; the trial underneath is stale or has been rebuilt; the parquet is truncated |
+| `results/statistics/per_subject/` | `load_per_trial_statistics` → `StaleStatistics` | the constants, variant, pooled method set or requested axes differ, or the joint angles it pooled have been regenerated |
+
+All three raise `StaleArtifact`, so every experiment inherits the refusal from the shared
+loader rather than implementing its own. This exists because the silent version of it cost a
+real result: Al Borno's cached angles carried `acc_std=0.018 / mag_std=0.05` while the summary
+manifest claimed `0.09695 / 0.009695` — a 28x difference in magnetometer trust — and the
+"mag_on and mag_off agree at every joint" that came out of it was pure artifact. The constants
+were in the sidecars the whole time; nothing compared them.
+
+The error names every stale artifact and the command that rewrites them. To look at an old
+run anyway, knowing its numbers do not describe current code:
+
+```bash
+MAJIC_ALLOW_STALE=1 python -m experiments.benchmark_experiment --dataset alborno --stats-only
+```
+
+That warns loudly on every read and prints a banner to stderr. There is no other way past it,
+deliberately — a fallback that costs time and nothing else is also a fallback nobody notices.
+
 -   **`paths.py`**: Single source of truth for every filesystem path. Paths are anchored
     to the repository root, not the working directory, so scripts resolve identically no
     matter where they are invoked from.
@@ -111,6 +140,12 @@ produced a given file:
     `ekf_perfect_acc` and the other oracle variants inherit it and the oracle gaps stay
     uncontaminated. See `experiments/normalization_comparison.py` for the three-arm
     evidence.
+-   **`experiments/anatomical_frames.py`**: The rotation from each parent sensor's frame to its
+    segment's anatomical frame, measured from the source mocap's landmarks and composed with the
+    sensor-to-segment rotation the build recorded. It computes no error of its own — it is what
+    lets `compute_error_stats` report an error along flexion / adduction / internal rotation
+    instead of along the axes of a plate that was re-strapped per subject. `alborno` and `imove`
+    only; the biplane halves have no registered marker set.
 -   **`plotting/`**: One plotting script per experiment, sharing the experiment's
     basename (`experiments/oracle_ablation.py` -> `plotting/oracle_ablation.py`; the
     benchmark's figures are `plotting/paper_figures.py`). Plotting never recomputes —
@@ -157,16 +192,19 @@ Download the dataset (see the links above) and unpack it into `data/`, which the
 treat as read-only:
 ```
 data/
-├── Subject01/
-│   ├── walking/
-│   │   ├── walking.trc                 # Mocap ground truth
-│   │   ├── imu data/                   # Raw IMU .txt files, one per segment
-│   │   └── madgwick (al borno)/        # Optional: Al Borno et al. (2022) outputs
-│   └── complexTasks/                   # ... same structure
-├── Subject02/
-│   └── ...
-└── ...
+└── alborno/
+    ├── Subject01/
+    │   ├── walking/
+    │   │   ├── walking.trc             # Mocap ground truth
+    │   │   ├── imu data/               # Raw IMU .txt files, one per segment
+    │   │   └── madgwick (al borno)/    # Optional: Al Borno et al. (2022) outputs
+    │   └── complexTasks/               # ... same structure
+    ├── Subject02/
+    │   └── ...
+    └── ...
 ```
+-   Each dataset gets its own directory directly under `data/`; the Al Borno subjects go
+    under `data/alborno/`, and the IMoVE download unpacks to `data/IMoveLab_Raw_Data/`.
 -   Each subject has their own directory (`Subject01` … `Subject11`).
 -   Inside it, one subdirectory per trial type (`walking`, `complexTasks`).
 -   Each trial directory must contain a `.trc` motion capture file and an `imu data`
@@ -190,30 +228,82 @@ Computes joint angles for every method across every subject/activity, then aggre
 error statistics against the marker (mocap) ground truth.
 
 ```bash
-python -m experiments.benchmark_experiment
+python -m experiments.benchmark_experiment --dataset alborno
 ```
+
+It runs one dataset at a time, over every trial BUILT under `results/trials/<dataset>/`.
+`--dataset` takes `alborno`, `imove`, `imove_biplane` (fluoroscopic bone poses) or
+`imove_biplane_vicon` (the same IMUs against the skin marker cluster). Everything that
+differs between them — the joint table, which way is up, the magnetometer reference, whether
+there is a magnetometer at all — comes from `global_assumptions.tracking_spec`. A dataset
+whose IMUs have no magnetometer supports neither `mag_on` nor `mag_adapt`: left to the
+default method list they are dropped with a printed note, and asked for explicitly they are
+an error, because the filter would otherwise return `mag_off`'s answer under `mag_on`'s name.
 
 This writes:
 
--   `results/joint_angles/Subject<NN>/<activity>/<method>.parquet` — per-method joint
-    angles (rotation vectors), one file per subject/activity/method.
--   `results/statistics/per_subject/all_subject/Subject<NN>/<activity>.parquet` —
-    per-subject error statistics.
--   `results/statistics/all_subject_joint_angles.parquet` — the concatenated time series
-    across all subjects and methods (large, ~1 GB).
--   `results/statistics/all_subject_statistics.parquet` — the summary statistics used by
-    the plotting scripts.
+-   `results/joint_angles/<dataset>/<subject>/<trial>/<method>.parquet` — per-method joint
+    angles (rotation vectors), one file per trial/method.
+-   `results/statistics/per_subject/all_subject/<dataset>/<subject>/<trial>.parquet` —
+    per-trial error statistics.
+-   `results/statistics/all_subject_<dataset>_statistics.parquet` — the summary statistics
+    used by the plotting scripts. It is the concatenation of the per-trial tables above:
+    `compute_error_stats` already groups per trial, so the two are the same numbers.
+-   `results/statistics/all_subject_<dataset>_joint_angles.parquet` — the concatenated
+    every-sample time series. Only with `--pooled-angles`, because it is ~1 GB on alborno
+    and roughly ten times that on imove, and nothing in the summary needs it.
 
 Each of these gets a `.manifest.json` provenance sidecar alongside it.
 
-Useful flags: `--subjects`, `--activities`, `--methods` to restrict the grid, `--workers`
+Useful flags: `--subjects`, `--trials`, `--methods` to restrict the grid, `--workers`
 to cap parallelism, and `--stats-only` to skip regeneration and re-run just the
-aggregation over the joint angles already on disk:
+aggregation over the joint angles already on disk. `--stats-only` is the one path that reads
+every cached layer and writes none of them, so it is where the freshness gate above matters
+most: it refuses rather than summarising angles that no longer match the code:
 
 ```bash
-python -m experiments.benchmark_experiment --subjects 01 02 --activities walking
-python -m experiments.benchmark_experiment --stats-only
+python -m experiments.benchmark_experiment --dataset alborno --subjects 01 02 --trials walking
+python -m experiments.benchmark_experiment --dataset imove --subjects s13
+python -m experiments.benchmark_experiment --dataset alborno --stats-only
 ```
+
+#### Splitting the error by anatomical axis
+
+By default the statistics carry one row per error `axis`: `MAG` (the rotation magnitude, what
+every figure reports) plus `X`, `Y`, `Z` — the components in the **parent sensor's own frame**.
+Those components are physically well defined and anatomically meaningless: the plates are
+re-strapped per subject, so `X` names a different direction for each of them and pooling eleven
+subjects averages flexion error into rotation error.
+
+`experiments/anatomical_frames.py` measures the missing rotation. For each parent sensor it reads
+the anatomical landmarks straight out of the source mocap (Al Borno's standing capture, which is
+the only file there carrying medial markers; IMoVE's per-frame epicondyles and malleoli), builds
+an ISB-shaped segment frame from them, and composes it with the sensor-to-segment rotation the
+build recorded in its `*.build.parquet` sidecar:
+
+```bash
+python -m experiments.anatomical_frames --dataset alborno
+python -m experiments.benchmark_experiment --dataset alborno --stats-only --anatomical-axes
+python -m plotting.paper_figures --dataset alborno --axes anatomical
+```
+
+No filter is re-run — this is a statistics-stage option, so `--stats-only` is enough to add the
+axes to a finished benchmark. Nothing existing is replaced either: the new `FE`, `AA` and `IE`
+rows sit beside `MAG`/`X`/`Y`/`Z`, so every script that reads `axis == 'MAG'` is unaffected.
+Positive means flexion, adduction and internal rotation on **both** sides of the body, which is
+what makes a pooled left+right `Knee` row legitimate.
+
+Because the basis is orthonormal, the split is exact in the strong sense that
+`RMSE_MAG² = RMSE_FE² + RMSE_AA² + RMSE_IE²` in every cell — the three panels add up to the
+magnitude figure and cannot contradict it. It is **not** a Cardan/Euler per-plane angle error,
+which is a different quantity, is sequence-dependent and does not decompose the total.
+
+Available on `alborno` and `imove` only; the biplane halves have no registered marker set and are
+refused by name. The module's own report carries the checks that say whether to trust it —
+`align_check_deg` on the build's alignment rotation, `hinge_angle_deg` comparing the landmark
+flexion axis against the axis the joint is actually observed to turn about (6–7° at Al Borno's
+knees), and cross-trial agreement of the basis (median 0.1–0.7°). Read
+`experiments/anatomical_frames.py`'s header before quoting any of it.
 
 ### Step 2: Run any additional experiments (optional)
 
@@ -225,11 +315,12 @@ python -m experiments.normalized_benchmark     # the benchmark grid, normalized 
 python -m experiments.oracle_ablation          # acc/mag ground-truth ablation
 python -m experiments.threshold_sensitivity    # mag_adapt observability threshold sweep
 python -m experiments.distortion_tolerance     # how much magnetic distortion mag_on tolerates
-python -m experiments.noise_sensitivity        # gyro/acc/mag noise parameter sweep
+python -m experiments.filter_gains --dataset alborno  # measures the filter's innovation and sweeps the two free gain ratios; DATASET_STDS is read off this
 python -m experiments.ekf_oracle_comparison    # EKF vs. its oracle variants
 python -m experiments.drift_observability      # segment-and-reset drift diagnostic
 python -m experiments.acceleration_projection --dataset alborno  # does the acc projection agree: with markers, across a joint, along a segment
 python -m experiments.magnetic_projection --dataset alborno      # the same three questions for the magnetometer, plus: can an array estimate the field gradient?
+python -m experiments.sensor_placement --dataset imove           # what moving the IMU along the segment costs the joint angle, and whether the projection removes it
 python -m experiments.global_assumptions       # acc/mag assumption departure, static vs moving
 python -m experiments.relative_vs_absolute     # relative vs global-reference correction geometry
 python -m experiments.normalization_comparison # unit-length vs raw-magnitude filter inputs
@@ -252,7 +343,7 @@ pulled apart.
 Because the std triple lives outside the method name — it is a module constant, not a
 suffix — a re-tuned `mag_on_normalized` would otherwise overwrite the default-tuned one at
 the same path. Everything is namespaced under a **variant** subdirectory
-(`results/joint_angles/normalized_benchmark/…`) with its own statistics file, and every
+(`results/joint_angles/normalized_benchmark/<dataset>/…`) with its own statistics file, and every
 manifest records the stds that produced it, so this run and the benchmark coexist. The
 stds are also flags, so the same machinery runs any other tuning:
 
@@ -438,6 +529,87 @@ zero** by discarding the measurement, so every mode is scored on two axes — ag
 distance from a marker-supported field model — and the control makes that visible rather than
 arguable.
 
+The last figure asks the complementary question — not how far two magnetometers **disagree** but
+how much of what they see is **shared**, which is what decides whether a relative filter's
+subtraction removes a disturbance or manufactures one. Each sensor's time-mean is removed first,
+so this is the fluctuation rather than the standing offset the rest of the experiment measures,
+and the far pair classes are the control: a disturbance that is genuinely spatial is shared by
+neighbours and not by a sensor on the other leg.
+
+| pair | IMoVE ρ | IMoVE surviving | Al Borno ρ | Al Borno surviving |
+| --- | --- | --- | --- | --- |
+| same segment (7-19 cm) | 0.67 | 0.37 | — | — |
+| across a joint (25-47 cm) | 0.38 | 0.72 | 0.87 | 0.29 |
+| other leg | 0.33 | 0.70 | 0.72 | 0.28 |
+| unrelated | 0.21 | 0.87 | 0.60 | 0.69 |
+
+`surviving` is the fraction of disturbance energy left after subtracting the two sensors — 0 means
+perfectly shared and differencing removes it, 1 means independent so differencing is neutral, above
+1 means differencing makes it worse. Correlation falls off with adjacency on both datasets, so part
+of the disturbance is genuinely spatial, and removing each sensor's own fitted body-fixed bias
+*raises* the same-segment correlation (0.67 → 0.80), so the bias decorrelates neighbours rather
+than coupling them. Split by timescale, the slow band (< 0.5 Hz) carries nearly all of the shared
+part while the gait band is shared only *within* a segment — a room-scale disturbance changes as
+the subject crosses the lab, whereas two biases rotating together only look alike on sensors that
+rotate together.
+
+**The two datasets disagree on how much differencing buys, and the difference is the protocol.**
+Across a joint, Al Borno leaves 29% of the disturbance after subtraction and IMoVE leaves 72%. Al
+Borno's trials are minutes of walking across a magnetically inhomogeneous capture volume, so the
+shared slow term dominates; most of IMoVE's are short tasks performed on one spot, where there is
+little room-scale variation to share and the per-sensor term is most of what is left. So the
+benefit a relative formulation gets from common-mode rejection is a property of the protocol, not
+a constant — which also means it is largest exactly where magnetic distortion is worst.
+
+`sensor_placement` is the only experiment here that can vary WHERE the IMU sits, and it is IMoVE
+only: three sensors on each thigh and shank, High/Mid/Low, 7-19 cm apart against a single marker
+cluster. One trial, one joint, one filter, one reference construction — the only thing that
+changes between two cells is which sensor on the same rigid segment the filter was handed, so a
+difference between cells is placement and cannot be subject, motion or tuning. The full cross
+product is run (9 cells at each knee, 3 at each hip and ankle), crossed with three projections
+and the magnetometer on and off.
+
+```bash
+python -m experiments.sensor_placement --dataset imove
+python -m experiments.sensor_placement --dataset imove --report-only
+```
+
+Over 21 subjects and 231 trials, moving the sensor is worth more than most of the method choices
+this repo benchmarks. Within a trial and joint, the gap between the best and the worst placement
+is a median **41.7°** unprojected, and error tracks the lever arm almost perfectly (Spearman
+**1.00** within a cell, **16.0° per 100 mm**). MAJIC's acceleration projection is exactly the
+correction for that term, and it works: with a marker joint centre the same gap falls to
+**10.3°** and the slope to **1.9° per 100 mm**. With the joint centre estimated from the IMUs
+alone — the deployable case — it lands at **13.1°**, so most but not all of the benefit survives
+losing the markers, and what is lost is a tail rather than a level shift (median cost +0.13°, p90
++19°: the cells where the IMU-only fit failed are the distal placements, which are also the ones
+that most needed the correction).
+
+The mechanism is settled by a test that needs no extra data. A thigh sensor's distance to the hip
+and its distance to the knee move in OPPOSITE directions as it slides down the segment, so a
+lever-arm explanation predicts the placement ranking REVERSES between the two joints a segment
+spans, while every rival explanation (that sensor is noisier, that spot has more soft tissue,
+that tape job was worse) predicts the same ranking at both. Measured: the ranking reverses in
+**66%** of segment-trials unprojected and **28%** once projected, against a geometry control that
+reverses 100% of the time. The report also shows it directly — the best placement for the hip is
+the thigh's High sensor (91% of trials), for the ankle it is the shank's Low sensor (83%), and
+the worst knee cell is High-Low, both sensors as far from the knee as the segments allow.
+
+Two secondary results. Placement MISMATCH between the two sensors costs nothing beyond the two
+lever arms it implies (+0.4° at most, not significant), so there is no reason to insist both
+sensors sit at the same height — only that each sits near its joint. And the magnetometer pays
+off better the further the sensor is from the floor (rho 0.25-0.35 with sensor height), which is
+the sign the floor-source distortion finding predicts, though the effect is small next to the
+lever arm.
+
+The confounds are measured rather than argued, in section 7 of the report: the placements of one
+segment read the same |omega| to 2.5°/s (3.8% of signal), as a rigid body requires; the taped
+High/Low sensors fall back to a default cluster-to-IMU offset on 8-14% of plates against 0% for
+the bolted Mid ones; and their sensor-to-segment alignment residual is roughly twice the Mid
+sensors' (0.25 vs 0.15 of their own gyro signal). That last one matters most once the lever arm
+is gone — with the projection on, the alignment residual becomes the strongest remaining
+correlate of the error (rho 0.38), which is where the residual 10° of placement spread lives.
+
 `relative_vs_absolute` is the evidence behind the method's central claim — that comparing the
 two sensors of a joint against *each other* beats correcting each one against a global
 reference. It is a geometry result first and a measurement second, and it reports two things
@@ -604,11 +776,12 @@ python -m plotting.normalized_benchmark
 python -m plotting.oracle_ablation
 python -m plotting.threshold_sensitivity
 python -m plotting.distortion_tolerance
-python -m plotting.noise_sensitivity
+python -m plotting.filter_gains
 python -m plotting.ekf_oracle_comparison
 python -m plotting.drift_observability
 python -m plotting.acceleration_projection --dataset alborno
 python -m plotting.magnetic_projection --dataset alborno
+python -m plotting.sensor_placement --dataset imove
 python -m plotting.global_assumptions
 python -m plotting.relative_vs_absolute
 ```
@@ -616,6 +789,14 @@ python -m plotting.relative_vs_absolute
 These read only from `results/` — they never re-run the filter, so a figure can be re-tuned
 in seconds. If the statistics file is missing, the script says which experiment to run first.
 Figures are written to `plots/`, namespaced per experiment.
+
+`plotting.paper_figures --axes anatomical` draws the same two figures split by anatomical axis
+instead of pooled into a rotation magnitude: `figure_1_rmse_by_axis.png` (one panel per axis,
+sharing a y scale, because the panels are components of one vector and their relative height is
+the result) and one `heatmap_rmse_<axis>.png` per axis. It needs statistics written with
+`--anatomical-axes` — see [Splitting the error by anatomical axis](#splitting-the-error-by-anatomical-axis)
+— and says which command to run if they are not there rather than falling back to the magnitude
+under an anatomical title.
 
 `plotting.global_assumptions` draws the headline two-panel static-vs-moving figure, the
 distribution figures (regime-split box / ridgeline / strip per metric), the noise floor against
@@ -708,6 +889,7 @@ differences of its own residual function, plus the analysis layer on top of them
 | `TestMethodSpec` | `resolve_method_spec`'s name grammar, and the round trip from every name the experiment scripts build (including that `_unnormalized` is not parsed as `_normalized`) |
 | `TestExperimentPhysics` | the acc/mag oracles, the virtual EKF ground plate, and the `o^J` observability metric |
 | `TestErrorStats` | `compute_error_stats` — error convention, every summary metric against numpy, grouping and the timestamp merge |
+| `TestAnatomicalFrames` | the anatomical basis and the split it produces: that positive is flexion/adduction/internal rotation on *both* sides (checked on a synthetic mirrored subject, because getting it wrong cancels the two legs in every signed statistic while RMSE looks fine), that the components are `Aᵀe` and not `Ae`, that the three axes sum to the magnitude in quadrature, and that a joint with no basis gets no anatomical rows rather than an identity |
 | `TestPlotUtils` | `plotting/utils.py` — the block reduction that sets *n*, Holm correction, effect sizes, and the two-stage correction family |
 | `TestSensorDistributions` | the sitting/standing and ground-anchored-stationary detectors, the length-weighted noise floor, the pooled-with-margins quantile summary, and the fixed field-reference rule behind `var_reduction` |
 | `TestRelativeVsAbsolute` | the spherical geometry behind the relative-correction claim: the quaternion layer against scipy, the spherical excess against a known area, all seven identities over random configurations on the whole sphere, the equality case that makes the inequalities tight, the documented counter-example the claim does *not* cover, and the rotation-invariance of the acc–mag angle |

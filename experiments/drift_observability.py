@@ -31,7 +31,9 @@ from scipy.spatial.transform import Rotation
 import matplotlib.pyplot as plt
 
 import paths
-from experiments.experiment_utils import (load_raw_data, JOINTS, _calculate_observability_metric_,
+from experiments.experiment_utils import (load_raw_data, JOINTS, TRIAL_DATASET,
+                                          _calculate_observability_metric_,
+                                          load_joint_angles as checked_load_joint_angles,
                                           project_pair_to_joint_center, run_tracked_grid)
 
 OUT_DIR = paths.experiment_dir("drift_observability")
@@ -42,13 +44,21 @@ PROXIMAL_JOINTS = {'Lumbar', 'R_Hip', 'L_Hip'}  # expected low observability / h
 # Loading precomputed joint angles / observability
 # ==============================================================================
 
-def load_joint_angles(subject, activity, method, joint_name):
-    """Reads results/joint_angles/Subject{subject}/{activity}/{method}.parquet (method
+def load_joint_angles(subject, activity, method, joint_name, dataset=TRIAL_DATASET):
+    """Reads results/joint_angles/<dataset>/{subject}/{activity}/{method}.parquet (method
     is 'mag_on', 'mag_off', or 'marker') and returns (timestamps, R) for the given
     joint, R being the (N,3,3) rotation matrices reconstructed from the stored
-    rx/ry/rz rotvec."""
-    path = paths.joint_angles_path(subject, activity, method)
-    df = pd.read_parquet(path, engine='pyarrow')
+    rx/ry/rz rotvec.
+
+    Goes through `experiment_utils.load_joint_angles` rather than reading the path directly, so
+    this analysis inherits the same refusal every other reader gets: it draws a drift RATE out
+    of these rotations, and a rate fitted to angles from a filter that no longer exists is
+    exactly the kind of number that survives into a figure unchallenged."""
+    df = checked_load_joint_angles(dataset, subject, activity, method)
+    if df is None:
+        raise FileNotFoundError(
+            f"No joint angles for {dataset}/{subject}/{activity}/{method}. Run: "
+            f"python -m experiments.benchmark_experiment --dataset {dataset}")
     df = df[df['joint_name'] == joint_name].sort_values('timestamp').reset_index(drop=True)
     timestamps = df['timestamp'].to_numpy()
     R = Rotation.from_rotvec(df[['rx', 'ry', 'rz']].to_numpy()).as_matrix()

@@ -245,7 +245,7 @@ def alborno_static_trc(subject: str) -> Path:
     glob `_alborno_trc` uses. A subdirectory is invisible to all three, none of which recurse.
     """
     import paths
-    return paths.DATA_DIR / f"Subject{subject}" / 'walking' / 'static' / 'static_walking.trc'
+    return paths.raw_trial_dir(subject, 'walking') / 'static' / 'static_walking.trc'
 
 
 def read_alborno_static(subject: str, sensors: Sequence[str],
@@ -386,7 +386,7 @@ def get_spec(dataset: str) -> LandmarkSpec:
 
 def _alborno_trc(subject: str, trial: str) -> Path:
     import paths
-    found = sorted((paths.DATA_DIR / f"Subject{subject}" / trial).glob("*.trc"))
+    found = sorted(paths.raw_trial_dir(subject, trial).glob("*.trc"))
     if not found:
         raise FileNotFoundError(f"No .trc for alborno/{subject}/{trial}")
     return found[0]
